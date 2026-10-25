@@ -135,6 +135,16 @@ func (s *cursorSet) cancelAll() {
 // QueryRows runs a query and returns a cursor. A single SELECT outside a
 // transaction is streamed; anything else is executed and materialized.
 func (c *Conn) QueryRows(ctx context.Context, src string, args ...any) (*Rows, error) {
+	return c.query(ctx, src, args, 0)
+}
+
+// QueryFirst is QueryRows for callers that read at most one row: the query
+// runs to its first row before returning, without a producer goroutine.
+func (c *Conn) QueryFirst(ctx context.Context, src string, args ...any) (*Rows, error) {
+	return c.query(ctx, src, args, 1)
+}
+
+func (c *Conn) query(ctx context.Context, src string, args []any, maxRows int) (*Rows, error) {
 	pr, err := c.db.parse(src)
 	if err != nil {
 		return nil, err
@@ -158,7 +168,7 @@ func (c *Conn) QueryRows(ctx context.Context, src string, args ...any) (*Rows, e
 	if err != nil {
 		return nil, err
 	}
-	return c.db.stream(ctx, sel, nargs)
+	return c.db.stream(ctx, sel, nargs, maxRows)
 }
 
 // QueryRows is Conn.QueryRows on a fresh session.
@@ -166,7 +176,15 @@ func (db *DB) QueryRows(ctx context.Context, src string, args ...any) (*Rows, er
 	return db.Conn().QueryRows(ctx, src, args...)
 }
 
-func (db *DB) stream(ctx context.Context, sel *sql.Select, args []any) (*Rows, error) {
+// QueryFirst is Conn.QueryFirst.
+func (db *DB) QueryFirst(ctx context.Context, src string, args ...any) (*Rows, error) {
+	return db.Conn().QueryFirst(ctx, src, args...)
+}
+
+// stream runs sel on a snapshot. Queries with a small, bounded result (and
+// all of them when maxRows > 0, which stops after that many rows) run
+// synchronously; others produce rows from a goroutine as they are read.
+func (db *DB) stream(ctx context.Context, sel *sql.Select, args []any, maxRows int) (*Rows, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -190,12 +208,26 @@ func (db *DB) stream(ctx context.Context, sel *sql.Select, args []any) (*Rows, e
 		snap.Release()
 		db.swapMu.RUnlock()
 	}
-	x := &execCtx{v: snap.View(), cat: snap.Meta().(*Catalog), args: args, ctx: ctx, spill: db.spill}
+	x := &execCtx{v: snap.View(), cat: snap.Meta().(*Catalog), args: args, ctx: ctx, spill: db.spill, plans: &db.plans}
 	run, err := x.prepareSelect(sel)
 	if err != nil {
 		release()
 		cancelAll()
 		return nil, err
+	}
+
+	if maxRows > 0 || run.small() {
+		var rows [][]any
+		err := x.runSelect(run, func(vals []any) (bool, error) {
+			rows = append(rows, vals)
+			return maxRows <= 0 || len(rows) < maxRows, nil
+		})
+		release()
+		cancelAll()
+		if err != nil {
+			return nil, err
+		}
+		return &Rows{cols: run.p.cols, types: run.p.types, static: rows}, nil
 	}
 
 	ch := make(chan []any, 64)

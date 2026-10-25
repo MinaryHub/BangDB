@@ -116,8 +116,11 @@ func (db *DB) QueryRow(query string, args ...any) *Row {
 
 // QueryRowContext is QueryRow with cancellation.
 func (db *DB) QueryRowContext(ctx context.Context, query string, args ...any) *Row {
-	rows, err := db.QueryContext(ctx, query, args...)
-	return &Row{rows: rows, err: err}
+	r, err := db.e.QueryFirst(ctx, query, args...)
+	if err != nil {
+		return &Row{err: err}
+	}
+	return &Row{rows: &Rows{r: r}}
 }
 
 // Begin starts a write transaction. Only one write transaction can be active

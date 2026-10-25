@@ -164,6 +164,7 @@ type Pager struct {
 	base     map[uint32][]byte // checkpointed pages of in-memory databases
 	cache    map[uint32][]byte // checkpointed file pages
 	cacheMax int
+	objs     objCache // decoded page images
 
 	versions map[uint32][]version // uncheckpointed versions, ascending seq
 	walPages int                  // number of versions
@@ -189,7 +190,9 @@ type Pager struct {
 }
 
 func newPager() *Pager {
-	return &Pager{versions: map[uint32][]version{}, readers: map[uint64]int{}}
+	p := &Pager{versions: map[uint32][]version{}, readers: map[uint64]int{}}
+	p.objs.setSize(defaultCache)
+	return p
 }
 
 // OpenMemory creates an empty, purely in-memory pager.
@@ -1001,6 +1004,13 @@ type View struct {
 	spGen    int
 	undo     []undoEntry
 	undoSeen map[uint32]struct{}
+
+	owned map[uint32]ownedObj // see SetOwned
+}
+
+type ownedObj struct {
+	buf []byte
+	obj any
 }
 
 type undoEntry struct {

@@ -477,6 +477,7 @@ func (db *DB) installLocked(w *SnapshotWriter) error {
 		db.p = p
 	}
 	db.p.SetOnCommit(db.repl.onCommit)
+	db.p.SetCacheSize(db.cacheSize)
 	db.repl.mu.Lock()
 	db.repl.lastSeq = db.p.Header().Seq
 	db.repl.frames, db.repl.bytes = nil, 0

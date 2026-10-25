@@ -53,7 +53,8 @@ func BenchmarkPointLookupPK(b *testing.B) {
 	db := benchDB(b, 100000)
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		if _, err := db.Query(`SELECT name FROM t WHERE id = ?`, i%100000+1); err != nil {
+		var name string
+		if err := db.QueryRow(`SELECT name FROM t WHERE id = ?`, i%100000+1).Scan(&name); err != nil {
 			b.Fatal(err)
 		}
 	}
@@ -63,7 +64,8 @@ func BenchmarkPointLookupIndex(b *testing.B) {
 	db := benchDB(b, 100000)
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		if _, err := db.Query(`SELECT id FROM t WHERE name = ?`, fmt.Sprintf("user%07d", i%100000)); err != nil {
+		var id int64
+		if err := db.QueryRow(`SELECT id FROM t WHERE name = ?`, fmt.Sprintf("user%07d", i%100000)).Scan(&id); err != nil {
 			b.Fatal(err)
 		}
 	}
@@ -73,8 +75,32 @@ func BenchmarkFullScanAggregate100k(b *testing.B) {
 	db := benchDB(b, 100000)
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		if _, err := db.Query(`SELECT score, COUNT(*) FROM t GROUP BY score`); err != nil {
+		rows, err := db.Query(`SELECT score, COUNT(*) FROM t GROUP BY score`)
+		if err != nil {
 			b.Fatal(err)
+		}
+		if all, err := rows.All(); err != nil || len(all) != 100 {
+			b.Fatalf("%d groups: %v", len(all), err)
+		}
+	}
+}
+
+// BenchmarkRangeScan reads 100 consecutive rows through an index.
+func BenchmarkRangeScan(b *testing.B) {
+	db := benchDB(b, 100000)
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		rows, err := db.Query(`SELECT id, score FROM t WHERE name >= ? ORDER BY name LIMIT 100`, fmt.Sprintf("user%07d", i%99000))
+		if err != nil {
+			b.Fatal(err)
+		}
+		n := 0
+		for rows.Next() {
+			n++
+		}
+		rows.Close()
+		if n != 100 {
+			b.Fatalf("%d rows", n)
 		}
 	}
 }

@@ -280,14 +280,52 @@ type compoundOrder struct {
 	desc bool
 }
 
+// small reports whether the result is known to be small (a few hundred rows
+// at most), so it can be produced at once instead of streamed.
+func (r *selectRun) small() bool {
+	if r.parts != nil {
+		return false
+	}
+	if r.limit >= 0 && r.limit <= 256 {
+		return true
+	}
+	p := r.p
+	if p.agg && len(p.groupBy) == 0 || len(p.levels) == 0 {
+		return true
+	}
+	if len(p.levels) != 1 || p.levels[0].virtual != nil {
+		return false
+	}
+	switch acc := p.levels[0].acc; acc.kind {
+	case accRowidEq:
+		return true
+	case accRowidIn:
+		return len(acc.eq) <= 256
+	case accIndex:
+		return acc.ix.Unique && len(acc.prefix) == len(acc.ix.cols) ||
+			acc.ix.Unique && len(acc.prefix) == len(acc.ix.cols)-1 && acc.in != nil && len(acc.in) <= 256
+	}
+	return false
+}
+
 func (x *execCtx) prepareSelect(st *sql.Select) (*selectRun, error) {
 	if len(st.Compound) > 0 {
 		return x.prepareCompound(st)
 	}
-	p, err := x.planSelect(st)
-	if err != nil {
-		return nil, err
+	var p *selectPlan
+	if x.plans != nil && x.outer == nil {
+		p = x.plans.get(st, x.cat)
 	}
+	if p == nil {
+		var err error
+		if p, err = x.planSelect(st); err != nil {
+			return nil, err
+		}
+		if x.plans != nil && x.outer == nil && p.cacheable(st) {
+			x.plans.put(st, x.cat, p)
+		}
+	}
+	var err error
 	r := &selectRun{st: st, p: p, limit: -1}
 	if st.Limit != nil {
 		if r.limit, err = evalInt(st.Limit, x.args, "LIMIT"); err != nil {

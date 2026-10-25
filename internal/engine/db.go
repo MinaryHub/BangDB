@@ -39,7 +39,13 @@ type Options struct {
 	SortMemory int
 	// TempDir holds the spill files. Default: os.TempDir().
 	TempDir string
+	// CacheSize is the memory for cached file pages and decoded B+tree
+	// nodes. Default: 32 MiB.
+	CacheSize int
 }
+
+// DefaultCacheSize is the default Options.CacheSize.
+const DefaultCacheSize = 32 << 20
 
 // Result is the outcome of executing SQL.
 type Result struct {
@@ -69,6 +75,8 @@ type DB struct {
 	busyTimeout  time.Duration
 	queryTimeout time.Duration
 	spill        *spillConfig
+	cacheSize    int
+	plans        planCache
 
 	cacheMu   sync.Mutex
 	stmtCache map[string]parsed
@@ -108,6 +116,11 @@ func Open(path string, opts *Options) (*DB, error) {
 		db.busyTimeout = opts.BusyTimeout
 	}
 	db.spill = &spillConfig{limit: DefaultSortMemory}
+	db.cacheSize = DefaultCacheSize
+	if opts != nil && opts.CacheSize > 0 {
+		db.cacheSize = opts.CacheSize
+	}
+	p.SetCacheSize(db.cacheSize)
 	if opts != nil {
 		db.queryTimeout = opts.QueryTimeout
 		db.spill.dir = opts.TempDir
@@ -341,7 +354,7 @@ func (db *DB) read(ctx context.Context, fn func(x *execCtx) (Result, error), arg
 		return Result{}, err
 	}
 	defer snap.Release()
-	x := &execCtx{v: snap.View(), cat: snap.Meta().(*Catalog), args: args, ctx: ctx, spill: db.spill}
+	x := &execCtx{v: snap.View(), cat: snap.Meta().(*Catalog), args: args, ctx: ctx, spill: db.spill, plans: &db.plans}
 	return fn(x)
 }
 

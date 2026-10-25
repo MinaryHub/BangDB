@@ -26,6 +26,7 @@ type execCtx struct {
 
 	fkDepth int          // nesting of foreign key actions and views
 	spill   *spillConfig // nil: defaults
+	plans   *planCache   // nil: no plan reuse
 }
 
 // tick is called once per row visited; every 256 rows it checks whether the

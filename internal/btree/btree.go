@@ -200,19 +200,56 @@ func Create(v *pager.View) (uint32, error) {
 // Open returns a handle for the tree rooted at root.
 func Open(v *pager.View, root uint32) *Tree { return &Tree{v: v, root: root} }
 
+// load returns the node at pg. It may be shared with other readers through
+// the pager's decoded-page cache and must not be modified; use loadMut.
 func (t *Tree) load(pg uint32) (*node, error) {
 	b, err := t.v.Read(pg)
 	if err != nil {
 		return nil, err
 	}
-	n, err := decode(b)
+	obj, err := t.v.Decoded(b, decodeAny)
 	if err != nil {
 		return nil, fmt.Errorf("%w (page %d)", err, pg)
 	}
-	return n, nil
+	return obj.(*node), nil
 }
 
-func (t *Tree) store(pg uint32, n *node) { t.v.Write(pg, n.encode()) }
+func decodeAny(b []byte) (any, error) { return decode(b) }
+
+// loadMut returns a private copy of the node at pg for modification. It
+// does not populate the decoded-page cache: the page is about to change.
+func (t *Tree) loadMut(pg uint32) (*node, error) {
+	b, err := t.v.Read(pg)
+	if err != nil {
+		return nil, err
+	}
+	if obj, ok := t.v.TakeOwned(pg, b); ok {
+		return obj.(*node), nil // written by this view: already private
+	}
+	obj, ok := t.v.Cached(b)
+	if !ok {
+		n, err := decode(b)
+		if err != nil {
+			return nil, fmt.Errorf("%w (page %d)", err, pg)
+		}
+		return n, nil // freshly decoded: already private
+	}
+	n := obj.(*node)
+	c := *n
+	c.keys = append(make([][]byte, 0, len(n.keys)+1), n.keys...)
+	if n.leaf {
+		c.vals = append(make([]value, 0, len(n.vals)+1), n.vals...)
+	} else {
+		c.children = append(make([]uint32, 0, len(n.children)+1), n.children...)
+	}
+	return &c, nil
+}
+
+func (t *Tree) store(pg uint32, n *node) {
+	b := n.encode()
+	t.v.Write(pg, b)
+	t.v.SetOwned(pg, b, n)
+}
 
 // childIndex: children[i] holds keys < keys[i]; children[i+1] holds keys >= keys[i].
 func childIndex(n *node, key []byte) int {
@@ -358,7 +395,7 @@ func (t *Tree) Put(key, val []byte) error {
 }
 
 func (t *Tree) insert(pg uint32, key []byte, v value) (*split, error) {
-	n, err := t.load(pg)
+	n, err := t.loadMut(pg)
 	if err != nil {
 		return nil, err
 	}
@@ -487,7 +524,7 @@ func (t *Tree) Delete(key []byte) (bool, error) {
 // del removes key from the subtree at pg. under reports that the node at pg
 // is now below minFill.
 func (t *Tree) del(pg uint32, key []byte) (found, under bool, err error) {
-	n, err := t.load(pg)
+	n, err := t.loadMut(pg)
 	if err != nil {
 		return false, false, err
 	}
@@ -560,12 +597,15 @@ func (t *Tree) rebalance(n *node, ci int) (bool, error) {
 	var sep []byte
 	if merged.leaf {
 		m := leafSplit(merged)
-		nl = &node{leaf: true, keys: merged.keys[:m], vals: merged.vals[:m], next: rpg}
+		// Capped slices: the halves share arrays and both stay owned by
+		// the view (see store), so appending to one must not clobber the
+		// other.
+		nl = &node{leaf: true, keys: merged.keys[:m:m], vals: merged.vals[:m:m], next: rpg}
 		nr = &node{leaf: true, keys: merged.keys[m:], vals: merged.vals[m:], next: right.next}
 		sep = nr.keys[0]
 	} else {
 		m := internalSplit(merged)
-		nl = &node{keys: merged.keys[:m], children: merged.children[:m+1]}
+		nl = &node{keys: merged.keys[:m:m], children: merged.children[: m+1 : m+1]}
 		nr = &node{keys: merged.keys[m+1:], children: merged.children[m+1:]}
 		sep = merged.keys[m]
 	}
