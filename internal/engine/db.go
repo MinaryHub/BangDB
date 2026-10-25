@@ -67,6 +67,7 @@ type DB struct {
 
 	path     string // "" for in-memory
 	readOnly atomic.Bool
+	cursors  cursorSet
 	repl     *replLog
 
 	closeOnce sync.Once
@@ -120,6 +121,7 @@ func (db *DB) Close() error {
 			return
 		}
 		close(db.closed)
+		db.cursors.cancelAll() // open cursors release their snapshots
 		db.swapMu.Lock()
 		err = db.p.Close()
 		db.swapMu.Unlock()

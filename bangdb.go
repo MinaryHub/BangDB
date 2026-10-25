@@ -87,12 +87,16 @@ func (db *DB) Query(query string, args ...any) (*Rows, error) {
 }
 
 // QueryContext is Query with cancellation (see ExecContext).
+//
+// A single SELECT is streamed: rows are produced while you iterate, from a
+// consistent snapshot taken when the query starts. Always Close the Rows (or
+// iterate to the end); an open Rows keeps its snapshot pinned.
 func (db *DB) QueryContext(ctx context.Context, query string, args ...any) (*Rows, error) {
-	r, err := db.e.QueryContext(ctx, query, args...)
+	r, err := db.e.QueryRows(ctx, query, args...)
 	if err != nil {
 		return nil, err
 	}
-	return newRows(r), nil
+	return &Rows{r: r}, nil
 }
 
 // QueryRow runs a query expected to return at most one row.
@@ -181,13 +185,14 @@ func (tx *Tx) Query(query string, args ...any) (*Rows, error) {
 	return tx.QueryContext(context.Background(), query, args...)
 }
 
-// QueryContext is Query with cancellation.
+// QueryContext is Query with cancellation. Results inside a transaction are
+// materialized.
 func (tx *Tx) QueryContext(ctx context.Context, query string, args ...any) (*Rows, error) {
 	r, err := tx.t.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, err
 	}
-	return newRows(r), nil
+	return &Rows{r: engine.RowsFromResult(r)}, nil
 }
 
 // QueryRow runs a query expected to return at most one row.
@@ -202,58 +207,49 @@ func (tx *Tx) Commit() error { return tx.t.Commit() }
 // Rollback discards the changes.
 func (tx *Tx) Rollback() error { return tx.t.Rollback() }
 
-// Rows is a result set.
-type Rows struct {
-	cols []string
-	data [][]any
-	pos  int
-}
-
-func newRows(r engine.Result) *Rows { return &Rows{cols: r.Columns, data: r.Rows, pos: -1} }
+// Rows is a result set. Use Next to iterate and Close when done early.
+type Rows struct{ r *engine.Rows }
 
 // Columns returns the column names.
-func (r *Rows) Columns() []string { return r.cols }
+func (r *Rows) Columns() []string { return r.r.Columns() }
 
-// Len returns the number of rows.
-func (r *Rows) Len() int { return len(r.data) }
-
-// Next advances to the next row.
-func (r *Rows) Next() bool {
-	if r.pos+1 >= len(r.data) {
-		r.pos = len(r.data)
-		return false
-	}
-	r.pos++
-	return true
-}
+// Next advances to the next row. It returns false at the end of the result
+// or on error (check Err); the Rows is then closed automatically.
+func (r *Rows) Next() bool { return r.r.Next() }
 
 // Values returns the current row. Values are nil, int64, float64, string or
 // []byte.
-func (r *Rows) Values() []any { return r.data[r.pos] }
+func (r *Rows) Values() []any { return r.r.Row() }
 
-// All returns every row.
-func (r *Rows) All() [][]any { return r.data }
+// All reads every remaining row into memory and closes the Rows.
+func (r *Rows) All() ([][]any, error) {
+	var out [][]any
+	for r.r.Next() {
+		out = append(out, r.r.Row())
+	}
+	return out, r.r.Err()
+}
 
-// Close is a no-op kept for symmetry with database/sql.
-func (r *Rows) Close() error { return nil }
+// Close stops the query and releases its snapshot.
+func (r *Rows) Close() error { return r.r.Close() }
 
-// Err is always nil; errors are reported by Query. Kept for symmetry with
-// database/sql.
-func (r *Rows) Err() error { return nil }
+// Err returns the error that ended iteration (for example a canceled
+// context).
+func (r *Rows) Err() error { return r.r.Err() }
 
 // Scan copies the current row into dest. Supported destinations: *any,
 // *int, *int64, *int32, *float64, *string, *[]byte, *bool, *time.Time.
 func (r *Rows) Scan(dest ...any) error {
-	if r.pos < 0 || r.pos >= len(r.data) {
+	row := r.r.Row()
+	if row == nil {
 		return errors.New("bangdb: Scan called without a current row")
 	}
-	row := r.data[r.pos]
 	if len(dest) != len(row) {
 		return fmt.Errorf("bangdb: expected %d destination arguments, got %d", len(row), len(dest))
 	}
 	for i, d := range dest {
 		if err := convertAssign(d, row[i]); err != nil {
-			return fmt.Errorf("bangdb: column %s: %w", r.cols[i], err)
+			return fmt.Errorf("bangdb: column %s: %w", r.r.Columns()[i], err)
 		}
 	}
 	return nil
@@ -270,7 +266,11 @@ func (r *Row) Scan(dest ...any) error {
 	if r.err != nil {
 		return r.err
 	}
+	defer r.rows.Close()
 	if !r.rows.Next() {
+		if err := r.rows.Err(); err != nil {
+			return err
+		}
 		return ErrNoRows
 	}
 	return r.rows.Scan(dest...)

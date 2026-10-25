@@ -31,7 +31,8 @@ func TestQueryCancellation(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
 	defer cancel()
 	start := time.Now()
-	_, err := db.QueryContext(ctx, slowQuery)
+	var n int
+	err := db.QueryRowContext(ctx, slowQuery).Scan(&n)
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("want DeadlineExceeded, got %v", err)
 	}
@@ -53,7 +54,8 @@ func TestQueryCancellation(t *testing.T) {
 
 func TestQueryTimeoutOption(t *testing.T) {
 	db := slowDB(t, &Options{QueryTimeout: 50 * time.Millisecond})
-	if _, err := db.Query(slowQuery); !errors.Is(err, context.DeadlineExceeded) {
+	var n int
+	if err := db.QueryRow(slowQuery).Scan(&n); !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("want DeadlineExceeded, got %v", err)
 	}
 	// Inside a transaction the canceled statement is undone, the tx survives.

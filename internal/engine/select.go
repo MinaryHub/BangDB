@@ -202,54 +202,111 @@ func evalInt(e sql.Expr, args []any, what string) (int64, error) {
 }
 
 func (x *execCtx) execSelect(st *sql.Select) (Result, error) {
-	p, err := x.planSelect(st)
+	r, err := x.prepareSelect(st)
 	if err != nil {
 		return Result{}, err
 	}
-	limit, offset := int64(-1), int64(0)
+	var rows [][]any
+	err = x.runSelect(r, func(vals []any) (bool, error) {
+		rows = append(rows, vals)
+		return true, nil
+	})
+	if err != nil {
+		return Result{}, err
+	}
+	return Result{Columns: r.p.cols, Rows: rows}, nil
+}
+
+// selectRun is a planned SELECT ready to execute.
+type selectRun struct {
+	st            *sql.Select
+	p             *selectPlan
+	limit, offset int64
+}
+
+func (x *execCtx) prepareSelect(st *sql.Select) (*selectRun, error) {
+	p, err := x.planSelect(st)
+	if err != nil {
+		return nil, err
+	}
+	r := &selectRun{st: st, p: p, limit: -1}
 	if st.Limit != nil {
-		if limit, err = evalInt(st.Limit, x.args, "LIMIT"); err != nil {
-			return Result{}, err
+		if r.limit, err = evalInt(st.Limit, x.args, "LIMIT"); err != nil {
+			return nil, err
 		}
 	}
 	if st.Offset != nil {
-		if offset, err = evalInt(st.Offset, x.args, "OFFSET"); err != nil {
-			return Result{}, err
+		if r.offset, err = evalInt(st.Offset, x.args, "OFFSET"); err != nil {
+			return nil, err
 		}
-		offset = max(offset, 0)
+		r.offset = max(r.offset, 0)
 	}
+	return r, nil
+}
 
+// runSelect executes a planned SELECT and passes each result row to sink,
+// which returns false to stop early. Queries without sorting, grouping or
+// DISTINCT stream rows as they are found; others are buffered (sorting with
+// LIMIT keeps only the top rows in memory).
+func (x *execCtx) runSelect(r *selectRun, sink func(vals []any) (bool, error)) error {
+	p, st, limit, offset := r.p, r.st, r.limit, r.offset
 	e := &env{row: make([]any, len(p.sc.cols)), args: x.args}
+	streaming := !p.agg && len(p.orderBy) == 0 && !st.Distinct
 	var out []outRow
+	sortOut := func() {
+		sort.SliceStable(out, func(i, j int) bool {
+			for k, o := range p.orderBy {
+				c := value.Compare(out[i].keys[k], out[j].keys[k])
+				if c != 0 {
+					return (c < 0) != o.desc
+				}
+			}
+			return false
+		})
+	}
+	topK := int64(-1)
+	if len(p.orderBy) > 0 && limit >= 0 && !st.Distinct {
+		topK = offset + limit
+	}
+	emitted, skipped := int64(0), int64(0)
+	stopped := false
 	project := func() error {
-		r := outRow{vals: make([]any, len(p.items))}
+		vals := make([]any, len(p.items))
 		for i, f := range p.items {
 			v, err := f(e)
 			if err != nil {
 				return err
 			}
-			r.vals[i] = v
+			vals[i] = v
 		}
+		if streaming {
+			cont, err := sink(vals)
+			emitted++
+			stopped = stopped || !cont
+			return err
+		}
+		row := outRow{vals: vals}
 		if len(p.orderBy) > 0 {
-			r.keys = make([]any, len(p.orderBy))
+			row.keys = make([]any, len(p.orderBy))
 			for i, o := range p.orderBy {
 				if o.outIdx >= 0 {
-					r.keys[i] = r.vals[o.outIdx]
+					row.keys[i] = vals[o.outIdx]
 					continue
 				}
 				v, err := o.fn(e)
 				if err != nil {
 					return err
 				}
-				r.keys[i] = v
+				row.keys[i] = v
 			}
 		}
-		out = append(out, r)
+		out = append(out, row)
+		if topK >= 0 && int64(len(out)) >= 2*topK+1024 {
+			sortOut()
+			out = out[:topK]
+		}
 		return nil
 	}
-	// Without sorting, grouping or DISTINCT we can stop as soon as LIMIT is met.
-	streaming := !p.agg && len(p.orderBy) == 0 && !st.Distinct
-	skipped := int64(0)
 
 	if !p.agg {
 		emit := func() (bool, error) {
@@ -257,31 +314,32 @@ func (x *execCtx) execSelect(st *sql.Select) (Result, error) {
 				skipped++
 				return true, nil
 			}
-			if streaming && limit >= 0 && int64(len(out)) >= limit {
+			if streaming && limit >= 0 && emitted >= limit {
 				return false, nil
 			}
 			if err := project(); err != nil {
 				return false, err
 			}
-			return !(streaming && limit >= 0 && int64(len(out)) >= limit), nil
+			return !stopped && !(streaming && limit >= 0 && emitted >= limit), nil
 		}
 		if len(p.levels) == 0 {
 			if ok, err := passes(p.final, e); err != nil {
-				return Result{}, err
+				return err
 			} else if ok {
 				if _, err := emit(); err != nil {
-					return Result{}, err
+					return err
 				}
 			}
 		} else if limit != 0 || !streaming {
 			if err := x.runJoin(p.levels, p.final, e, emit); err != nil {
-				return Result{}, err
+				return err
 			}
 		}
-	} else {
-		if err := x.runGrouped(p, e, project); err != nil {
-			return Result{}, err
-		}
+	} else if err := x.runGrouped(p, e, project); err != nil {
+		return err
+	}
+	if streaming {
+		return nil
 	}
 
 	if st.Distinct {
@@ -300,29 +358,20 @@ func (x *execCtx) execSelect(st *sql.Select) (Result, error) {
 		out = uniq
 	}
 	if len(p.orderBy) > 0 {
-		sort.SliceStable(out, func(i, j int) bool {
-			for k, o := range p.orderBy {
-				c := value.Compare(out[i].keys[k], out[j].keys[k])
-				if c != 0 {
-					return (c < 0) != o.desc
-				}
-			}
-			return false
-		})
+		sortOut()
 	}
-	if !streaming {
-		if offset > 0 {
-			out = out[min(int(offset), len(out)):]
-		}
-		if limit >= 0 && int64(len(out)) > limit {
-			out = out[:limit]
+	if offset > 0 {
+		out = out[min(int(offset), len(out)):]
+	}
+	if limit >= 0 && int64(len(out)) > limit {
+		out = out[:limit]
+	}
+	for _, r := range out {
+		if cont, err := sink(r.vals); err != nil || !cont {
+			return err
 		}
 	}
-	res := Result{Columns: p.cols, Rows: make([][]any, len(out))}
-	for i, r := range out {
-		res.Rows[i] = r.vals
-	}
-	return res, nil
+	return nil
 }
 
 type group struct {

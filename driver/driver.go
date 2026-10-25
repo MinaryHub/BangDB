@@ -101,7 +101,7 @@ func (c *conn) QueryContext(ctx context.Context, query string, args []driver.Nam
 	if err != nil {
 		return nil, err
 	}
-	r, err := c.c.ExecContext(ctx, query, vals...)
+	r, err := c.c.QueryRows(ctx, query, vals...)
 	if err != nil {
 		return nil, err
 	}
@@ -176,21 +176,20 @@ type result struct{ r engine.Result }
 func (r result) LastInsertId() (int64, error) { return r.r.LastInsertID, nil }
 func (r result) RowsAffected() (int64, error) { return r.r.RowsAffected, nil }
 
-type rows struct {
-	r   engine.Result
-	pos int
-}
+type rows struct{ r *engine.Rows }
 
-func (r *rows) Columns() []string { return r.r.Columns }
-func (r *rows) Close() error      { return nil }
+func (r *rows) Columns() []string { return r.r.Columns() }
+func (r *rows) Close() error      { return r.r.Close() }
 
 func (r *rows) Next(dest []driver.Value) error {
-	if r.pos >= len(r.r.Rows) {
+	if !r.r.Next() {
+		if err := r.r.Err(); err != nil {
+			return err
+		}
 		return io.EOF
 	}
-	for i, v := range r.r.Rows[r.pos] {
+	for i, v := range r.r.Row() {
 		dest[i] = v
 	}
-	r.pos++
 	return nil
 }
