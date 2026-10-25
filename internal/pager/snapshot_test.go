@@ -238,3 +238,78 @@ func TestCrashDuringCheckpoint(t *testing.T) {
 		}
 	}
 }
+
+func TestGroupCommitVisibility(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "g.db")
+	p, _ := Open(path)
+	defer p.Close()
+	v := p.NewView()
+	pg, _ := v.Alloc()
+	v.Write(pg, page(1))
+	p.Commit(v)
+
+	// c1 is prepared but not flushed: the next writer builds on it, readers
+	// do not see it.
+	v = p.NewView()
+	v.Write(pg, page(2))
+	c1, err := p.PrepareCommit(v)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := p.NewView().Read(pg); !sameContent(got, 2) {
+		t.Fatal("writer does not see the pending commit")
+	}
+	s, _ := p.Snapshot()
+	if got, _ := s.View().Read(pg); !sameContent(got, 1) {
+		t.Fatal("reader sees a commit that is not durable yet")
+	}
+	s.Release()
+	v = p.NewView()
+	v.Write(pg, page(3))
+	c2, _ := p.PrepareCommit(v)
+
+	// Flushing c2 publishes c1 and c2 together, in order.
+	var published []uint64
+	p.SetOnCommit(func(seq uint64, _ map[uint32][]byte) { published = append(published, seq) })
+	if err := p.Flush(c2); err != nil {
+		t.Fatal(err)
+	}
+	if err := p.Flush(c1); err != nil { // already published: no-op
+		t.Fatal(err)
+	}
+	if len(published) != 2 || published[0] != c1.Seq() || published[1] != c2.Seq() {
+		t.Fatalf("published %v", published)
+	}
+	s, _ = p.Snapshot()
+	defer s.Release()
+	if got, _ := s.View().Read(pg); !sameContent(got, 3) {
+		t.Fatal("reader does not see the flushed commits")
+	}
+}
+
+func TestGroupCommitSyncFailure(t *testing.T) {
+	p, _ := Open(filepath.Join(t.TempDir(), "f.db"))
+	defer p.Close()
+	v := p.NewView()
+	pg, _ := v.Alloc()
+	v.Write(pg, page(1))
+	p.Commit(v)
+	before := p.Header().Seq
+
+	v = p.NewView()
+	v.Write(pg, page(2))
+	c1, _ := p.PrepareCommit(v)
+	v = p.NewView()
+	v.Write(pg, page(3))
+	c2, _ := p.PrepareCommit(v)
+	p.failpoint = func(string) error { return errCrash }
+	if err := p.Flush(c1); err == nil {
+		t.Fatal("expected sync failure")
+	}
+	if err := p.Flush(c2); err == nil {
+		t.Fatal("a commit built on a failed one must fail too")
+	}
+	if p.Header().Seq != before {
+		t.Fatal("nothing may be published after a failed sync")
+	}
+}

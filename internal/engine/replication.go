@@ -232,15 +232,15 @@ func (db *DB) OpenSnapshot(subscribe bool) (*Snapshot, error) {
 		db.swapMu.RUnlock()
 		return nil, pager.ErrClosed
 	}
-	db.pubMu.Lock()
-	ps, err := db.p.Snapshot()
 	var sub *Subscription
-	if err == nil && subscribe {
-		if sub, err = db.Subscribe(ps.Seq()); err != nil {
-			ps.Release()
+	ps, err := db.p.SnapshotWith(func(seq uint64) error {
+		if !subscribe {
+			return nil
 		}
-	}
-	db.pubMu.Unlock()
+		var err error
+		sub, err = db.Subscribe(seq)
+		return err
+	})
 	if err != nil {
 		db.swapMu.RUnlock()
 		return nil, err
@@ -315,13 +315,18 @@ func (db *DB) ApplyFrame(f Frame) error {
 	if err != nil {
 		return err
 	}
-	return db.publish(c, func() (*Catalog, error) { return loadCatalog(db.p.NewView()) })
+	cat, err := loadCatalog(db.p.NewView())
+	if err != nil {
+		return err
+	}
+	db.prepared(c, cat)
+	return db.p.Flush(c)
 }
 
 // framePages validates f against the local sequence; nil means "already
 // applied".
 func framePages(p *pager.Pager, f Frame) (map[uint32][]byte, error) {
-	cur := p.Header().Seq
+	cur := p.PreparedHeader().Seq
 	if f.Seq <= cur {
 		return nil, nil
 	}
@@ -357,6 +362,7 @@ func (db *DB) reloadCatalogLocked() error {
 	db.catMu.Lock()
 	db.cat = cat
 	db.catMu.Unlock()
+	db.p.SetMeta(cat)
 	return nil
 }
 

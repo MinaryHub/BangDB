@@ -168,10 +168,7 @@ func (db *DB) stream(ctx context.Context, sel *sql.Select, args []any) (*Rows, e
 		cancelAll()
 		return nil, pager.ErrClosed
 	}
-	db.pubMu.Lock()
 	snap, err := db.p.Snapshot()
-	cat := db.committedCatalog()
-	db.pubMu.Unlock()
 	if err != nil {
 		db.swapMu.RUnlock()
 		cancelAll()
@@ -181,7 +178,7 @@ func (db *DB) stream(ctx context.Context, sel *sql.Select, args []any) (*Rows, e
 		snap.Release()
 		db.swapMu.RUnlock()
 	}
-	x := &execCtx{v: snap.View(), cat: cat, args: args, ctx: ctx}
+	x := &execCtx{v: snap.View(), cat: snap.Meta().(*Catalog), args: args, ctx: ctx}
 	run, err := x.prepareSelect(sel)
 	if err != nil {
 		release()

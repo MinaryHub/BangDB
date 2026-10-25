@@ -46,19 +46,17 @@ type Result struct {
 // Concurrency: any number of readers run in parallel with at most one write
 // transaction. Each statement outside a transaction reads a pager snapshot of
 // the latest commit, so readers and writers never wait for each other (a
-// reader only waits for the in-memory publication of a commit, never for its
-// I/O).
+// reader only takes the pager lock briefly). Commits are made durable in
+// groups: a committing writer releases the write lock before its WAL fsync,
+// so concurrent writers share fsyncs.
 type DB struct {
 	p        *pager.Pager
 	writeSem chan struct{} // capacity 1: the single-writer lock
-	// pubMu makes "publish a commit + install its catalog" atomic with
-	// respect to "take a snapshot + read the catalog".
-	pubMu sync.Mutex
 	// swapMu guards the pager pointer: readers hold R for a statement,
 	// replacing or closing the pager takes W.
 	swapMu       sync.RWMutex
 	catMu        sync.Mutex
-	cat          *Catalog // committed catalog (immutable)
+	cat          *Catalog // catalog of the latest prepared commit (immutable); readers use their snapshot's
 	busyTimeout  time.Duration
 	queryTimeout time.Duration
 
@@ -108,6 +106,7 @@ func Open(path string, opts *Options) (*DB, error) {
 		return nil, err
 	}
 	db.cat = cat
+	p.SetMeta(cat)
 	return db, nil
 }
 
@@ -282,39 +281,41 @@ func (db *DB) read(ctx context.Context, fn func(x *execCtx) (Result, error), arg
 	if db.isClosed() {
 		return Result{}, pager.ErrClosed
 	}
-	db.pubMu.Lock()
 	snap, err := db.p.Snapshot()
-	cat := db.committedCatalog()
-	db.pubMu.Unlock()
 	if err != nil {
 		return Result{}, err
 	}
 	defer snap.Release()
-	x := &execCtx{v: snap.View(), cat: cat, args: args, ctx: ctx}
+	x := &execCtx{v: snap.View(), cat: snap.Meta().(*Catalog), args: args, ctx: ctx}
 	return fn(x)
 }
 
-// publish makes a prepared commit and its catalog visible, then runs a
-// checkpoint if the WAL is large. The caller holds the write lock.
-func (db *DB) publish(c *pager.Prepared, cat func() (*Catalog, error)) error {
-	db.pubMu.Lock()
-	db.p.Publish(c)
-	var err error
-	if c != nil {
-		var nc *Catalog
-		if nc, err = cat(); err == nil {
-			db.catMu.Lock()
-			db.cat = nc
-			db.catMu.Unlock()
+// prepared records a commit's catalog: it is published with the commit and
+// is the base of the next write transaction. The caller holds the write
+// lock.
+func (db *DB) prepared(c *pager.Prepared, cat *Catalog) {
+	c.Meta = cat
+	db.catMu.Lock()
+	db.cat = cat
+	db.catMu.Unlock()
+}
+
+// maybeCheckpoint runs a checkpoint when the WAL is large and the write lock
+// is free (a busy writer will do it later). A failed checkpoint does not
+// undo any commit; it is retried and a broken file is reported by the next
+// operation.
+func (db *DB) maybeCheckpoint() {
+	if !db.p.NeedsCheckpoint() {
+		return
+	}
+	select {
+	case db.writeSem <- struct{}{}:
+		if !db.isClosed() {
+			db.p.Checkpoint()
 		}
+		db.unlockWrite()
+	default:
 	}
-	db.pubMu.Unlock()
-	if err == nil && db.p.NeedsCheckpoint() {
-		// A failed checkpoint does not undo the commit; it is retried later
-		// and a broken file is reported by the next operation.
-		db.p.Checkpoint()
-	}
-	return err
 }
 
 // Checkpoint copies committed pages from the WAL into the database file as
@@ -407,12 +408,20 @@ func (tx *Tx) Commit() error {
 		return ErrTxDone
 	}
 	tx.done = true
-	defer tx.db.unlockWrite()
 	c, err := tx.db.p.PrepareCommit(tx.v)
-	if err != nil {
+	if err != nil || c == nil {
+		tx.db.unlockWrite()
 		return err
 	}
-	return tx.db.publish(c, func() (*Catalog, error) { return tx.cat, nil })
+	tx.db.prepared(c, tx.cat)
+	// Group commit: release the write lock before waiting for the fsync, so
+	// the next writer can prepare and share it.
+	tx.db.unlockWrite()
+	if err := tx.db.p.Flush(c); err != nil {
+		return err
+	}
+	tx.db.maybeCheckpoint()
+	return nil
 }
 
 // Rollback discards the transaction's changes.
@@ -533,3 +542,6 @@ func (db *DB) PageCount() uint32 {
 	defer db.swapMu.RUnlock()
 	return db.p.Header().PageCount
 }
+
+// WALPages returns the number of page versions not yet checkpointed.
+func (db *DB) WALPages() int { return db.p.WALPages() }

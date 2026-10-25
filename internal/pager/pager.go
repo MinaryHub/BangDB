@@ -169,7 +169,11 @@ type Pager struct {
 	walPages int                  // number of versions
 	walSize  int64                // bytes used in the WAL file
 	verBytes int                  // bytes of version images held in memory
-	hdr      Header               // header of the latest published commit
+	hdr      Header               // header of the latest published (durable) commit
+	meta     any                  // caller data published with hdr (the engine's catalog)
+	prepHdr  Header               // header of the latest prepared commit (>= hdr)
+	pending  []*Prepared          // prepared commits waiting for their WAL fsync
+	flushMu  sync.Mutex           // one WAL fsync at a time (group commit)
 	readers  map[uint64]int       // active snapshot sequences -> count
 
 	err    error // sticky error after a failed commit
@@ -192,6 +196,7 @@ func newPager() *Pager {
 func OpenMemory() *Pager {
 	p := newPager()
 	p.hdr = newHeader()
+	p.prepHdr = p.hdr
 	p.base = map[uint32][]byte{0: p.hdr.encode()}
 	return p
 }
@@ -246,6 +251,7 @@ func Open(path string) (*Pager, error) {
 	if err := p.recover(); err != nil {
 		return fail(err)
 	}
+	p.prepHdr = p.hdr
 	return p, nil
 }
 
@@ -376,7 +382,7 @@ func (p *Pager) Close() error {
 	}
 	var errs []error
 	if !broken {
-		errs = append(errs, p.Checkpoint())
+		errs = append(errs, p.flushPending(), p.Checkpoint())
 	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -487,18 +493,39 @@ type Snapshot struct {
 	p        *Pager
 	seq      uint64
 	hdr      Header
+	meta     any
 	released bool
 }
 
 // Snapshot opens a read snapshot of the latest published commit.
-func (p *Pager) Snapshot() (*Snapshot, error) {
+func (p *Pager) Snapshot() (*Snapshot, error) { return p.SnapshotWith(nil) }
+
+// SnapshotWith opens a snapshot and calls fn with its sequence while no
+// commit can be published, e.g. to subscribe to all later commits.
+func (p *Pager) SnapshotWith(fn func(seq uint64) error) (*Snapshot, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if p.closed {
 		return nil, ErrClosed
 	}
+	if fn != nil {
+		if err := fn(p.hdr.Seq); err != nil {
+			return nil, err
+		}
+	}
 	p.readers[p.hdr.Seq]++
-	return &Snapshot{p: p, seq: p.hdr.Seq, hdr: p.hdr}, nil
+	return &Snapshot{p: p, seq: p.hdr.Seq, hdr: p.hdr, meta: p.meta}, nil
+}
+
+// Meta returns the caller data published with the snapshot's commit.
+func (s *Snapshot) Meta() any { return s.meta }
+
+// SetMeta sets the caller data of the current published state (used once
+// after opening, before any commit).
+func (p *Pager) SetMeta(m any) {
+	p.mu.Lock()
+	p.meta = m
+	p.mu.Unlock()
 }
 
 // Seq returns the commit sequence the snapshot sees.
@@ -525,34 +552,44 @@ func (s *Snapshot) Release() {
 	}
 }
 
-// NewView starts a write overlay on the latest commit. Only the single writer
-// may use it; it needs no snapshot because nothing else can commit or
-// checkpoint while the writer holds its lock.
+// NewView starts a write overlay on the latest prepared commit (which may
+// not be durable yet: the writer builds on commits still waiting for their
+// fsync). Only the single writer may use it; it needs no snapshot because
+// nothing else can commit or checkpoint while the writer holds its lock.
 func (p *Pager) NewView() *View {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	return &View{p: p, dirty: map[uint32][]byte{}, hdr: p.hdr, seq: p.hdr.Seq}
+	return &View{p: p, dirty: map[uint32][]byte{}, hdr: p.prepHdr, seq: p.prepHdr.Seq}
+}
+
+// PreparedHeader returns the header of the latest prepared commit.
+func (p *Pager) PreparedHeader() Header {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.prepHdr
 }
 
 // ---- commits ----
 
-// Prepared is a commit that is durable in the WAL but not yet visible.
+// Prepared is a commit written to the WAL but not yet durable or visible to
+// readers; Flush makes it both.
 type Prepared struct {
 	pages map[uint32][]byte
 	hdr   Header
-	offs  map[uint32]int64
-	end   int64 // WAL size after this commit
+	// Meta is published together with the commit (Snapshot.Meta).
+	Meta any
 }
 
 // Seq returns the commit's sequence number.
 func (c *Prepared) Seq() uint64 { return c.hdr.Seq }
 
-// PrepareCommit makes the view's changes durable in the WAL and assigns the
-// next sequence number. It returns nil if there is nothing to commit. The
-// commit becomes visible with Publish.
+// PrepareCommit appends the view's changes to the WAL (without fsync) and
+// assigns the next sequence number. It returns nil if there is nothing to
+// commit. The next writer may build on it at once; Flush makes it durable
+// and visible to readers. Writer-side.
 func (p *Pager) PrepareCommit(v *View) (*Prepared, error) {
 	p.mu.Lock()
-	cur, err := p.hdr, p.usable()
+	cur, err := p.prepHdr, p.usable()
 	p.mu.Unlock()
 	if err != nil {
 		return nil, err
@@ -595,67 +632,49 @@ func (p *Pager) prepare(pages map[uint32][]byte, hdr Header) (*Prepared, error) 
 		seal(b) // the pages are owned by the commit and not yet visible
 	}
 	c := &Prepared{pages: pages, hdr: hdr}
-	if p.file == nil {
-		return c, nil
-	}
-	nos := make([]uint32, 0, len(pages))
-	for no := range pages {
-		nos = append(nos, no)
-	}
-	sort.Slice(nos, func(i, j int) bool { return nos[i] < nos[j] })
-
-	start := p.walSize
-	buf := make([]byte, 0, 8+len(pages)*(4+PageSize)+20)
-	if start == 0 {
-		buf = append(buf, walMagic...)
-		buf = binary.BigEndian.AppendUint32(buf, PageSize)
-	}
-	c.offs = make(map[uint32]int64, len(pages))
-	crc := crc32.NewIEEE()
-	for _, no := range nos {
-		frameStart := len(buf)
-		buf = binary.BigEndian.AppendUint32(buf, no)
-		c.offs[no] = start + int64(len(buf))
-		buf = append(buf, pages[no]...)
-		crc.Write(buf[frameStart:])
-	}
-	buf = binary.BigEndian.AppendUint32(buf, commitMarker)
-	tail := len(buf)
-	buf = binary.BigEndian.AppendUint64(buf, hdr.Seq)
-	crc.Write(buf[tail:])
-	buf = binary.BigEndian.AppendUint32(buf, uint32(len(pages)))
-	buf = binary.BigEndian.AppendUint32(buf, crc.Sum32())
-	if _, err := p.wal.WriteAt(buf, start); err != nil {
-		p.wal.Truncate(start)
-		return nil, err
-	}
-	if err := p.wal.Sync(); err != nil {
-		p.wal.Truncate(start)
-		return nil, err
-	}
-	if p.failpoint != nil {
-		if err := p.failpoint("wal-synced"); err != nil {
-			p.mu.Lock()
-			p.err = err
-			p.mu.Unlock()
+	var offs map[uint32]int64
+	end := p.walSize
+	if p.file != nil {
+		nos := make([]uint32, 0, len(pages))
+		for no := range pages {
+			nos = append(nos, no)
+		}
+		sort.Slice(nos, func(i, j int) bool { return nos[i] < nos[j] })
+		start := p.walSize
+		buf := make([]byte, 0, 8+len(pages)*(4+PageSize)+20)
+		if start == 0 {
+			buf = append(buf, walMagic...)
+			buf = binary.BigEndian.AppendUint32(buf, PageSize)
+		}
+		offs = make(map[uint32]int64, len(pages))
+		crc := crc32.NewIEEE()
+		for _, no := range nos {
+			frameStart := len(buf)
+			buf = binary.BigEndian.AppendUint32(buf, no)
+			offs[no] = start + int64(len(buf))
+			buf = append(buf, pages[no]...)
+			crc.Write(buf[frameStart:])
+		}
+		buf = binary.BigEndian.AppendUint32(buf, commitMarker)
+		tail := len(buf)
+		buf = binary.BigEndian.AppendUint64(buf, hdr.Seq)
+		crc.Write(buf[tail:])
+		buf = binary.BigEndian.AppendUint32(buf, uint32(len(pages)))
+		buf = binary.BigEndian.AppendUint32(buf, crc.Sum32())
+		if _, err := p.wal.WriteAt(buf, start); err != nil {
+			p.wal.Truncate(start)
 			return nil, err
 		}
-	}
-	c.end = start + int64(len(buf))
-	return c, nil
-}
-
-// Publish makes a prepared commit visible to new snapshots.
-func (p *Pager) Publish(c *Prepared) {
-	if c == nil {
-		return
+		end = start + int64(len(buf))
 	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	for no, data := range c.pages {
-		v := version{seq: c.hdr.Seq, data: data}
+	// Register the versions now: the next writer reads them; readers do not
+	// see them until the commit is published (their snapshots are older).
+	for no, data := range pages {
+		v := version{seq: hdr.Seq, data: data}
 		if p.file != nil {
-			v.off = c.offs[no]
+			v.off = offs[no]
 			if p.verBytes+PageSize > versionMemBudget {
 				v.data = nil
 			} else {
@@ -665,33 +684,99 @@ func (p *Pager) Publish(c *Prepared) {
 		p.versions[no] = append(p.versions[no], v)
 		p.walPages++
 	}
-	if p.file != nil {
-		p.walSize = c.end
-	}
-	p.hdr = c.hdr
-	if p.onCommit != nil {
-		p.onCommit(c.hdr.Seq, c.pages)
-	}
+	p.walSize = end
+	p.prepHdr = hdr
+	p.pending = append(p.pending, c)
+	return c, nil
 }
 
-// Commit is PrepareCommit followed by Publish.
+// Flush makes c durable and visible. Commits are made durable in groups: one
+// WAL fsync covers every commit prepared so far, and they are published in
+// order. Safe to call from any goroutine.
+func (p *Pager) Flush(c *Prepared) error {
+	if c == nil {
+		return nil
+	}
+	p.flushMu.Lock()
+	defer p.flushMu.Unlock()
+	p.mu.Lock()
+	if p.hdr.Seq >= c.hdr.Seq {
+		p.mu.Unlock()
+		return nil // published by an earlier flush
+	}
+	err := p.usable()
+	p.mu.Unlock()
+	if err != nil {
+		return err
+	}
+	return p.flushLocked()
+}
+
+// flushPending makes every prepared commit durable (used on Close).
+func (p *Pager) flushPending() error {
+	p.flushMu.Lock()
+	defer p.flushMu.Unlock()
+	return p.flushLocked()
+}
+
+func (p *Pager) flushLocked() error {
+	p.mu.Lock()
+	batch := append([]*Prepared(nil), p.pending...)
+	p.mu.Unlock()
+	if len(batch) == 0 {
+		return nil
+	}
+	if p.file != nil {
+		err := p.wal.Sync()
+		if err == nil && p.failpoint != nil {
+			err = p.failpoint("wal-synced")
+		}
+		if err != nil {
+			// Later commits were built on these; nothing can be published.
+			p.mu.Lock()
+			p.err = fmt.Errorf("bangdb: WAL sync failed, reopen the database: %w", err)
+			p.mu.Unlock()
+			return err
+		}
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for _, c := range batch {
+		p.hdr = c.hdr
+		if c.Meta != nil {
+			p.meta = c.Meta
+		}
+		if p.onCommit != nil {
+			p.onCommit(c.hdr.Seq, c.pages)
+		}
+	}
+	// Drop references so the page images can be collected.
+	for i := range batch {
+		p.pending[i] = nil
+	}
+	p.pending = p.pending[len(batch):]
+	if len(p.pending) == 0 {
+		p.pending = nil
+	}
+	return nil
+}
+
+// Commit is PrepareCommit followed by Flush.
 func (p *Pager) Commit(v *View) error {
 	c, err := p.PrepareCommit(v)
 	if err != nil {
 		return err
 	}
-	p.Publish(c)
-	return nil
+	return p.Flush(c)
 }
 
-// CommitRaw is PrepareRaw followed by Publish.
+// CommitRaw is PrepareRaw followed by Flush.
 func (p *Pager) CommitRaw(pages map[uint32][]byte) error {
 	c, err := p.PrepareRaw(pages)
 	if err != nil {
 		return err
 	}
-	p.Publish(c)
-	return nil
+	return p.Flush(c)
 }
 
 // NeedsCheckpoint reports whether the WAL has grown past CheckpointPages.
@@ -895,7 +980,7 @@ func (p *Pager) FinishRaw(seq uint64) error {
 		}
 		clear(p.cache)
 	}
-	p.hdr = hdr
+	p.hdr, p.prepHdr = hdr, hdr
 	return nil
 }
 
