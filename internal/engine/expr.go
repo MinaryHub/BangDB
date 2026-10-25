@@ -6,6 +6,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 	"unicode/utf8"
 
 	"github.com/knoxxr/bangdb/internal/sql"
@@ -26,6 +27,7 @@ type scopeCol struct {
 	name   string
 	level  int // position of the table in the FROM list
 	hidden bool
+	coll   string // collation of the column (NOCASE, RTRIM or "")
 }
 
 // scope maps column references to positions in env.row. outer links to
@@ -157,6 +159,8 @@ func walk(e sql.Expr, fn func(sql.Expr)) {
 		for _, a := range x.Args {
 			walk(a, fn)
 		}
+	case *sql.Collate:
+		walk(x.X, fn)
 	case *sql.Case:
 		walk(x.Operand, fn)
 		for _, w := range x.Whens {
@@ -250,6 +254,12 @@ func (c *compiler) compile(e sql.Expr) (evalFn, error) {
 		if err != nil {
 			return nil, err
 		}
+		if coll := c.collationOf(x.X); coll != "" {
+			lhs = withCollation(lhs, coll)
+			for i := range list {
+				list[i] = withCollation(list[i], coll)
+			}
+		}
 		not := x.Not
 		return func(e *env) (any, error) {
 			v, err := lhs(e)
@@ -275,6 +285,8 @@ func (c *compiler) compile(e sql.Expr) (evalFn, error) {
 		}, nil
 	case *sql.Between:
 		return c.compile(betweenAsAnd(x))
+	case *sql.Collate:
+		return c.compile(x.X) // collations only matter where values are compared
 	case *sql.Subquery:
 		return c.compileScalarSubquery(x.Select)
 	case *sql.Exists:
@@ -371,6 +383,9 @@ func (c *compiler) compileBinary(x *sql.Binary) (evalFn, error) {
 			return boolVal(isAnd), nil
 		}, nil
 	case "=", "!=", "<", "<=", ">", ">=":
+		if coll := c.comparisonCollation(x.L, x.R); coll != "" {
+			l, r = withCollation(l, coll), withCollation(r, coll)
+		}
 		return func(e *env) (any, error) {
 			lv, err := l(e)
 			if err != nil {
@@ -550,11 +565,78 @@ func likeMatch(pattern, s string) bool {
 	return pi == len(p)
 }
 
+// foldASCII folds case for LIKE (Unicode-aware despite its name: ASCII
+// takes a fast path).
 func foldASCII(r rune) rune {
 	if r >= 'A' && r <= 'Z' {
 		return r + 32
 	}
-	return r
+	if r < 0x80 {
+		return r
+	}
+	return unicode.ToLower(r)
+}
+
+// collationFold returns the text folding of a collation (nil = binary).
+func collationFold(name string) func(string) string {
+	switch name {
+	case "NOCASE":
+		return strings.ToLower
+	case "RTRIM":
+		return func(s string) string { return strings.TrimRight(s, " ") }
+	}
+	return nil
+}
+
+// foldValue applies a collation to a text value.
+func foldValue(v any, coll string) any {
+	if s, ok := v.(string); ok {
+		if f := collationFold(coll); f != nil {
+			return f(s)
+		}
+	}
+	return v
+}
+
+func withCollation(fn evalFn, coll string) evalFn {
+	if collationFold(coll) == nil {
+		return fn
+	}
+	return func(e *env) (any, error) {
+		v, err := fn(e)
+		return foldValue(v, coll), err
+	}
+}
+
+// collationOf returns the collation of an expression: an explicit COLLATE,
+// or the collation of a column it directly refers to.
+func (c *compiler) collationOf(e sql.Expr) string {
+	switch x := e.(type) {
+	case *sql.Collate:
+		return x.Name
+	case *sql.ColumnRef:
+		if c.sc != nil {
+			if i, err := c.sc.resolve(x.Table, x.Name); err == nil {
+				return c.sc.cols[i].coll
+			}
+		}
+	}
+	return ""
+}
+
+// comparisonCollation follows SQLite: an explicit COLLATE on the left, then
+// on the right, then the left column's collation, then the right's.
+func (c *compiler) comparisonCollation(l, r sql.Expr) string {
+	if x, ok := l.(*sql.Collate); ok {
+		return x.Name
+	}
+	if x, ok := r.(*sql.Collate); ok {
+		return x.Name
+	}
+	if coll := c.collationOf(l); coll != "" {
+		return coll
+	}
+	return c.collationOf(r)
 }
 
 func (c *compiler) compileCase(x *sql.Case) (evalFn, error) {
@@ -718,7 +800,6 @@ var scalarFuncs = map[string]scalarFunc{
 	"NOW": {0, 0, func([]any) (any, error) {
 		return time.Now().UTC().Format(time.RFC3339Nano), nil
 	}, nil},
-	"UNIXEPOCH": {0, 0, func([]any) (any, error) { return time.Now().Unix(), nil }, nil},
 }
 
 func coalesce(args []evalFn) evalFn {

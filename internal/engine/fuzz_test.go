@@ -32,6 +32,9 @@ func FuzzExec(f *testing.F) {
 		"SELECT * FROM t WHERE n = 1 OR name = 'b' OR id IN (2, 3) ORDER BY id DESC LIMIT 2",
 		"SELECT t.id, u.v FROM t JOIN u ON u.v = t.name LEFT JOIN t t2 ON t2.n = u.tid ORDER BY t.id",
 		"SELECT * FROM t WHERE name > 'a' ORDER BY name DESC, id DESC LIMIT 1 OFFSET 1",
+		"CREATE TABLE c (k TEXT UNIQUE COLLATE NOCASE, r TEXT COLLATE RTRIM); INSERT INTO c VALUES ('A', 'x '), ('b', 'y') ON CONFLICT DO NOTHING; SELECT * FROM c WHERE k = 'a' OR r = 'x' ORDER BY k COLLATE BINARY DESC",
+		"SELECT date('2026-01-31', '+1 month', 'start of day'), strftime('%Y %j %W %s %f', 'now'), julianday(2451545.5), datetime(0, 'unixepoch', 'localtime')",
+		"ALTER TABLE t RENAME COLUMN n TO m; ALTER TABLE t DROP COLUMN m; ALTER TABLE t RENAME TO t2; SELECT * FROM t2",
 	} {
 		f.Add(s)
 	}

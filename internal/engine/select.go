@@ -37,6 +37,7 @@ type orderFn struct {
 	outIdx int // >= 0: sort by output column
 	fn     evalFn
 	desc   bool
+	coll   string // collation applied to the sort key
 }
 
 func (x *execCtx) planSelect(st *sql.Select) (*selectPlan, error) {
@@ -131,12 +132,15 @@ func (x *execCtx) planSelect(st *sql.Select) (*selectPlan, error) {
 				}
 			}
 		}
+		if of.outIdx >= 0 && !st.Items[of.outIdx].Star {
+			of.coll = c.collationOf(st.Items[of.outIdx].Expr)
+		}
 		if of.outIdx < 0 {
 			f, err := c.compile(o.Expr)
 			if err != nil {
 				return nil, err
 			}
-			of.fn = f
+			of.fn = withCollation(f, c.collationOf(o.Expr))
 		}
 		p.orderBy = append(p.orderBy, of)
 	}
@@ -145,7 +149,7 @@ func (x *execCtx) planSelect(st *sql.Select) (*selectPlan, error) {
 		p.ordered = p.useScanOrder(st)
 	}
 	if p.agg {
-		gc := &compiler{x: x, sc: p.sc}
+		gc := &compiler{x: x, sc: p.sc, aliases: c.aliases} // GROUP BY may name a select alias
 		for _, g := range st.GroupBy {
 			if hasAggregate(g) {
 				return nil, errors.New("bangdb: aggregate functions are not allowed in GROUP BY")
@@ -154,7 +158,7 @@ func (x *execCtx) planSelect(st *sql.Select) (*selectPlan, error) {
 			if err != nil {
 				return nil, err
 			}
-			p.groupBy = append(p.groupBy, f)
+			p.groupBy = append(p.groupBy, withCollation(f, gc.collationOf(g)))
 		}
 		if st.Having != nil {
 			if p.having, err = c.compile(st.Having); err != nil {
@@ -345,7 +349,7 @@ func (x *execCtx) runSelect(r *selectRun, sink func(vals []any) (bool, error)) e
 			row.keys = make([]any, len(p.orderBy))
 			for i, o := range p.orderBy {
 				if o.outIdx >= 0 {
-					row.keys[i] = vals[o.outIdx]
+					row.keys[i] = foldValue(vals[o.outIdx], o.coll)
 					continue
 				}
 				v, err := o.fn(e)
@@ -568,7 +572,7 @@ func (x *execCtx) explain(s sql.Stmt) (Result, error) {
 func tableScope(t *Table, alias string, level int, qualifiedOnly bool) []scopeCol {
 	var cols []scopeCol
 	for _, c := range t.Columns {
-		cols = append(cols, scopeCol{table: strings.ToLower(alias), name: strings.ToLower(c.Name), level: level, hidden: qualifiedOnly})
+		cols = append(cols, scopeCol{table: strings.ToLower(alias), name: strings.ToLower(c.Name), level: level, hidden: qualifiedOnly, coll: c.Collate})
 	}
 	return append(cols, scopeCol{table: strings.ToLower(alias), name: "rowid", level: level, hidden: true})
 }

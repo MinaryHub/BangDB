@@ -93,7 +93,7 @@ var reserved = map[string]bool{
 	"VALUES": true, "UNION": true, "BY": true, "ASC": true, "DESC": true, "IS": true, "IN": true,
 	"LIKE": true, "BETWEEN": true, "NULL": true, "CASE": true, "WHEN": true, "THEN": true,
 	"ELSE": true, "END": true, "DISTINCT": true, "INTO": true, "RETURNING": true,
-	"INTERSECT": true, "EXCEPT": true, "EXISTS": true,
+	"INTERSECT": true, "EXCEPT": true, "EXISTS": true, "COLLATE": true,
 }
 
 func (p *parser) peek() token { return p.toks[p.pos] }
@@ -343,6 +343,12 @@ func (p *parser) parseColumnDef() (ColumnDef, error) {
 		case p.acceptKw("NULL"):
 		case p.acceptKw("UNIQUE"):
 			cd.Unique = true
+		case p.acceptKw("COLLATE"):
+			name, err := p.collationName()
+			if err != nil {
+				return cd, err
+			}
+			cd.Collate = name
 		case p.acceptKw("DEFAULT"):
 			if p.acceptOp("(") {
 				e, err := p.parseExpr()
@@ -368,7 +374,7 @@ func (p *parser) parseColumnDef() (ColumnDef, error) {
 
 func isConstraintKw(s string) bool {
 	switch strings.ToUpper(s) {
-	case "PRIMARY", "NOT", "NULL", "UNIQUE", "DEFAULT", "AUTOINCREMENT", "AUTO_INCREMENT", "CONSTRAINT", "CHECK", "REFERENCES":
+	case "PRIMARY", "NOT", "NULL", "UNIQUE", "DEFAULT", "AUTOINCREMENT", "AUTO_INCREMENT", "CONSTRAINT", "CHECK", "REFERENCES", "COLLATE":
 		return true
 	}
 	return false
@@ -1017,7 +1023,25 @@ func (p *parser) parseUnary() (Expr, error) {
 			return nil, p.errf("integer literal out of range")
 		}
 	}
+	for p.acceptKw("COLLATE") {
+		name, err := p.collationName()
+		if err != nil {
+			return nil, err
+		}
+		x = &Collate{X: x, Name: name}
+	}
 	return x, nil
+}
+
+// collationName parses a collation: NOCASE, RTRIM or BINARY.
+func (p *parser) collationName() (string, error) {
+	t := p.next()
+	name := strings.ToUpper(t.text)
+	switch name {
+	case "NOCASE", "RTRIM", "BINARY":
+		return name, nil
+	}
+	return "", &SyntaxError{t.pos, "unknown collation " + t.text + " (use NOCASE, RTRIM or BINARY)"}
 }
 
 func (p *parser) parsePrimary() (Expr, error) {

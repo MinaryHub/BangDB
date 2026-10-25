@@ -428,6 +428,9 @@ func (x *execCtx) createTable(st *sql.CreateTable) error {
 func columnFromDef(cd sql.ColumnDef) (Column, error) {
 	col := Column{Name: cd.Name, Type: value.ParseType(cd.Type), DeclType: cd.Type,
 		NotNull: cd.NotNull, PrimaryKey: cd.PrimaryKey, Unique: cd.Unique, AutoIncrement: cd.AutoIncrement}
+	if cd.Collate != "BINARY" {
+		col.Collate = cd.Collate
+	}
 	if cd.AutoIncrement && !cd.PrimaryKey {
 		return col, fmt.Errorf("bangdb: AUTOINCREMENT requires PRIMARY KEY")
 	}

@@ -121,6 +121,9 @@ func formatExpr(sb *strings.Builder, e Expr) {
 			formatExpr(sb, a)
 		}
 		sb.WriteString(")")
+	case *Collate:
+		formatExpr(sb, x.X)
+		sb.WriteString(" COLLATE " + x.Name)
 	case *Subquery:
 		sb.WriteString("(SELECT ...)")
 	case *Exists:

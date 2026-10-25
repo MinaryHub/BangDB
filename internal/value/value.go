@@ -166,6 +166,10 @@ func Format(v any) string {
 	case int64:
 		return strconv.FormatInt(x, 10)
 	case float64:
+		// Plain decimal notation for ordinary magnitudes, exponent otherwise.
+		if a := math.Abs(x); a == 0 || a >= 1e-6 && a < 1e15 {
+			return strconv.FormatFloat(x, 'f', -1, 64)
+		}
 		return strconv.FormatFloat(x, 'g', -1, 64)
 	case string:
 		return x

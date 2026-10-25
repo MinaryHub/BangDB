@@ -23,6 +23,7 @@ type Column struct {
 	PrimaryKey    bool       `json:"pk,omitempty"`
 	Unique        bool       `json:"unique,omitempty"`
 	AutoIncrement bool       `json:"autoinc,omitempty"`
+	Collate       string     `json:"collate,omitempty"` // NOCASE, RTRIM or "" (binary)
 	DefaultSQL    string     `json:"default,omitempty"`
 
 	defExpr  sql.Expr // parsed DefaultSQL
@@ -54,14 +55,15 @@ type Index struct {
 	Auto    bool     `json:"auto,omitempty"` // created for UNIQUE / PRIMARY KEY
 	Root    uint32   `json:"root"`
 
-	cols []int
+	cols  []int
+	colls []string // collation per column: keys of collated text are folded
 }
 
 // key returns the index key part for row (without the rowid).
 func (ix *Index) key(row []any) []byte {
 	var k []byte
-	for _, c := range ix.cols {
-		k = value.AppendKey(k, row[c])
+	for i, c := range ix.cols {
+		k = value.AppendKey(k, foldValue(row[c], ix.colls[i]))
 	}
 	return k
 }
@@ -124,7 +126,7 @@ func (c *Catalog) clone() *Catalog {
 	for k, ix := range c.indexes {
 		ni := *ix
 		ni.Columns = append([]string(nil), ix.Columns...)
-		ni.cols = nil
+		ni.cols, ni.colls = nil, nil
 		n.indexes[k] = &ni
 	}
 	n.link()
@@ -150,9 +152,15 @@ func (ix *Index) resolve(t *Table) {
 	if len(ix.Columns) == 0 && ix.Column != "" {
 		ix.Columns, ix.Column = []string{ix.Column}, ""
 	}
-	ix.cols = ix.cols[:0]
+	ix.cols, ix.colls = ix.cols[:0], ix.colls[:0]
 	for _, c := range ix.Columns {
-		ix.cols = append(ix.cols, t.ColIndex(c))
+		i := t.ColIndex(c)
+		ix.cols = append(ix.cols, i)
+		coll := ""
+		if i >= 0 {
+			coll = t.Columns[i].Collate
+		}
+		ix.colls = append(ix.colls, coll)
 	}
 }
 
@@ -298,6 +306,9 @@ func (c *Catalog) Describe(name string) string {
 		}
 		if col.DefaultSQL != "" {
 			sb.WriteString(" DEFAULT " + col.DefaultSQL)
+		}
+		if col.Collate != "" {
+			sb.WriteString(" COLLATE " + col.Collate)
 		}
 		if i < len(t.Columns)-1 {
 			sb.WriteString(",")

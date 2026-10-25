@@ -14,7 +14,8 @@ type ColumnDef struct {
 	AutoIncrement bool
 	NotNull       bool
 	Unique        bool
-	Default       Expr // nil = no default
+	Default       Expr   // nil = no default
+	Collate       string // NOCASE, RTRIM, BINARY or ""
 }
 
 type CreateTable struct {
@@ -208,6 +209,12 @@ type In struct {
 	Not  bool
 }
 
+// Collate is "x COLLATE name".
+type Collate struct {
+	X    Expr
+	Name string
+}
+
 // Subquery is a scalar subquery: (SELECT ...).
 type Subquery struct{ Select *Select }
 
@@ -254,4 +261,5 @@ func (*Like) expr()      {}
 func (*Func) expr()      {}
 func (*Case) expr()      {}
 func (*Subquery) expr()  {}
+func (*Collate) expr()   {}
 func (*Exists) expr()    {}

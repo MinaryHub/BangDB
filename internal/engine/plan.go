@@ -37,11 +37,13 @@ type access struct {
 	loInc  bool
 	hiInc  bool
 
-	ix      *Index
-	prefix  []evalFn
-	prefTyp []value.Type
-	in      []evalFn
-	desc    string
+	ix       *Index
+	prefix   []evalFn
+	prefTyp  []value.Type
+	prefColl []string // collations of the prefix columns (search values are folded)
+	coll     string   // collation of the IN/range column
+	in       []evalFn
+	desc     string
 
 	reverse bool // visit rows in descending key order (for ORDER BY ... DESC)
 
@@ -136,9 +138,21 @@ func chooseAccess(sc *scope, l *level, li int, conds []sql.Expr, c *compiler) (*
 			if !ok {
 				continue
 			}
-			if col, ok := columnOf(x.L, sc, l, li); ok && refsBelow(x.R, sc, li) {
+			// An index (or the rowid) can only serve a comparison made with
+			// the column's own collation.
+			coll := c.comparisonCollation(x.L, x.R)
+			if coll == "BINARY" {
+				coll = ""
+			}
+			colColl := func(col int) string {
+				if col < 0 {
+					return ""
+				}
+				return l.t.Columns[col].Collate
+			}
+			if col, ok := columnOf(x.L, sc, l, li); ok && refsBelow(x.R, sc, li) && coll == colColl(col) {
 				byCol[col] = append(byCol[col], candidate{col: col, op: x.Op, other: x.R})
-			} else if col, ok := columnOf(x.R, sc, l, li); ok && refsBelow(x.L, sc, li) {
+			} else if col, ok := columnOf(x.R, sc, l, li); ok && refsBelow(x.L, sc, li) && coll == colColl(col) {
 				byCol[col] = append(byCol[col], candidate{col: col, op: op, other: x.L})
 			}
 		case *sql.In:
@@ -274,11 +288,13 @@ func chooseAccess(sc *scope, l *level, li int, conds []sql.Expr, c *compiler) (*
 		}
 		a.prefix = append(a.prefix, f)
 		a.prefTyp = append(a.prefTyp, l.t.Columns[col].Type)
+		a.prefColl = append(a.prefColl, l.t.Columns[col].Collate)
 		parts = append(parts, l.t.Columns[col].Name+"=?")
 	}
 	if best.eqN < len(ix.cols) {
 		next := ix.cols[best.eqN]
 		a.colTyp = l.t.Columns[next].Type
+		a.coll = l.t.Columns[next].Collate
 		colName := l.t.Columns[next].Name
 		if best.in != nil {
 			fns, err := compileList(best.in.list)
@@ -393,6 +409,9 @@ func hashAccess(sc *scope, l *level, li int, conds []sql.Expr, c *compiler) (*ac
 			col, other = cr, b.L
 		} else {
 			continue
+		}
+		if col >= 0 && l.t.Columns[col].Collate != "" || c.comparisonCollation(b.L, b.R) != "" {
+			continue // hash keys use binary equality
 		}
 		f, err := c.compile(other)
 		if err != nil {
@@ -740,7 +759,7 @@ func (x *execCtx) scanIndex(acc *access, e *env, emit func(int64) (bool, error))
 		if !ok {
 			return nil // NULL or incomparable: no row can be equal
 		}
-		prefix = value.AppendKey(prefix, k)
+		prefix = value.AppendKey(prefix, foldValue(k, acc.prefColl[i]))
 	}
 	tree := btree.Open(x.v, acc.ix.Root)
 	// collect returns the row ids of entries from start on that keep the
@@ -779,7 +798,7 @@ func (x *execCtx) scanIndex(acc *access, e *env, emit func(int64) (bool, error))
 			if !ok {
 				continue
 			}
-			p := value.AppendKey(clone(prefix), k)
+			p := value.AppendKey(clone(prefix), foldValue(k, acc.coll))
 			if seen[string(p)] {
 				continue
 			}
@@ -805,7 +824,7 @@ func (x *execCtx) scanIndex(acc *access, e *env, emit func(int64) (bool, error))
 			return err
 		}
 		if k, ok, inc := rangeBound(v, acc.colTyp, true, acc.loInc); ok {
-			start = value.AppendKey(clone(prefix), k)
+			start = value.AppendKey(clone(prefix), foldValue(k, acc.coll))
 			if !inc {
 				lowPrefix = start
 			}
@@ -817,7 +836,7 @@ func (x *execCtx) scanIndex(acc *access, e *env, emit func(int64) (bool, error))
 			return err
 		}
 		if k, ok, inc := rangeBound(v, acc.colTyp, false, acc.hiInc); ok {
-			stop, stopInc = value.AppendKey(clone(prefix), k), inc
+			stop, stopInc = value.AppendKey(clone(prefix), foldValue(k, acc.coll)), inc
 		}
 	}
 	return collect(start, prefix, func(key []byte) (bool, bool) {
@@ -855,7 +874,7 @@ func (x *execCtx) scanIndexReverse(acc *access, e *env, tree *btree.Tree, prefix
 			return err
 		}
 		if k, ok, inc := rangeBound(v, acc.colTyp, false, acc.hiInc); ok {
-			upper = value.AppendKey(clone(prefix), k)
+			upper = value.AppendKey(clone(prefix), foldValue(k, acc.coll))
 			if inc {
 				upper = append(upper, maxSuffix...)
 			}
@@ -867,7 +886,7 @@ func (x *execCtx) scanIndexReverse(acc *access, e *env, tree *btree.Tree, prefix
 			return err
 		}
 		if k, ok, inc := rangeBound(v, acc.colTyp, true, acc.loInc); ok {
-			lower, lowerExcl = value.AppendKey(clone(prefix), k), !inc
+			lower, lowerExcl = value.AppendKey(clone(prefix), foldValue(k, acc.coll)), !inc
 		}
 	}
 	c := tree.SeekReverse(upper)
@@ -927,7 +946,7 @@ func (x *execCtx) buildLevels(from []sql.TableRef, lefts []bool, ons []sql.Expr,
 		seen[strings.ToLower(alias)] = true
 		l := &level{t: t, alias: alias, offset: len(sc.cols), left: lefts[i], virtual: virtual}
 		for _, c := range t.Columns {
-			sc.cols = append(sc.cols, scopeCol{table: strings.ToLower(alias), name: strings.ToLower(c.Name), level: i})
+			sc.cols = append(sc.cols, scopeCol{table: strings.ToLower(alias), name: strings.ToLower(c.Name), level: i, coll: c.Collate})
 		}
 		sc.cols = append(sc.cols, scopeCol{table: strings.ToLower(alias), name: "rowid", level: i, hidden: true})
 		levels = append(levels, l)
