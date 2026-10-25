@@ -190,7 +190,7 @@ func (db *DB) stream(ctx context.Context, sel *sql.Select, args []any) (*Rows, e
 		snap.Release()
 		db.swapMu.RUnlock()
 	}
-	x := &execCtx{v: snap.View(), cat: snap.Meta().(*Catalog), args: args, ctx: ctx}
+	x := &execCtx{v: snap.View(), cat: snap.Meta().(*Catalog), args: args, ctx: ctx, spill: db.spill}
 	run, err := x.prepareSelect(sel)
 	if err != nil {
 		release()

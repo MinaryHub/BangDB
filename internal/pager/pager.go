@@ -712,6 +712,9 @@ func (p *Pager) Flush(c *Prepared) error {
 	return p.flushLocked()
 }
 
+// FlushAll makes every prepared commit durable and visible.
+func (p *Pager) FlushAll() error { return p.flushPending() }
+
 // flushPending makes every prepared commit durable (used on Close).
 func (p *Pager) flushPending() error {
 	p.flushMu.Lock()

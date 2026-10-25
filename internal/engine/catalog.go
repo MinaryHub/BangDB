@@ -64,14 +64,37 @@ type Index struct {
 	colls []string // collation per column: keys of collated text are folded
 }
 
-// key returns the index key part for row (without the rowid).
+// key returns the index key part for row (without the rowid), truncated to
+// keyLimit (see truncKey).
 func (ix *Index) key(row []any) []byte {
+	k, _ := truncKey(ix.fullKey(row))
+	return k
+}
+
+// fullKey is the untruncated key part for row.
+func (ix *Index) fullKey(row []any) []byte {
 	var k []byte
 	for i, c := range ix.cols {
 		k = value.AppendKey(k, foldValue(row[c], ix.colls[i]))
 	}
 	return k
 }
+
+// keyLimit is the longest index key part stored as is. Longer key parts are
+// cut to keyLimit bytes plus a 0x00 byte, so a stored part longer than
+// keyLimit marks a truncated key. Truncation keeps the order of keys (it is
+// monotonic) but different values can share a truncated key, so lookups
+// compare the rows' full keys and ordered scans sort such groups by value.
+const keyLimit = btree.MaxKey - 8 - 1
+
+func truncKey(k []byte) ([]byte, bool) {
+	if len(k) <= keyLimit {
+		return k, false
+	}
+	return append(k[:keyLimit:keyLimit], 0), true
+}
+
+func isTruncated(part []byte) bool { return len(part) > keyLimit }
 
 // hasNull reports whether any indexed value of row is NULL (such rows never
 // conflict in a UNIQUE index).

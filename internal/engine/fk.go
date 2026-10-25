@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"math"
 	"strings"
 
 	"github.com/knoxxr/bangdb/internal/btree"
@@ -246,10 +247,8 @@ func (x *execCtx) parentExists(p *Table, cols []string, vals []any) (bool, error
 	if ix == nil {
 		return false, errFK
 	}
-	prefix := ix.key(tmp)
-	c := btree.Open(x.v, ix.Root).Seek(prefix)
-	found := c.Valid() && bytes.HasPrefix(c.Key(), prefix)
-	return found, c.Err()
+	_, found, err := x.findKey(p, ix, tmp, math.MinInt64)
+	return found, err
 }
 
 // ---- enforcement: parent side ----
@@ -260,7 +259,11 @@ func (x *execCtx) children(child *Table, fk *ForeignKey, vals []any) ([]target, 
 	add := func(rowid int64) error {
 		row, ok, err := x.getRow(child, rowid)
 		if err == nil && ok {
-			out = append(out, target{rowid, row})
+			// Recheck: a truncated index key or a collation can match
+			// other values.
+			if cv, ok := fkValues(row, fk.cols); ok && sameValues(cv, vals) {
+				out = append(out, target{rowid, row})
+			}
 		}
 		return err
 	}
@@ -277,6 +280,7 @@ func (x *execCtx) children(child *Table, fk *ForeignKey, vals []any) ([]target, 
 				}
 			}
 		}
+		prefix, _ = truncKey(prefix)
 		var ids []int64
 		c := btree.Open(x.v, ix.Root).Seek(prefix)
 		for ; c.Valid() && bytes.HasPrefix(c.Key(), prefix); c.Next() {

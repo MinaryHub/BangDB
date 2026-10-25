@@ -33,6 +33,12 @@ type Options struct {
 	// QueryTimeout limits the run time of every statement whose context has
 	// no deadline of its own. Default: no limit.
 	QueryTimeout time.Duration
+	// SortMemory is the memory one query may use for ORDER BY, DISTINCT and
+	// GROUP BY before it spills to temporary files. Default: 64 MiB;
+	// negative: never spill.
+	SortMemory int
+	// TempDir holds the spill files. Default: os.TempDir().
+	TempDir string
 }
 
 // Result is the outcome of executing SQL.
@@ -62,6 +68,7 @@ type DB struct {
 	cat          *Catalog // catalog of the latest prepared commit (immutable); readers use their snapshot's
 	busyTimeout  time.Duration
 	queryTimeout time.Duration
+	spill        *spillConfig
 
 	cacheMu   sync.Mutex
 	stmtCache map[string]parsed
@@ -100,8 +107,13 @@ func Open(path string, opts *Options) (*DB, error) {
 	if opts != nil && opts.BusyTimeout > 0 {
 		db.busyTimeout = opts.BusyTimeout
 	}
+	db.spill = &spillConfig{limit: DefaultSortMemory}
 	if opts != nil {
 		db.queryTimeout = opts.QueryTimeout
+		db.spill.dir = opts.TempDir
+		if opts.SortMemory != 0 {
+			db.spill.limit = opts.SortMemory
+		}
 	}
 	cat, err := loadCatalog(p.NewView())
 	if err != nil {
@@ -329,7 +341,7 @@ func (db *DB) read(ctx context.Context, fn func(x *execCtx) (Result, error), arg
 		return Result{}, err
 	}
 	defer snap.Release()
-	x := &execCtx{v: snap.View(), cat: snap.Meta().(*Catalog), args: args, ctx: ctx}
+	x := &execCtx{v: snap.View(), cat: snap.Meta().(*Catalog), args: args, ctx: ctx, spill: db.spill}
 	return fn(x)
 }
 
@@ -408,6 +420,8 @@ func (tx *Tx) ExecContext(ctx context.Context, src string, args ...any) (Result,
 		switch s.(type) {
 		case *sql.Begin, *sql.Commit, *sql.Rollback:
 			return res, errors.New("bangdb: use Tx.Commit / Tx.Rollback instead of transaction statements")
+		case *sql.Vacuum:
+			return res, errors.New("bangdb: cannot VACUUM from within a transaction")
 		}
 		if res, err = tx.execStmt(ctx, s, nargs); err != nil {
 			return res, err
@@ -433,7 +447,7 @@ func (tx *Tx) execStmt(ctx context.Context, s sql.Stmt, args []any) (Result, err
 	for k, v := range tx.rowids {
 		rowids[k] = v
 	}
-	x := &execCtx{v: tx.v, cat: tx.cat, tx: tx, args: args, ctx: ctx}
+	x := &execCtx{v: tx.v, cat: tx.cat, tx: tx, args: args, ctx: ctx, spill: tx.db.spill}
 	res, err := x.exec(s)
 	if err != nil {
 		tx.v.Restore(sp)
@@ -451,7 +465,8 @@ func (tx *Tx) Commit() error {
 		return ErrTxDone
 	}
 	tx.done = true
-	c, err := tx.db.p.PrepareCommit(tx.v)
+	p := tx.db.p // stays valid after unlocking (VACUUM may swap db.p)
+	c, err := p.PrepareCommit(tx.v)
 	if err != nil || c == nil {
 		tx.db.unlockWrite()
 		return err
@@ -460,7 +475,7 @@ func (tx *Tx) Commit() error {
 	// Group commit: release the write lock before waiting for the fsync, so
 	// the next writer can prepare and share it.
 	tx.db.unlockWrite()
-	if err := tx.db.p.Flush(c); err != nil {
+	if err := p.Flush(c); err != nil {
 		return err
 	}
 	tx.db.maybeCheckpoint()
@@ -543,6 +558,11 @@ func (c *Conn) execStmt(ctx context.Context, s sql.Stmt, args []any) (Result, er
 		tx := c.tx
 		c.tx = nil
 		return Result{}, tx.Commit()
+	case *sql.Vacuum:
+		if c.tx != nil {
+			return Result{}, errors.New("bangdb: cannot VACUUM from within a transaction")
+		}
+		return Result{}, c.db.Vacuum(ctx)
 	case *sql.Rollback:
 		if c.tx == nil {
 			return Result{}, errors.New("bangdb: cannot rollback - no transaction is active")

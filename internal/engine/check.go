@@ -184,6 +184,9 @@ func (x *execCtx) checkIndex(t *Table, ix *Index, rows int, add func(string, ...
 		if want := ix.key(row); !bytes.Equal(want, valPart) {
 			add("index %s entry for row %d does not match the row's %s", ix.Name, rowid, ix.columnList())
 		}
+		if isTruncated(valPart) {
+			valPart = ix.fullKey(row) // compare the values themselves
+		}
 		if ix.Unique && prevVal != nil && bytes.Equal(prevVal, valPart) && !ix.hasNull(row) {
 			var vals []string
 			for _, c := range ix.cols {

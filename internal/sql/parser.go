@@ -201,6 +201,8 @@ func (p *parser) parseStmt() (Stmt, error) {
 	case p.acceptKw("COMMIT"), p.acceptKw("END"):
 		p.acceptKw("TRANSACTION")
 		return &Commit{}, nil
+	case p.acceptKw("VACUUM"):
+		return &Vacuum{}, nil
 	case p.acceptKw("ROLLBACK"):
 		p.acceptKw("TRANSACTION")
 		return &Rollback{}, nil

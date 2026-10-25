@@ -441,6 +441,12 @@ func (db *DB) InstallSnapshot(w *SnapshotWriter) error {
 		return err
 	}
 	defer db.unlockWrite()
+	return db.installLocked(w)
+}
+
+// installLocked swaps in a completed copy; the caller holds the write lock.
+// Subscribers are disconnected: their replicas must re-synchronize.
+func (db *DB) installLocked(w *SnapshotWriter) error {
 	db.swapMu.Lock() // waits for running readers of the old data
 	defer db.swapMu.Unlock()
 	if db.isClosed() {
@@ -474,6 +480,9 @@ func (db *DB) InstallSnapshot(w *SnapshotWriter) error {
 	db.repl.mu.Lock()
 	db.repl.lastSeq = db.p.Header().Seq
 	db.repl.frames, db.repl.bytes = nil, 0
+	clear(db.repl.subs)
+	close(db.repl.notify)
+	db.repl.notify = make(chan struct{})
 	db.repl.mu.Unlock()
 	return db.reloadCatalogLocked()
 }

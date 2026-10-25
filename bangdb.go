@@ -161,6 +161,11 @@ func (db *DB) Backup(path string) error { return db.e.Backup(context.Background(
 // BackupContext is Backup with cancellation.
 func (db *DB) BackupContext(ctx context.Context, path string) error { return db.e.Backup(ctx, path) }
 
+// Vacuum rebuilds the database file compactly, returning the space of
+// deleted data to the file system (same as the VACUUM statement). Writers
+// wait while it runs; replicas re-synchronize from a snapshot afterwards.
+func (db *DB) Vacuum(ctx context.Context) error { return db.e.Vacuum(ctx) }
+
 // IntegrityCheck verifies checksums, B+tree structure, page accounting and
 // index/table consistency on a snapshot, without blocking other work. It
 // returns the problems found; an empty slice means the database is sound.

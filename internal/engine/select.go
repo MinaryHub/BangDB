@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"math"
 	"sort"
 	"strings"
 
@@ -25,6 +26,7 @@ type selectPlan struct {
 	cols    []string
 	types   []string
 	items   []evalFn
+	exprs   []sql.Expr // output expressions (with * expanded)
 	orderBy []orderFn
 	agg     bool
 	aggs    []*aggSpec
@@ -98,6 +100,7 @@ func (x *execCtx) planSelect(st *sql.Select) (*selectPlan, error) {
 		exprs = append(exprs, it.Expr)
 		p.cols = append(p.cols, outputName(it))
 	}
+	p.exprs = exprs
 	for _, e := range exprs {
 		p.types = append(p.types, p.declType(e))
 	}
@@ -132,8 +135,8 @@ func (x *execCtx) planSelect(st *sql.Select) (*selectPlan, error) {
 				}
 			}
 		}
-		if of.outIdx >= 0 && !st.Items[of.outIdx].Star {
-			of.coll = c.collationOf(st.Items[of.outIdx].Expr)
+		if of.outIdx >= 0 {
+			of.coll = c.collationOf(exprs[of.outIdx])
 		}
 		if of.outIdx < 0 {
 			f, err := c.compile(o.Expr)
@@ -311,17 +314,17 @@ func (x *execCtx) runSelect(r *selectRun, sink func(vals []any) (bool, error)) e
 	p, st, limit, offset := r.p, r.st, r.limit, r.offset
 	e := &env{row: make([]any, len(p.sc.cols)), args: x.args}
 	streaming := !p.agg && (len(p.orderBy) == 0 || p.ordered) && !st.Distinct
+	keyLess := func(a, b []any) bool {
+		for k, o := range p.orderBy {
+			if c := value.Compare(a[k], b[k]); c != 0 {
+				return (c < 0) != o.desc
+			}
+		}
+		return false
+	}
 	var out []outRow
 	sortOut := func() {
-		sort.SliceStable(out, func(i, j int) bool {
-			for k, o := range p.orderBy {
-				c := value.Compare(out[i].keys[k], out[j].keys[k])
-				if c != 0 {
-					return (c < 0) != o.desc
-				}
-			}
-			return false
-		})
+		sort.SliceStable(out, func(i, j int) bool { return keyLess(out[i].keys, out[j].keys) })
 	}
 	topK := int64(-1)
 	if len(p.orderBy) > 0 && limit >= 0 && !st.Distinct {
@@ -329,6 +332,76 @@ func (x *execCtx) runSelect(r *selectRun, sink func(vals []any) (bool, error)) e
 	}
 	emitted, skipped := int64(0), int64(0)
 	stopped := false
+
+	// Buffered rows pass DISTINCT, then ORDER BY (top-K, or a sorter that
+	// spills to disk), then OFFSET / LIMIT.
+	cfg := x.spillCfg()
+	final := func(vals []any) error {
+		if stopped {
+			return nil
+		}
+		if skipped < offset {
+			skipped++
+			return nil
+		}
+		if limit >= 0 && emitted >= limit {
+			stopped = true
+			return nil
+		}
+		cont, err := sink(vals)
+		emitted++
+		stopped = !cont || limit >= 0 && emitted >= limit
+		return err
+	}
+	var orderSort *extSorter
+	if topK < 0 && len(p.orderBy) > 0 && !streaming {
+		orderSort = newSorter(cfg, keyLess)
+		defer orderSort.Close()
+	}
+	nk := len(p.orderBy)
+	ordered := func(row outRow) error {
+		switch {
+		case topK >= 0:
+			out = append(out, row)
+			if int64(len(out)) >= 2*topK+1024 {
+				sortOut()
+				out = out[:topK]
+			}
+			return nil
+		case orderSort != nil:
+			return orderSort.Add(append(row.keys[:nk:nk], row.vals...))
+		}
+		return final(row.vals)
+	}
+	var seen map[string]bool
+	seenBytes := 0
+	var distinctSort *extSorter
+	if st.Distinct {
+		seen = map[string]bool{}
+		distinctSort = newSorter(cfg, func(a, b []any) bool { return bytes.Compare(a[0].([]byte), b[0].([]byte)) < 0 })
+		defer distinctSort.Close()
+	}
+	stage := func(row outRow) error {
+		if !st.Distinct {
+			return ordered(row)
+		}
+		var k []byte
+		for _, v := range row.vals {
+			k = value.AppendKey(k, v)
+		}
+		if seen[string(k)] {
+			return nil
+		}
+		if cfg.limit <= 0 || seenBytes < cfg.limit/2 {
+			seen[string(k)] = true
+			seenBytes += len(k) + 64
+			return ordered(row)
+		}
+		// Too many distinct rows to remember: sort the rest by value and
+		// drop adjacent duplicates at the end.
+		rec := append([]any{k}, row.keys...)
+		return distinctSort.Add(append(rec, row.vals...))
+	}
 	project := func() error {
 		vals := make([]any, len(p.items))
 		for i, f := range p.items {
@@ -359,12 +432,7 @@ func (x *execCtx) runSelect(r *selectRun, sink func(vals []any) (bool, error)) e
 				row.keys[i] = v
 			}
 		}
-		out = append(out, row)
-		if topK >= 0 && int64(len(out)) >= 2*topK+1024 {
-			sortOut()
-			out = out[:topK]
-		}
-		return nil
+		return stage(row)
 	}
 
 	if !p.agg {
@@ -400,34 +468,52 @@ func (x *execCtx) runSelect(r *selectRun, sink func(vals []any) (bool, error)) e
 	if streaming {
 		return nil
 	}
-
-	if st.Distinct {
-		seen := map[string]bool{}
-		uniq := out[:0]
-		for _, r := range out {
-			var k []byte
-			for _, v := range r.vals {
-				k = value.AppendKey(k, v)
+	if distinctSort != nil {
+		it, err := distinctSort.Finish()
+		if err != nil {
+			return err
+		}
+		var last []byte
+		for {
+			rec, err := it.Next()
+			if err != nil || rec == nil {
+				if err != nil {
+					return err
+				}
+				break
 			}
-			if !seen[string(k)] {
-				seen[string(k)] = true
-				uniq = append(uniq, r)
+			k := rec[0].([]byte)
+			if last != nil && bytes.Equal(k, last) {
+				continue
+			}
+			last = k
+			if err := ordered(outRow{keys: rec[1 : 1+nk], vals: rec[1+nk:]}); err != nil {
+				return err
 			}
 		}
-		out = uniq
 	}
-	if len(p.orderBy) > 0 {
+	if topK >= 0 {
 		sortOut()
+		for _, r := range out {
+			if err := final(r.vals); err != nil || stopped {
+				return err
+			}
+		}
+		return nil
 	}
-	if offset > 0 {
-		out = out[min(int(offset), len(out)):]
-	}
-	if limit >= 0 && int64(len(out)) > limit {
-		out = out[:limit]
-	}
-	for _, r := range out {
-		if cont, err := sink(r.vals); err != nil || !cont {
+	if orderSort != nil {
+		it, err := orderSort.Finish()
+		if err != nil {
 			return err
+		}
+		for !stopped {
+			rec, err := it.Next()
+			if err != nil || rec == nil {
+				return err
+			}
+			if err := final(rec[nk:]); err != nil {
+				return err
+			}
 		}
 	}
 	return nil
@@ -438,6 +524,9 @@ type group struct {
 	states []*aggState
 }
 
+// runGrouped aggregates in a hash table. When the groups outgrow the sort
+// memory limit, rows of further groups are sorted (spilling to disk) and
+// aggregated one group at a time after the in-memory groups.
 func (x *execCtx) runGrouped(p *selectPlan, e *env, project func() error) error {
 	groups := map[string]*group{}
 	var order []*group
@@ -448,6 +537,11 @@ func (x *execCtx) runGrouped(p *selectPlan, e *env, project func() error) error 
 		}
 		return g
 	}
+	cfg := x.spillCfg()
+	used := 0
+	spill := newSorter(cfg, func(a, b []any) bool { return bytes.Compare(a[0].([]byte), b[0].([]byte)) < 0 })
+	defer spill.Close()
+	spilling := false
 	emit := func() (bool, error) {
 		var key []byte
 		for _, f := range p.groupBy {
@@ -459,9 +553,14 @@ func (x *execCtx) runGrouped(p *selectPlan, e *env, project func() error) error 
 		}
 		g := groups[string(key)]
 		if g == nil {
+			if spilling {
+				return true, spill.Add(append([]any{key}, e.row...))
+			}
 			g = newGroup()
 			groups[string(key)] = g
 			order = append(order, g)
+			used += len(key) + rowBytes(g.row) + 64*len(g.states)
+			spilling = cfg.limit > 0 && used > cfg.limit/2
 		}
 		for _, st := range g.states {
 			if err := st.step(e); err != nil {
@@ -488,7 +587,7 @@ func (x *execCtx) runGrouped(p *selectPlan, e *env, project func() error) error 
 		}
 		order = append(order, newGroup())
 	}
-	for _, g := range order {
+	finish := func(g *group) error {
 		e.row = g.row
 		e.aggs = make([]any, len(g.states))
 		for i, st := range g.states {
@@ -504,14 +603,52 @@ func (x *execCtx) runGrouped(p *selectPlan, e *env, project func() error) error 
 				return err
 			}
 			if ok, _ := value.Truthy(v); !ok {
-				continue
+				return nil
 			}
 		}
-		if err := project(); err != nil {
+		return project()
+	}
+	for _, g := range order {
+		if err := finish(g); err != nil {
 			return err
 		}
 	}
-	return nil
+	if !spilling {
+		return nil
+	}
+	groups, order = nil, nil
+	it, err := spill.Finish()
+	if err != nil {
+		return err
+	}
+	row := make([]any, len(e.row))
+	var cur *group
+	var curKey []byte
+	for {
+		rec, err := it.Next()
+		if err != nil {
+			return err
+		}
+		if cur != nil && (rec == nil || !bytes.Equal(rec[0].([]byte), curKey)) {
+			if err := finish(cur); err != nil {
+				return err
+			}
+			cur = nil
+		}
+		if rec == nil {
+			return nil
+		}
+		copy(row, rec[1:])
+		e.row = row
+		if cur == nil {
+			cur, curKey = newGroup(), rec[0].([]byte)
+		}
+		for _, st := range cur.states {
+			if err := st.step(e); err != nil {
+				return err
+			}
+		}
+	}
 }
 
 // ---- EXPLAIN ----
@@ -655,13 +792,12 @@ func (x *execCtx) conflicts(t *Table, row []any) ([]conflict, error) {
 		if !ix.Unique || ix.hasNull(row) {
 			continue
 		}
-		prefix := ix.key(row)
-		c := btree.Open(x.v, ix.Root).Seek(prefix)
-		if c.Valid() && bytes.HasPrefix(c.Key(), prefix) {
-			out = append(out, conflict{value.DecodeRowID(c.Key()[len(prefix):]), ix.Columns})
-		}
-		if err := c.Err(); err != nil {
+		id, found, err := x.findKey(t, ix, row, math.MinInt64)
+		if err != nil {
 			return nil, err
+		}
+		if found {
+			out = append(out, conflict{id, ix.Columns})
 		}
 	}
 	return out, nil
@@ -1052,7 +1188,7 @@ func (x *execCtx) updateRow(t *Table, oldID int64, old, newRow []any) (int64, er
 		}
 	}
 	for _, ix := range t.indexes {
-		if newID == oldID && bytes.Equal(ix.key(old), ix.key(newRow)) {
+		if newID == oldID && bytes.Equal(ix.fullKey(old), ix.fullKey(newRow)) {
 			continue
 		}
 		if err := x.checkUnique(t, ix, newRow, oldID); err != nil {
@@ -1239,11 +1375,7 @@ func (p *selectPlan) useScanOrder(st *sql.Select) bool {
 	for i, o := range st.OrderBy {
 		e := o.Expr
 		if of := p.orderBy[i]; of.outIdx >= 0 {
-			it := st.Items[of.outIdx]
-			if it.Star {
-				return false
-			}
-			e = it.Expr
+			e = p.exprs[of.outIdx]
 		}
 		ref, ok := e.(*sql.ColumnRef)
 		if !ok {

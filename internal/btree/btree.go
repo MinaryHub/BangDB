@@ -2,9 +2,9 @@
 // pager pages. Leaves are linked left-to-right for range scans. Values larger
 // than InlineMax are spilled to overflow page chains.
 //
-// Deletion removes entries without rebalancing (pages may become sparse or
-// empty); space is reclaimed when the whole tree is dropped. This keeps the
-// code small and is a common trade-off in embedded engines.
+// Deletion rebalances: a node that falls below a quarter of a page is merged
+// with a sibling (freeing a page) or takes entries from it. Builder loads
+// sorted entries into densely packed pages (used by VACUUM).
 package btree
 
 import (
@@ -401,8 +401,9 @@ func (t *Tree) insert(pg uint32, key []byte, v value) (*split, error) {
 	return t.splitInternal(pg, n)
 }
 
-func (t *Tree) splitLeaf(pg uint32, n *node) (*split, error) {
-	// Split by bytes so both halves fit even with variable-size cells.
+// leafSplit returns the index of the first entry of the right half when
+// splitting leaf n by bytes, so both halves fit even with variable-size cells.
+func leafSplit(n *node) int {
 	half, acc, m := n.size()/2, nodeHeader, 0
 	for m < len(n.keys)-1 {
 		acc += (&node{leaf: true, keys: n.keys[m : m+1], vals: n.vals[m : m+1]}).size() - nodeHeader
@@ -411,6 +412,25 @@ func (t *Tree) splitLeaf(pg uint32, n *node) (*split, error) {
 			break
 		}
 	}
+	return m
+}
+
+// internalSplit returns the index of the key that moves up when splitting
+// internal node n by bytes.
+func internalSplit(n *node) int {
+	half, acc, m := n.size()/2, nodeHeader, 0
+	for m < len(n.keys)-2 {
+		acc += 2 + len(n.keys[m]) + 4
+		m++
+		if acc >= half {
+			break
+		}
+	}
+	return m
+}
+
+func (t *Tree) splitLeaf(pg uint32, n *node) (*split, error) {
+	m := leafSplit(n)
 	rpg, err := t.v.Alloc()
 	if err != nil {
 		return nil, err
@@ -423,15 +443,7 @@ func (t *Tree) splitLeaf(pg uint32, n *node) (*split, error) {
 }
 
 func (t *Tree) splitInternal(pg uint32, n *node) (*split, error) {
-	// Split by bytes; keys[m] moves up to the parent.
-	half, acc, m := n.size()/2, nodeHeader, 0
-	for m < len(n.keys)-2 {
-		acc += 2 + len(n.keys[m]) + 4
-		m++
-		if acc >= half {
-			break
-		}
-	}
+	m := internalSplit(n) // keys[m] moves up to the parent
 	rpg, err := t.v.Alloc()
 	if err != nil {
 		return nil, err
@@ -443,22 +455,126 @@ func (t *Tree) splitInternal(pg uint32, n *node) (*split, error) {
 	return &split{sep: n.keys[m], right: rpg}, nil
 }
 
+// minFill is the size below which a non-root node is rebalanced.
+const minFill = pager.UsableSize / 4
+
 // Delete removes key and reports whether it existed.
 func (t *Tree) Delete(key []byte) (bool, error) {
-	pg, n, err := t.findLeaf(key)
+	found, _, err := t.del(t.root, key)
+	if err != nil || !found {
+		return found, err
+	}
+	// An internal root left with a single child absorbs it, so the tree
+	// shrinks in height while the root page number stays the same.
+	for {
+		n, err := t.load(t.root)
+		if err != nil {
+			return true, err
+		}
+		if n.leaf || len(n.keys) > 0 {
+			return true, nil
+		}
+		child := n.children[0]
+		b, err := t.v.Read(child)
+		if err != nil {
+			return true, err
+		}
+		t.v.Write(t.root, append([]byte(nil), b...))
+		t.v.Free(child)
+	}
+}
+
+// del removes key from the subtree at pg. under reports that the node at pg
+// is now below minFill.
+func (t *Tree) del(pg uint32, key []byte) (found, under bool, err error) {
+	n, err := t.load(pg)
+	if err != nil {
+		return false, false, err
+	}
+	if n.leaf {
+		i, ok := leafIndex(n, key)
+		if !ok {
+			return false, false, nil
+		}
+		if err := t.freeValue(n.vals[i]); err != nil {
+			return false, false, err
+		}
+		n.keys = append(n.keys[:i], n.keys[i+1:]...)
+		n.vals = append(n.vals[:i], n.vals[i+1:]...)
+		t.store(pg, n)
+		return true, n.size() < minFill, nil
+	}
+	ci := childIndex(n, key)
+	found, under, err = t.del(n.children[ci], key)
+	if err != nil || !found || !under {
+		return found, false, err
+	}
+	changed, err := t.rebalance(n, ci)
+	if err != nil || !changed {
+		return true, false, err
+	}
+	t.store(pg, n)
+	return true, n.size() < minFill, nil
+}
+
+// rebalance fixes the underfull child ci of n by merging it with a sibling
+// or, when both do not fit in one page, by sharing entries evenly. It
+// reports whether n changed (the caller stores it).
+func (t *Tree) rebalance(n *node, ci int) (bool, error) {
+	if len(n.children) < 2 {
+		return false, nil
+	}
+	li := ci - 1
+	if ci == 0 {
+		li = 0
+	}
+	lpg, rpg := n.children[li], n.children[li+1]
+	left, err := t.load(lpg)
 	if err != nil {
 		return false, err
 	}
-	i, ok := leafIndex(n, key)
-	if !ok {
-		return false, nil
-	}
-	if err := t.freeValue(n.vals[i]); err != nil {
+	right, err := t.load(rpg)
+	if err != nil {
 		return false, err
 	}
-	n.keys = append(n.keys[:i], n.keys[i+1:]...)
-	n.vals = append(n.vals[:i], n.vals[i+1:]...)
-	t.store(pg, n)
+	var merged *node
+	if left.leaf {
+		merged = &node{leaf: true, next: right.next,
+			keys: append(append([][]byte(nil), left.keys...), right.keys...),
+			vals: append(append([]value(nil), left.vals...), right.vals...)}
+	} else {
+		merged = &node{
+			keys:     append(append(append([][]byte(nil), left.keys...), n.keys[li]), right.keys...),
+			children: append(append([]uint32(nil), left.children...), right.children...)}
+	}
+	if merged.size() <= pager.UsableSize {
+		t.store(lpg, merged)
+		t.v.Free(rpg)
+		n.keys = append(n.keys[:li], n.keys[li+1:]...)
+		n.children = append(n.children[:li+1], n.children[li+2:]...)
+		return true, nil
+	}
+	// Redistribute. The new separator may be longer than the old one; give
+	// up if the parent would no longer fit in its page.
+	var nl, nr *node
+	var sep []byte
+	if merged.leaf {
+		m := leafSplit(merged)
+		nl = &node{leaf: true, keys: merged.keys[:m], vals: merged.vals[:m], next: rpg}
+		nr = &node{leaf: true, keys: merged.keys[m:], vals: merged.vals[m:], next: right.next}
+		sep = nr.keys[0]
+	} else {
+		m := internalSplit(merged)
+		nl = &node{keys: merged.keys[:m], children: merged.children[:m+1]}
+		nr = &node{keys: merged.keys[m+1:], children: merged.children[m+1:]}
+		sep = merged.keys[m]
+	}
+	if n.size()-len(n.keys[li])+len(sep) > pager.UsableSize {
+		return false, nil
+	}
+	t.store(lpg, nl)
+	t.store(rpg, nr)
+	n.keys[li] = sep
 	return true, nil
 }
 

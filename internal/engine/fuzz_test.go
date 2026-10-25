@@ -36,6 +36,7 @@ func FuzzExec(f *testing.F) {
 		"SELECT date('2026-01-31', '+1 month', 'start of day'), strftime('%Y %j %W %s %f', 'now'), julianday(2451545.5), datetime(0, 'unixepoch', 'localtime')",
 		"ALTER TABLE t RENAME COLUMN n TO m; ALTER TABLE t DROP COLUMN m; ALTER TABLE t RENAME TO t2; SELECT * FROM t2",
 		"CREATE TABLE f (id INTEGER PRIMARY KEY, tid INT REFERENCES t ON DELETE CASCADE ON UPDATE SET NULL, up INT REFERENCES f ON DELETE SET NULL, CHECK (id > 0)); INSERT INTO f VALUES (1, 1, NULL), (2, 2, 1); DELETE FROM t WHERE id = 1; UPDATE t SET id = 9",
+		"DELETE FROM t WHERE id > 1; VACUUM; SELECT * FROM t",
 		"CREATE VIEW v (a, b) AS SELECT name, COUNT(*) FROM t GROUP BY name; SELECT * FROM v JOIN t ON t.name = v.a WHERE b > 0; DROP VIEW v",
 	} {
 		f.Add(s)

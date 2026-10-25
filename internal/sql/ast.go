@@ -175,6 +175,9 @@ type Delete struct {
 }
 
 type Begin struct{}
+
+// Vacuum rebuilds the database file compactly.
+type Vacuum struct{}
 type Commit struct{}
 type Rollback struct{}
 
@@ -196,6 +199,7 @@ func (*Select) stmt()                 {}
 func (*Update) stmt()                 {}
 func (*Delete) stmt()                 {}
 func (*Begin) stmt()                  {}
+func (*Vacuum) stmt()                 {}
 func (*Commit) stmt()                 {}
 func (*Rollback) stmt()               {}
 func (*Explain) stmt()                {}

@@ -361,3 +361,28 @@ func TestCascadeAndBackupFromReplica(t *testing.T) {
 	}
 	checkConsistent(t, openDB(t, filepath.Join(dir, "from-replica.db")))
 }
+
+func TestReplicaResyncsAfterVacuum(t *testing.T) {
+	dir := t.TempDir()
+	primary := openDB(t, filepath.Join(dir, "p.db"))
+	setup(t, primary)
+	_, addr := startPrimary(t, primary, PrimaryOptions{})
+	replicaDB := openDB(t, filepath.Join(dir, "r.db"))
+	r := StartReplica(replicaDB, addr, ReplicaOptions{})
+	defer r.Stop()
+	waitSynced(t, r, primary)
+
+	mustExec(t, primary, `DELETE FROM a WHERE v % 3 <> 0; DELETE FROM b WHERE v % 3 <> 0`)
+	if err := primary.Vacuum(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	mustExec(t, primary, `INSERT INTO a (v) VALUES (777); INSERT INTO b (v) VALUES (777)`)
+	waitSynced(t, r, primary)
+	if got, want := dump(t, replicaDB), dump(t, primary); got != want {
+		t.Fatal("replica differs after the primary was vacuumed")
+	}
+	if replicaDB.Engine().DBID() != primary.Engine().DBID() {
+		t.Fatal("replica did not take the new identity")
+	}
+	checkConsistent(t, replicaDB)
+}

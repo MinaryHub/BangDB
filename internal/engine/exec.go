@@ -24,7 +24,8 @@ type execCtx struct {
 	ticks uint32
 	outer *outerCtx // set when planning a subquery
 
-	fkDepth int // nesting of foreign key actions and views
+	fkDepth int          // nesting of foreign key actions and views
+	spill   *spillConfig // nil: defaults
 }
 
 // tick is called once per row visited; every 256 rows it checks whether the
@@ -125,12 +126,32 @@ func (x *execCtx) getRow(t *Table, rowid int64) ([]any, bool, error) {
 }
 
 func indexEntry(ix *Index, row []any, rowid int64) ([]byte, error) {
-	k := ix.key(row)
-	k = append(k, value.EncodeRowID(rowid)...)
-	if len(k) > btree.MaxKey {
-		return nil, fmt.Errorf("bangdb: value too large to be indexed (max %d bytes)", btree.MaxKey-16)
+	return append(ix.key(row), value.EncodeRowID(rowid)...), nil
+}
+
+// findKey returns a row other than self whose values in ix equal those of
+// row (row must have every index column set).
+func (x *execCtx) findKey(t *Table, ix *Index, row []any, self int64) (int64, bool, error) {
+	full := ix.fullKey(row)
+	prefix, trunc := truncKey(full)
+	c := btree.Open(x.v, ix.Root).Seek(prefix)
+	for ; c.Valid() && bytes.HasPrefix(c.Key(), prefix); c.Next() {
+		id := value.DecodeRowID(c.Key()[len(c.Key())-8:])
+		if id == self {
+			continue
+		}
+		if trunc {
+			other, ok, err := x.getRow(t, id)
+			if err != nil {
+				return 0, false, err
+			}
+			if !ok || !bytes.Equal(ix.fullKey(other), full) {
+				continue // shares only the truncated prefix
+			}
+		}
+		return id, true, nil
 	}
-	return k, nil
+	return 0, false, c.Err()
 }
 
 // checkUnique fails if another row (not self) has the same values in ix.
@@ -138,13 +159,10 @@ func (x *execCtx) checkUnique(t *Table, ix *Index, row []any, self int64) error 
 	if !ix.Unique || ix.hasNull(row) {
 		return nil
 	}
-	prefix := ix.key(row)
-	for c := btree.Open(x.v, ix.Root).Seek(prefix); c.Valid() && bytes.HasPrefix(c.Key(), prefix); c.Next() {
-		if value.DecodeRowID(c.Key()[len(prefix):]) != self {
-			return constraintErr("UNIQUE constraint failed: %s.%s", t.Name, strings.Join(ix.Columns, ", "+t.Name+"."))
-		}
+	if _, found, err := x.findKey(t, ix, row, self); err != nil || !found {
+		return err
 	}
-	return nil
+	return constraintErr("UNIQUE constraint failed: %s.%s", t.Name, strings.Join(ix.Columns, ", "+t.Name+"."))
 }
 
 func (x *execCtx) nextRowid(t *Table) (int64, error) {
