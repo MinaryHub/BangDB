@@ -29,6 +29,7 @@ type selectPlan struct {
 	aggs    []*aggSpec
 	groupBy []evalFn
 	having  evalFn
+	ordered bool // the scan already delivers rows in ORDER BY order
 }
 
 type orderFn struct {
@@ -136,6 +137,9 @@ func (x *execCtx) planSelect(st *sql.Select) (*selectPlan, error) {
 		p.orderBy = append(p.orderBy, of)
 	}
 
+	if !p.agg && !st.Distinct && len(st.OrderBy) > 0 && len(p.levels) > 0 {
+		p.ordered = p.useScanOrder(st)
+	}
 	if p.agg {
 		gc := &compiler{x: x, sc: p.sc}
 		for _, g := range st.GroupBy {
@@ -272,7 +276,7 @@ func (x *execCtx) runSelect(r *selectRun, sink func(vals []any) (bool, error)) e
 	}
 	p, st, limit, offset := r.p, r.st, r.limit, r.offset
 	e := &env{row: make([]any, len(p.sc.cols)), args: x.args}
-	streaming := !p.agg && len(p.orderBy) == 0 && !st.Distinct
+	streaming := !p.agg && (len(p.orderBy) == 0 || p.ordered) && !st.Distinct
 	var out []outRow
 	sortOut := func() {
 		sort.SliceStable(out, func(i, j int) bool {
@@ -496,7 +500,7 @@ func (x *execCtx) explain(s sql.Stmt) (Result, error) {
 			if p.agg {
 				add("AGGREGATE")
 			}
-			if len(st.OrderBy) > 0 {
+			if len(st.OrderBy) > 0 && !p.ordered {
 				add("SORT")
 			}
 		}()
@@ -1155,4 +1159,124 @@ func (x *execCtx) runCompound(r *selectRun, sink func(vals []any) (bool, error))
 		}
 	}
 	return nil
+}
+
+// useScanOrder checks whether the first table can be read in ORDER BY order
+// (rowid order or the order of an index), adjusting its access path if
+// needed. The nested-loop join preserves the order of the first table.
+func (p *selectPlan) useScanOrder(st *sql.Select) bool {
+	l := p.levels[0]
+	if l.virtual != nil {
+		return false
+	}
+	var cols []int // table column positions; -1 = rowid
+	var dirs []bool
+	for i, o := range st.OrderBy {
+		e := o.Expr
+		if of := p.orderBy[i]; of.outIdx >= 0 {
+			it := st.Items[of.outIdx]
+			if it.Star {
+				return false
+			}
+			e = it.Expr
+		}
+		ref, ok := e.(*sql.ColumnRef)
+		if !ok {
+			return false
+		}
+		idx, err := p.sc.resolve(ref.Table, ref.Name)
+		if err != nil || p.sc.cols[idx].level != 0 {
+			return false
+		}
+		col := idx - l.offset
+		if col == len(l.t.Columns) || col == l.t.RowidCol {
+			col = -1
+		} else if l.t.Columns[col].Type == value.Any {
+			return false // mixed types: index order differs from value order
+		}
+		cols = append(cols, col)
+		dirs = append(dirs, o.Desc)
+	}
+	// uniform reports the common direction of the given ORDER BY items.
+	uniform := func(keep func(i int) bool) (desc, ok bool) {
+		first := true
+		for i, d := range dirs {
+			if !keep(i) {
+				continue
+			}
+			if first {
+				desc, first = d, false
+			} else if d != desc {
+				return false, false
+			}
+		}
+		return desc, true
+	}
+	all := func(int) bool { return true }
+	acc := l.acc
+	if len(cols) == 1 && cols[0] == -1 {
+		desc := dirs[0]
+		switch acc.kind {
+		case accFull, accRowidRange:
+			acc.reverse = desc
+			acc.desc += " (ordered by rowid)"
+			return true
+		case accRowidEq:
+			return true
+		}
+		// An index fully fixed by equality also yields rowid order.
+	}
+	// Index entries are ordered by (columns..., rowid), so a trailing rowid
+	// matches once every index column is used.
+	matches := func(ix *Index, from int, want []int) bool {
+		for i, c := range want {
+			pos := from + i
+			switch {
+			case c < 0 && pos == len(ix.cols) && i == len(want)-1:
+			case pos >= len(ix.cols) || c < 0 || ix.cols[pos] != c:
+				return false
+			}
+		}
+		return true
+	}
+	switch acc.kind {
+	case accIndex:
+		if acc.in != nil {
+			return false
+		}
+		// Columns fixed by equality are constant and can be skipped.
+		eqN := len(acc.prefix)
+		var rest []int
+		isFixed := map[int]bool{}
+		for i, c := range cols {
+			for _, ec := range acc.ix.cols[:eqN] {
+				isFixed[i] = isFixed[i] || ec == c
+			}
+			if !isFixed[i] {
+				rest = append(rest, c)
+			}
+		}
+		desc, ok := uniform(func(i int) bool { return !isFixed[i] })
+		if !ok || !matches(acc.ix, eqN, rest) {
+			return false
+		}
+		acc.reverse = desc
+		acc.desc += " (ordered by index)"
+		return true
+	case accFull:
+		// Reading through an index costs a row lookup per entry; it pays off
+		// when LIMIT stops the scan early.
+		desc, ok := uniform(all)
+		if st.Limit == nil || !ok {
+			return false
+		}
+		for _, ix := range l.t.indexes {
+			if matches(ix, 0, cols) {
+				l.acc = &access{kind: accIndex, ix: ix, reverse: desc,
+					desc: fmt.Sprintf("SCAN %s USING INDEX %s (ordered by index)", l.t.Name, ix.Name)}
+				return true
+			}
+		}
+	}
+	return false
 }

@@ -573,3 +573,98 @@ func (c *Cursor) Next() {
 	c.i++
 	c.normalize()
 }
+
+// RevCursor iterates over the tree in descending key order. Leaves are only
+// linked forward, so it keeps the path from the root.
+type RevCursor struct {
+	t     *Tree
+	stack []revFrame // internal nodes on the path, with the child index taken
+	n     *node      // current leaf
+	i     int
+	err   error
+}
+
+type revFrame struct {
+	n  *node
+	ci int
+}
+
+// SeekReverse positions a reverse cursor at the last key <= key (nil = the
+// last key of the tree).
+func (t *Tree) SeekReverse(key []byte) *RevCursor {
+	c := &RevCursor{t: t}
+	pg := t.root
+	for {
+		n, err := t.load(pg)
+		if err != nil {
+			c.err = err
+			return c
+		}
+		if n.leaf {
+			c.n = n
+			if key == nil {
+				c.i = len(n.keys) - 1
+			} else {
+				c.i = sort.Search(len(n.keys), func(i int) bool { return bytes.Compare(n.keys[i], key) > 0 }) - 1
+			}
+			break
+		}
+		ci := len(n.children) - 1
+		if key != nil {
+			ci = childIndex(n, key)
+		}
+		c.stack = append(c.stack, revFrame{n, ci})
+		pg = n.children[ci]
+	}
+	if c.i < 0 {
+		c.Prev()
+	}
+	return c
+}
+
+// Valid reports whether the cursor points at an entry.
+func (c *RevCursor) Valid() bool { return c.n != nil && c.err == nil && c.i >= 0 }
+
+// Err returns the first error encountered.
+func (c *RevCursor) Err() error { return c.err }
+
+// Key returns the current key. It must not be modified.
+func (c *RevCursor) Key() []byte { return c.n.keys[c.i] }
+
+// Value returns the current value.
+func (c *RevCursor) Value() ([]byte, error) { return c.t.readValue(c.n.vals[c.i]) }
+
+// Prev moves to the previous entry.
+func (c *RevCursor) Prev() {
+	if c.n == nil {
+		return
+	}
+	c.i--
+	for c.i < 0 {
+		// Climb to the nearest ancestor with a left sibling subtree.
+		for len(c.stack) > 0 && c.stack[len(c.stack)-1].ci == 0 {
+			c.stack = c.stack[:len(c.stack)-1]
+		}
+		if len(c.stack) == 0 {
+			c.n = nil
+			return
+		}
+		top := &c.stack[len(c.stack)-1]
+		top.ci--
+		pg := top.n.children[top.ci]
+		// Descend along the rightmost path.
+		for {
+			n, err := c.t.load(pg)
+			if err != nil {
+				c.err, c.n = err, nil
+				return
+			}
+			if n.leaf {
+				c.n, c.i = n, len(n.keys)-1
+				break
+			}
+			c.stack = append(c.stack, revFrame{n, len(n.children) - 1})
+			pg = n.children[len(n.children)-1]
+		}
+	}
+}

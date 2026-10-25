@@ -39,6 +39,8 @@ type access struct {
 	prefTyp []value.Type
 	in      []evalFn
 	desc    string
+
+	reverse bool // visit rows in descending key order (for ORDER BY ... DESC)
 }
 
 // level is one table in a FROM/JOIN chain.
@@ -470,6 +472,9 @@ func (x *execCtx) scan(t *Table, acc *access, e *env, visit func(rowid int64, ro
 				stop, stopInc = value.EncodeRowID(k.(int64)), inc
 			}
 		}
+		if acc.reverse {
+			return x.scanRowsReverse(t, stop, stopInc, start, fn)
+		}
 		c := tree.Seek(start)
 		for ; c.Valid(); c.Next() {
 			if stop != nil {
@@ -492,8 +497,38 @@ func (x *execCtx) scan(t *Table, acc *access, e *env, visit func(rowid int64, ro
 		}
 		return c.Err()
 	}
+	if acc.reverse {
+		return x.scanRowsReverse(t, nil, true, nil, fn)
+	}
 	c := tree.Seek(nil)
 	for ; c.Valid(); c.Next() {
+		data, err := c.Value()
+		if err != nil {
+			return err
+		}
+		row, err := x.decodeRow(t, data)
+		if err != nil {
+			return err
+		}
+		if cont, err := fn(value.DecodeRowID(c.Key()), row); err != nil || !cont {
+			return err
+		}
+	}
+	return c.Err()
+}
+
+// scanRowsReverse visits table rows in descending rowid order, from hi
+// (nil = the end; exclusive unless hiInc) down to lo (nil = the start,
+// inclusive).
+func (x *execCtx) scanRowsReverse(t *Table, hi []byte, hiInc bool, lo []byte, fn func(int64, []any) (bool, error)) error {
+	c := btree.Open(x.v, t.Root).SeekReverse(hi)
+	for ; c.Valid(); c.Prev() {
+		if hi != nil && !hiInc && bytes.Equal(c.Key(), hi) {
+			continue
+		}
+		if lo != nil && bytes.Compare(c.Key(), lo) < 0 {
+			break
+		}
 		data, err := c.Value()
 		if err != nil {
 			return err
@@ -526,8 +561,9 @@ func (x *execCtx) scanLevel(l *level, e *env, visit func(rowid int64, row []any)
 }
 
 // scanIndex visits the rows located by an index access path: equality on
-// the leading columns, then an IN list or a range on the next column. Row ids
-// are collected before rows are fetched so that callers may modify the table.
+// the leading columns, then an IN list or a range on the next column. Rows
+// are emitted while the index is traversed, so LIMIT can stop early (DML
+// collects its targets before modifying anything).
 func (x *execCtx) scanIndex(acc *access, e *env, emit func(int64) (bool, error)) error {
 	var prefix []byte
 	for i, f := range acc.prefix {
@@ -545,7 +581,6 @@ func (x *execCtx) scanIndex(acc *access, e *env, emit func(int64) (bool, error))
 	// collect returns the row ids of entries from start on that keep the
 	// prefix, as long as accept says so.
 	collect := func(start, prefix []byte, accept func(key []byte) (keep, more bool)) error {
-		var ids []int64
 		c := tree.Seek(start)
 		for ; c.Valid() && bytes.HasPrefix(c.Key(), prefix); c.Next() {
 			if err := x.tick(); err != nil {
@@ -559,18 +594,12 @@ func (x *execCtx) scanIndex(acc *access, e *env, emit func(int64) (bool, error))
 				break
 			}
 			if keep {
-				ids = append(ids, value.DecodeRowID(c.Key()[len(c.Key())-8:]))
+				if cont, err := emit(value.DecodeRowID(c.Key()[len(c.Key())-8:])); err != nil || !cont {
+					return err
+				}
 			}
 		}
-		if err := c.Err(); err != nil {
-			return err
-		}
-		for _, id := range ids {
-			if cont, err := emit(id); err != nil || !cont {
-				return err
-			}
-		}
-		return nil
+		return c.Err()
 	}
 	clone := func(b []byte) []byte { return append([]byte(nil), b...) }
 
@@ -595,6 +624,9 @@ func (x *execCtx) scanIndex(acc *access, e *env, emit func(int64) (bool, error))
 			}
 		}
 		return nil
+	}
+	if acc.reverse {
+		return x.scanIndexReverse(acc, e, tree, prefix, emit)
 	}
 	if acc.lo == nil && acc.hi == nil {
 		return collect(prefix, prefix, nil)
@@ -637,6 +669,56 @@ func (x *execCtx) scanIndex(acc *access, e *env, emit func(int64) (bool, error))
 		}
 		return true, true
 	})
+}
+
+// maxSuffix sorts after every key that starts with a given prefix (value
+// tags are < 0xFF and a rowid suffix is 8 bytes).
+var maxSuffix = []byte{0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF}
+
+// scanIndexReverse is scanIndex in descending key order (no IN lists).
+func (x *execCtx) scanIndexReverse(acc *access, e *env, tree *btree.Tree, prefix []byte, emit func(int64) (bool, error)) error {
+	clone := func(b []byte) []byte { return append([]byte(nil), b...) }
+	upper := append(clone(prefix), maxSuffix...)
+	var lower []byte // stop below this key
+	lowerExcl := false
+	if acc.lo != nil || acc.hi != nil {
+		lower = append(clone(prefix), value.MinNonNullKey...) // NULLs never satisfy a range
+	}
+	if acc.hi != nil {
+		v, err := acc.hi(e)
+		if err != nil || v == nil {
+			return err
+		}
+		if k, ok, inc := rangeBound(v, acc.colTyp, false, acc.hiInc); ok {
+			upper = value.AppendKey(clone(prefix), k)
+			if inc {
+				upper = append(upper, maxSuffix...)
+			}
+		}
+	}
+	if acc.lo != nil {
+		v, err := acc.lo(e)
+		if err != nil || v == nil {
+			return err
+		}
+		if k, ok, inc := rangeBound(v, acc.colTyp, true, acc.loInc); ok {
+			lower, lowerExcl = value.AppendKey(clone(prefix), k), !inc
+		}
+	}
+	c := tree.SeekReverse(upper)
+	for ; c.Valid() && bytes.HasPrefix(c.Key(), prefix); c.Prev() {
+		if err := x.tick(); err != nil {
+			return err
+		}
+		key := c.Key()
+		if lower != nil && (bytes.Compare(key, lower) < 0 || lowerExcl && bytes.HasPrefix(key, lower)) {
+			break
+		}
+		if cont, err := emit(value.DecodeRowID(key[len(key)-8:])); err != nil || !cont {
+			return err
+		}
+	}
+	return c.Err()
 }
 
 // buildLevels resolves the FROM clause into a scope and per-table levels,

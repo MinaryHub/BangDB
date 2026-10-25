@@ -115,3 +115,57 @@ func TestPersistAndReopen(t *testing.T) {
 		t.Fatal("Get failed", err)
 	}
 }
+
+func TestReverseCursor(t *testing.T) {
+	p := pager.OpenMemory()
+	v := p.NewView()
+	root, _ := Create(v)
+	tr := Open(v, root)
+	rng := rand.New(rand.NewSource(5))
+	present := map[int]bool{}
+	for i := 0; i < 20000; i++ {
+		k := rng.Intn(8000) * 2 // even keys only
+		tr.Put(key(k), bytes.Repeat([]byte{1}, rng.Intn(900)))
+		present[k] = true
+	}
+	for k := range present { // delete many to create empty leaves
+		if rng.Intn(3) == 0 {
+			tr.Delete(key(k))
+			delete(present, k)
+		}
+	}
+	var all []int
+	for k := range present {
+		all = append(all, k)
+	}
+	sort.Ints(all)
+	check := func(seek []byte, want []int) {
+		t.Helper()
+		c := tr.SeekReverse(seek)
+		for i := len(want) - 1; i >= 0; i-- {
+			if !c.Valid() || int(binary.BigEndian.Uint64(c.Key())) != want[i] {
+				t.Fatalf("seek %x: expected %d", seek, want[i])
+			}
+			c.Prev()
+		}
+		if c.Valid() {
+			t.Fatalf("seek %x: extra entries", seek)
+		}
+	}
+	check(nil, all)
+	for _, probe := range []int{-1, 0, 1, 777, 778, 9000, 15998, 16001} {
+		var want []int
+		for _, k := range all {
+			if k <= probe {
+				want = append(want, k)
+			}
+		}
+		pk := key(0)
+		if probe >= 0 {
+			pk = key(probe)
+		} else {
+			pk = []byte{}
+		}
+		check(pk, want)
+	}
+}
