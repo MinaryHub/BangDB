@@ -40,13 +40,19 @@ type Result struct {
 // DB is an open database. It is safe for concurrent use.
 //
 // Concurrency: any number of readers run in parallel with at most one write
-// transaction. Readers see the last committed state (snapshot isolation for
-// the duration of a statement); they are only paused while a commit is being
-// applied.
+// transaction. Each statement outside a transaction reads a pager snapshot of
+// the latest commit, so readers and writers never wait for each other (a
+// reader only waits for the in-memory publication of a commit, never for its
+// I/O).
 type DB struct {
-	p           *pager.Pager
-	writeSem    chan struct{} // capacity 1: the single-writer lock
-	commitMu    sync.RWMutex  // readers hold R, commit holds W
+	p        *pager.Pager
+	writeSem chan struct{} // capacity 1: the single-writer lock
+	// pubMu makes "publish a commit + install its catalog" atomic with
+	// respect to "take a snapshot + read the catalog".
+	pubMu sync.Mutex
+	// swapMu guards the pager pointer: readers hold R for a statement,
+	// replacing or closing the pager takes W.
+	swapMu      sync.RWMutex
 	catMu       sync.Mutex
 	cat         *Catalog // committed catalog (immutable)
 	busyTimeout time.Duration
@@ -106,9 +112,9 @@ func (db *DB) Close() error {
 			return
 		}
 		close(db.closed)
-		db.commitMu.Lock()
+		db.swapMu.Lock()
 		err = db.p.Close()
-		db.commitMu.Unlock()
+		db.swapMu.Unlock()
 		db.repl.mu.Lock()
 		db.repl.disabled = true
 		close(db.repl.notify)
@@ -226,15 +232,60 @@ func (db *DB) Begin() (*Tx, error) {
 	return &Tx{db: db, v: db.p.NewView(), cat: db.committedCatalog(), rowids: map[string]int64{}}, nil
 }
 
-// read runs fn against the committed state.
+// read runs fn against a snapshot of the latest commit.
 func (db *DB) read(fn func(x *execCtx) (Result, error), args []any) (Result, error) {
-	db.commitMu.RLock()
-	defer db.commitMu.RUnlock()
+	db.swapMu.RLock()
+	defer db.swapMu.RUnlock()
 	if db.isClosed() {
 		return Result{}, pager.ErrClosed
 	}
-	x := &execCtx{v: db.p.NewView(), cat: db.committedCatalog(), args: args}
+	db.pubMu.Lock()
+	snap, err := db.p.Snapshot()
+	cat := db.committedCatalog()
+	db.pubMu.Unlock()
+	if err != nil {
+		return Result{}, err
+	}
+	defer snap.Release()
+	x := &execCtx{v: snap.View(), cat: cat, args: args}
 	return fn(x)
+}
+
+// publish makes a prepared commit and its catalog visible, then runs a
+// checkpoint if the WAL is large. The caller holds the write lock.
+func (db *DB) publish(c *pager.Prepared, cat func() (*Catalog, error)) error {
+	db.pubMu.Lock()
+	db.p.Publish(c)
+	var err error
+	if c != nil {
+		var nc *Catalog
+		if nc, err = cat(); err == nil {
+			db.catMu.Lock()
+			db.cat = nc
+			db.catMu.Unlock()
+		}
+	}
+	db.pubMu.Unlock()
+	if err == nil && db.p.NeedsCheckpoint() {
+		// A failed checkpoint does not undo the commit; it is retried later
+		// and a broken file is reported by the next operation.
+		db.p.Checkpoint()
+	}
+	return err
+}
+
+// Checkpoint copies committed pages from the WAL into the database file as
+// far as active readers allow. It runs automatically; calling it explicitly
+// is only useful before copying the database file by hand.
+func (db *DB) Checkpoint() error {
+	if err := db.lockWrite(); err != nil {
+		return err
+	}
+	defer db.unlockWrite()
+	if db.isClosed() {
+		return pager.ErrClosed
+	}
+	return db.p.Checkpoint()
 }
 
 // Tx is a write transaction. It must be finished with Commit or Rollback.
@@ -302,15 +353,11 @@ func (tx *Tx) Commit() error {
 	}
 	tx.done = true
 	defer tx.db.unlockWrite()
-	tx.db.commitMu.Lock()
-	defer tx.db.commitMu.Unlock()
-	if err := tx.db.p.Commit(tx.v); err != nil {
+	c, err := tx.db.p.PrepareCommit(tx.v)
+	if err != nil {
 		return err
 	}
-	tx.db.catMu.Lock()
-	tx.db.cat = tx.cat
-	tx.db.catMu.Unlock()
-	return nil
+	return tx.db.publish(c, func() (*Catalog, error) { return tx.cat, nil })
 }
 
 // Rollback discards the transaction's changes.
@@ -420,7 +467,7 @@ func isReadOnly(s sql.Stmt) bool {
 
 // PageCount returns the number of pages in the committed database.
 func (db *DB) PageCount() uint32 {
-	db.commitMu.RLock()
-	defer db.commitMu.RUnlock()
+	db.swapMu.RLock()
+	defer db.swapMu.RUnlock()
 	return db.p.Header().PageCount
 }

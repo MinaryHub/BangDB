@@ -16,12 +16,12 @@ import (
 // Every commit produces a Frame: the full images of the pages it changed,
 // including the header page 0 that carries the commit sequence number. A copy
 // of the database is brought up to date by applying frames in sequence order.
-// Because frames hold whole pages, replaying them is idempotent, which makes
-// "fuzzy" snapshots possible: pages can be copied while commits continue, as
-// long as every frame committed during the copy is replayed afterwards.
+// Full snapshots are read from a pager snapshot, so they are consistent and
+// never pause commits.
 //
-//	backup / new replica:  SnapshotSubscribe -> CopyPages -> replay frames up to endSeq
-//	mirroring:             Subscribe(seq) -> apply each frame as it arrives
+//	backup:       OpenSnapshot -> CopyPages
+//	new replica:  OpenSnapshot(subscribe) -> CopyPages -> apply frames after BaseSeq
+//	mirroring:    Subscribe(seq) -> apply each frame as it arrives
 
 var (
 	// ErrReadOnly is returned for writes on a replica.
@@ -175,15 +175,15 @@ func (db *DB) SetReplicationLog(bytes int) {
 
 // Seq returns the sequence number of the last committed transaction.
 func (db *DB) Seq() uint64 {
-	db.commitMu.RLock()
-	defer db.commitMu.RUnlock()
+	db.swapMu.RLock()
+	defer db.swapMu.RUnlock()
 	return db.p.Header().Seq
 }
 
 // DBID returns the identity shared by a database and its replicas.
 func (db *DB) DBID() [16]byte {
-	db.commitMu.RLock()
-	defer db.commitMu.RUnlock()
+	db.swapMu.RLock()
+	defer db.swapMu.RUnlock()
 	return db.p.Header().DBID
 }
 
@@ -204,61 +204,74 @@ func (db *DB) Subscribe(seq uint64) (*Subscription, error) {
 	return s, nil
 }
 
-// SnapshotInfo describes a snapshot in progress.
+// SnapshotInfo describes a snapshot.
 type SnapshotInfo struct {
 	DBID      [16]byte
-	BaseSeq   uint64 // sequence at which the copy started
+	BaseSeq   uint64 // commit the snapshot shows
 	PageCount uint32 // pages to copy
 }
 
-// SnapshotSubscribe atomically records the current state and subscribes to
-// every later frame. Follow it with CopyPages.
-func (db *DB) SnapshotSubscribe() (*Subscription, SnapshotInfo, error) {
-	db.commitMu.RLock()
-	defer db.commitMu.RUnlock()
-	if db.isClosed() {
-		return nil, SnapshotInfo{}, pager.ErrClosed
-	}
-	h := db.p.Header()
-	sub, err := db.Subscribe(h.Seq)
-	if err != nil {
-		return nil, SnapshotInfo{}, err
-	}
-	return sub, SnapshotInfo{DBID: h.DBID, BaseSeq: h.Seq, PageCount: h.PageCount}, nil
+// Snapshot is a consistent, pinned view of one commit used to copy the whole
+// database. Commits continue while it is open; the WAL cannot be
+// checkpointed past it, so it should not be held longer than needed.
+type Snapshot struct {
+	Info SnapshotInfo
+	// Sub delivers every commit after Info.BaseSeq (only if requested). It
+	// stays valid after Close and must be closed by its owner.
+	Sub *Subscription
+
+	db   *DB
+	snap *pager.Snapshot
 }
 
-// CopyPages copies pages [0, count) of the committed state to fn. Commits are
-// only paused for one batch at a time, so the copy is "fuzzy"; it returns the
-// sequence up to which frames must be replayed to make it consistent.
-func (db *DB) CopyPages(count uint32, fn func(no uint32, data []byte) error) (endSeq uint64, err error) {
-	const batch = 256
-	for start := uint32(0); start < count; start += batch {
-		pages := make([][]byte, 0, batch)
-		db.commitMu.RLock()
-		if db.isClosed() {
-			db.commitMu.RUnlock()
-			return 0, pager.ErrClosed
-		}
-		for no := start; no < min(start+batch, count); no++ {
-			b, err := db.p.ReadCommitted(no)
-			if err != nil {
-				db.commitMu.RUnlock()
-				return 0, err
-			}
-			pages = append(pages, b)
-		}
-		endSeq = db.p.Header().Seq
-		db.commitMu.RUnlock()
-		for i, b := range pages {
-			if err := fn(start+uint32(i), b); err != nil {
-				return 0, err
-			}
+// OpenSnapshot pins the latest commit. With subscribe, it also atomically
+// subscribes to every later commit, which is how a replica is bootstrapped.
+func (db *DB) OpenSnapshot(subscribe bool) (*Snapshot, error) {
+	db.swapMu.RLock()
+	if db.isClosed() {
+		db.swapMu.RUnlock()
+		return nil, pager.ErrClosed
+	}
+	db.pubMu.Lock()
+	ps, err := db.p.Snapshot()
+	var sub *Subscription
+	if err == nil && subscribe {
+		if sub, err = db.Subscribe(ps.Seq()); err != nil {
+			ps.Release()
 		}
 	}
-	if count == 0 {
-		endSeq = db.Seq()
+	db.pubMu.Unlock()
+	if err != nil {
+		db.swapMu.RUnlock()
+		return nil, err
 	}
-	return endSeq, nil
+	h := ps.Header()
+	return &Snapshot{Info: SnapshotInfo{DBID: h.DBID, BaseSeq: ps.Seq(), PageCount: h.PageCount},
+		Sub: sub, db: db, snap: ps}, nil
+}
+
+// CopyPages passes every page of the snapshot to fn in order.
+func (s *Snapshot) CopyPages(fn func(no uint32, data []byte) error) error {
+	v := s.snap.View()
+	for no := uint32(0); no < s.Info.PageCount; no++ {
+		b, err := v.Read(no)
+		if err != nil {
+			return err
+		}
+		if err := fn(no, b); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// Close releases the snapshot (but not Sub).
+func (s *Snapshot) Close() {
+	if s.snap != nil {
+		s.snap.Release()
+		s.snap = nil
+		s.db.swapMu.RUnlock()
+	}
 }
 
 // SetReadOnly turns replica mode on or off. In replica mode all writes fail
@@ -285,40 +298,53 @@ func (db *DB) Path() string { return db.path }
 func (db *DB) ReadOnly() bool { return db.readOnly.Load() }
 
 // ApplyFrame applies a frame from the primary. Frames at or below the local
-// sequence are ignored (idempotent re-delivery).
+// sequence are ignored (idempotent re-delivery). Readers are not blocked.
 func (db *DB) ApplyFrame(f Frame) error {
 	if err := db.lockWrite(); err != nil {
 		return err
 	}
 	defer db.unlockWrite()
-	db.commitMu.Lock()
-	defer db.commitMu.Unlock()
 	if db.isClosed() {
 		return pager.ErrClosed
 	}
-	if err := applyFrame(db.p, f); err != nil {
+	pages, err := framePages(db.p, f)
+	if err != nil || pages == nil {
 		return err
 	}
-	return db.reloadCatalogLocked()
+	c, err := db.p.PrepareRaw(pages)
+	if err != nil {
+		return err
+	}
+	return db.publish(c, func() (*Catalog, error) { return loadCatalog(db.p.NewView()) })
 }
 
-func applyFrame(p *pager.Pager, f Frame) error {
+// framePages validates f against the local sequence; nil means "already
+// applied".
+func framePages(p *pager.Pager, f Frame) (map[uint32][]byte, error) {
 	cur := p.Header().Seq
 	if f.Seq <= cur {
-		return nil
+		return nil, nil
 	}
 	if f.Seq != cur+1 {
-		return fmt.Errorf("%w: have %d, got %d", ErrSeqGap, cur, f.Seq)
+		return nil, fmt.Errorf("%w: have %d, got %d", ErrSeqGap, cur, f.Seq)
 	}
 	pages := make(map[uint32][]byte, len(f.Pages))
 	for _, pg := range f.Pages {
 		if len(pg.Data) != pager.PageSize {
-			return errors.New("bangdb: replication frame has a page of wrong size")
+			return nil, errors.New("bangdb: replication frame has a page of wrong size")
 		}
 		pages[pg.No] = pg.Data
 	}
 	if _, ok := pages[0]; !ok {
-		return errors.New("bangdb: replication frame without header page")
+		return nil, errors.New("bangdb: replication frame without header page")
+	}
+	return pages, nil
+}
+
+func applyFrame(p *pager.Pager, f Frame) error {
+	pages, err := framePages(p, f)
+	if err != nil || pages == nil {
+		return err
 	}
 	return p.CommitRaw(pages)
 }
@@ -393,7 +419,10 @@ func (w *SnapshotWriter) Close() error {
 		return nil
 	}
 	os.Remove(w.tmp + "-wal")
-	return os.Rename(w.tmp, w.path)
+	if err := os.Rename(w.tmp, w.path); err != nil {
+		return err
+	}
+	return pager.SyncDir(w.path)
 }
 
 // InstallSnapshot replaces this database's content with a completed copy.
@@ -406,8 +435,8 @@ func (db *DB) InstallSnapshot(w *SnapshotWriter) error {
 		return err
 	}
 	defer db.unlockWrite()
-	db.commitMu.Lock()
-	defer db.commitMu.Unlock()
+	db.swapMu.Lock() // waits for running readers of the old data
+	defer db.swapMu.Unlock()
 	if db.isClosed() {
 		return pager.ErrClosed
 	}
@@ -426,6 +455,9 @@ func (db *DB) InstallSnapshot(w *SnapshotWriter) error {
 		if err := os.Rename(w.tmp, db.path); err != nil {
 			return err
 		}
+		if err := pager.SyncDir(db.path); err != nil {
+			return err
+		}
 		p, err := pager.Open(db.path)
 		if err != nil {
 			return err // db.p stays closed: later calls fail with ErrClosed
@@ -441,30 +473,30 @@ func (db *DB) InstallSnapshot(w *SnapshotWriter) error {
 }
 
 // Backup writes a consistent copy of the database to path while the database
-// stays fully usable: commits are paused only for short page batches. The
-// result is a regular database file that can be opened directly.
+// stays fully usable: it copies a pinned snapshot, so neither readers nor
+// writers wait. The result is a regular database file that can be opened
+// directly.
 func (db *DB) Backup(ctx context.Context, path string) error {
 	if path == "" || path == ":memory:" || path == db.path {
 		return errors.New("bangdb: invalid backup path")
 	}
-	sub, info, err := db.SnapshotSubscribe()
+	snap, err := db.OpenSnapshot(false)
 	if err != nil {
 		return err
 	}
-	defer sub.Close()
+	defer snap.Close()
 	w, err := NewSnapshotWriter(path)
 	if err != nil {
 		return err
 	}
-	endSeq, err := db.CopyPages(info.PageCount, w.WritePage)
-	if err == nil {
-		err = w.Finish(info.BaseSeq)
-	}
-	for err == nil && w.Seq() < endSeq {
-		var f Frame
-		if f, err = sub.Next(ctx); err == nil {
-			err = w.Apply(f)
+	err = snap.CopyPages(func(no uint32, data []byte) error {
+		if err := ctx.Err(); err != nil {
+			return err
 		}
+		return w.WritePage(no, data)
+	})
+	if err == nil {
+		err = w.Finish(snap.Info.BaseSeq)
 	}
 	if err != nil {
 		w.Abort()

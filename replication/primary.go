@@ -193,25 +193,25 @@ func (p *Primary) handle(c net.Conn) {
 }
 
 func (p *Primary) sendSnapshot(w *bufio.Writer, info *ReplicaInfo) (*engine.Subscription, error) {
-	sub, snap, err := p.db.SnapshotSubscribe()
+	snap, err := p.db.OpenSnapshot(true)
 	if err != nil {
 		return nil, err
 	}
-	writeSnapshotBegin(w, snap)
-	endSeq, err := p.db.CopyPages(snap.PageCount, func(no uint32, data []byte) error {
-		return writePage(w, no, data)
-	})
+	defer snap.Close()
+	writeSnapshotBegin(w, snap.Info)
+	err = snap.CopyPages(func(no uint32, data []byte) error { return writePage(w, no, data) })
+	if err == nil {
+		// The snapshot is consistent as of BaseSeq: no frames need to be
+		// replayed before it can be installed.
+		w.WriteByte(msgSnapEnd)
+		err = writeU64(w, snap.Info.BaseSeq)
+	}
 	if err != nil {
-		sub.Close()
+		snap.Sub.Close()
 		return nil, err
 	}
-	w.WriteByte(msgSnapEnd)
-	if err := writeU64(w, endSeq); err != nil {
-		sub.Close()
-		return nil, err
-	}
-	p.setInfo(info, func() { info.Snapshots++; info.Seq = snap.BaseSeq })
-	return sub, nil
+	p.setInfo(info, func() { info.Snapshots++; info.Seq = snap.Info.BaseSeq })
+	return snap.Sub, nil
 }
 
 func (p *Primary) setInfo(info *ReplicaInfo, fn func()) {

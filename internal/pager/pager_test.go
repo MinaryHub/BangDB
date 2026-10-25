@@ -129,3 +129,5 @@ func TestSecondProcessLock(t *testing.T) {
 		t.Fatal("expected lock error on second open")
 	}
 }
+
+var errCrash = errors.New("crash")
