@@ -23,6 +23,8 @@ type execCtx struct {
 	ctx   context.Context
 	ticks uint32
 	outer *outerCtx // set when planning a subquery
+
+	fkDepth int // nesting of foreign key actions and views
 }
 
 // tick is called once per row visited; every 256 rows it checks whether the
@@ -70,6 +72,10 @@ func (x *execCtx) exec(s sql.Stmt) (Result, error) {
 		return Result{}, x.renameColumn(st)
 	case *sql.AlterTableDropColumn:
 		return Result{}, x.dropColumn(st)
+	case *sql.CreateView:
+		return Result{}, x.createView(st)
+	case *sql.DropView:
+		return Result{}, x.dropView(st)
 	}
 	return Result{}, fmt.Errorf("bangdb: unsupported statement %T", s)
 }
@@ -77,6 +83,9 @@ func (x *execCtx) exec(s sql.Stmt) (Result, error) {
 func (x *execCtx) table(name string) (*Table, error) {
 	t := x.cat.table(name)
 	if t == nil {
+		if x.cat.view(name) != nil {
+			return nil, fmt.Errorf("bangdb: cannot modify %s because it is a view", name)
+		}
 		return nil, fmt.Errorf("bangdb: no such table: %s", name)
 	}
 	return t, nil
@@ -223,7 +232,8 @@ func (x *execCtx) noteRowid(t *Table, id int64) {
 	}
 }
 
-// prepareRow coerces values to column types and checks NOT NULL.
+// prepareRow coerces values to column types and checks NOT NULL and CHECK
+// constraints.
 func prepareRow(t *Table, row []any) error {
 	for i, c := range t.Columns {
 		v, err := value.Coerce(row[i], c.Type)
@@ -235,7 +245,7 @@ func prepareRow(t *Table, row []any) error {
 			return constraintErr("NOT NULL constraint failed: %s.%s", t.Name, c.Name)
 		}
 	}
-	return nil
+	return checkRow(t, row)
 }
 
 // insertRow writes a new row (already prepared) and returns its rowid.
@@ -264,6 +274,11 @@ func (x *execCtx) insertRow(t *Table, row []any) (int64, error) {
 	}
 	for _, ix := range t.indexes {
 		if err := x.checkUnique(t, ix, row, rowid); err != nil {
+			return 0, err
+		}
+	}
+	if len(t.ForeignKeys) > 0 {
+		if err := x.checkParents(t, row, nil); err != nil {
 			return 0, err
 		}
 	}
@@ -307,6 +322,9 @@ func (x *execCtx) createTable(st *sql.CreateTable) error {
 			return nil
 		}
 		return fmt.Errorf("bangdb: table %s already exists", st.Name)
+	}
+	if x.cat.view(st.Name) != nil {
+		return fmt.Errorf("bangdb: there is already a view named %s", st.Name)
 	}
 	if strings.HasPrefix(strings.ToLower(st.Name), "bangdb_") {
 		return fmt.Errorf("bangdb: table names starting with bangdb_ are reserved")
@@ -398,6 +416,22 @@ func (x *execCtx) createTable(st *sql.CreateTable) error {
 		}
 		autos = append(autos, autoIdx{cols: canon})
 	}
+	checks := append([]sql.Expr(nil), st.Checks...)
+	for _, cd := range st.Columns {
+		if cd.Check != nil {
+			checks = append(checks, cd.Check)
+		}
+	}
+	for _, e := range checks {
+		if err := validateCheck(e); err != nil {
+			return fmt.Errorf("bangdb: %w", err)
+		}
+		src := sql.FormatExpr(e)
+		if _, err := compileCheck(t, src); err != nil {
+			return fmt.Errorf("bangdb: CHECK constraint: %w", err)
+		}
+		t.Checks = append(t.Checks, src)
+	}
 
 	root, err := btree.Create(x.v)
 	if err != nil {
@@ -422,7 +456,25 @@ func (x *execCtx) createTable(st *sql.CreateTable) error {
 		}
 	}
 	x.cat.link()
+	if len(st.ForeignKeys) > 0 || hasReferences(st) {
+		if err := x.buildForeignKeys(t, st); err != nil {
+			return err
+		}
+		if err := saveEntry(x.v, tableKey(t.Name), t); err != nil {
+			return err
+		}
+		x.cat.link()
+	}
 	return nil
+}
+
+func hasReferences(st *sql.CreateTable) bool {
+	for _, cd := range st.Columns {
+		if cd.References != nil {
+			return true
+		}
+	}
+	return false
 }
 
 func columnFromDef(cd sql.ColumnDef) (Column, error) {
@@ -457,7 +509,13 @@ func (x *execCtx) dropTable(st *sql.DropTable) error {
 		if st.IfExists {
 			return nil
 		}
+		if x.cat.view(st.Name) != nil {
+			return fmt.Errorf("bangdb: %s is a view (use DROP VIEW)", st.Name)
+		}
 		return fmt.Errorf("bangdb: no such table: %s", st.Name)
+	}
+	if refs := x.cat.referencingTables(t); len(refs) > 0 {
+		return fmt.Errorf("bangdb: cannot drop table %s: it is referenced by a foreign key of %s", t.Name, strings.Join(refs, ", "))
 	}
 	x.mutableCatalog()
 	t = x.cat.table(st.Name)
@@ -591,6 +649,9 @@ func (x *execCtx) addColumn(st *sql.AlterTableAddColumn) error {
 	if st.Column.PrimaryKey || st.Column.Unique {
 		return fmt.Errorf("bangdb: cannot add a PRIMARY KEY or UNIQUE column")
 	}
+	if st.Column.Check != nil || st.Column.References != nil {
+		return fmt.Errorf("bangdb: cannot add a column with a CHECK or REFERENCES constraint")
+	}
 	col, err := columnFromDef(st.Column)
 	if err != nil {
 		return err
@@ -628,8 +689,8 @@ func (x *execCtx) renameTable(st *sql.AlterTableRename) error {
 	if err != nil {
 		return err
 	}
-	if x.cat.table(st.NewName) != nil {
-		return fmt.Errorf("bangdb: there is already a table named %s", st.NewName)
+	if x.cat.table(st.NewName) != nil || x.cat.view(st.NewName) != nil {
+		return fmt.Errorf("bangdb: there is already a table or view named %s", st.NewName)
 	}
 	if strings.HasPrefix(strings.ToLower(st.NewName), "bangdb_") {
 		return fmt.Errorf("bangdb: table names starting with bangdb_ are reserved")
@@ -672,6 +733,15 @@ func (x *execCtx) renameTable(st *sql.AlterTableRename) error {
 		delete(x.tx.rowids, strings.ToLower(old))
 		x.tx.rowids[strings.ToLower(t.Name)] = id
 	}
+	// Foreign keys of other tables (and self references) follow the rename.
+	for _, ref := range t.referencedBy {
+		ref.fk.RefTable = t.Name
+		if ref.child != t {
+			if err := saveEntry(x.v, tableKey(ref.child.Name), ref.child); err != nil {
+				return err
+			}
+		}
+	}
 	x.cat.link()
 	return x.saveTable(t)
 }
@@ -704,6 +774,18 @@ func (x *execCtx) renameColumn(st *sql.AlterTableRenameColumn) error {
 			}
 		}
 	}
+	for k := range t.ForeignKeys {
+		renameIn(t.ForeignKeys[k].Columns, old, st.New)
+	}
+	renameInChecks(t, old, st.New)
+	for _, ref := range t.referencedBy {
+		renameIn(ref.fk.RefColumns, old, st.New)
+		if ref.child != t {
+			if err := saveEntry(x.v, tableKey(ref.child.Name), ref.child); err != nil {
+				return err
+			}
+		}
+	}
 	x.cat.link()
 	return x.saveTable(t)
 }
@@ -722,6 +804,9 @@ func (x *execCtx) dropColumn(st *sql.AlterTableDropColumn) error {
 	}
 	if t.Columns[i].PrimaryKey {
 		return fmt.Errorf("bangdb: cannot drop PRIMARY KEY column %s", t.Columns[i].Name)
+	}
+	if why := columnInUse(t, i); why != "" {
+		return fmt.Errorf("bangdb: cannot drop column %s: %s", t.Columns[i].Name, why)
 	}
 	for _, ix := range t.indexes {
 		for _, c := range ix.cols {

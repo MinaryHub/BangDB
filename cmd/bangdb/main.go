@@ -147,7 +147,7 @@ func (s *shell) command(cmd string) bool {
 	case ".quit", ".exit":
 		return false
 	case ".help":
-		fmt.Fprintln(s.out, `.tables            list tables
+		fmt.Fprintln(s.out, `.tables            list tables and views
 .schema [table]    show table definitions
 .timer on|off      show execution time
 .backup FILE       write an online backup to FILE
@@ -157,17 +157,22 @@ func (s *shell) command(cmd string) bool {
 .quit              exit
 SQL statements end with ';'. BEGIN/COMMIT/ROLLBACK are supported.`)
 	case ".tables":
-		names := s.db.Catalog().TableNames()
+		names := append(s.db.Catalog().TableNames(), s.db.Catalog().ViewNames()...)
 		sort.Strings(names)
 		fmt.Fprintln(s.out, strings.Join(names, "  "))
 	case ".schema":
-		names := s.db.Catalog().TableNames()
+		cat := s.db.Catalog()
+		names := append(cat.TableNames(), cat.ViewNames()...)
 		sort.Strings(names)
 		for _, n := range names {
 			if len(fields) > 1 && !strings.EqualFold(fields[1], n) {
 				continue
 			}
-			fmt.Fprintln(s.out, s.db.Catalog().Describe(n))
+			if d := cat.Describe(n); d != "" {
+				fmt.Fprintln(s.out, d)
+			} else {
+				fmt.Fprintln(s.out, cat.DescribeView(n))
+			}
 		}
 	case ".backup":
 		if len(fields) < 2 {

@@ -39,8 +39,13 @@ type Table struct {
 	// PrimaryKey lists the primary key columns when the key is composite
 	// (single-column keys are flagged on the column).
 	PrimaryKey []string `json:"primaryKey,omitempty"`
+	// Checks are CHECK constraints as SQL expressions.
+	Checks      []string     `json:"checks,omitempty"`
+	ForeignKeys []ForeignKey `json:"foreignKeys,omitempty"`
 
-	indexes []*Index
+	indexes      []*Index
+	checkFns     []evalFn // compiled Checks
+	referencedBy []fkRef  // foreign keys of other tables pointing here
 }
 
 // Index is a secondary index on one or more columns. Entries are keyed by
@@ -96,10 +101,63 @@ func (t *Table) ColIndex(name string) int {
 type Catalog struct {
 	tables  map[string]*Table
 	indexes map[string]*Index
+	views   map[string]*View
 }
 
 func newCatalog() *Catalog {
-	return &Catalog{tables: map[string]*Table{}, indexes: map[string]*Index{}}
+	return &Catalog{tables: map[string]*Table{}, indexes: map[string]*Index{}, views: map[string]*View{}}
+}
+
+// ForeignKey makes Columns of a table refer to RefColumns (a primary key or
+// UNIQUE constraint) of RefTable.
+type ForeignKey struct {
+	Columns    []string `json:"columns"`
+	RefTable   string   `json:"refTable"`
+	RefColumns []string `json:"refColumns"`
+	OnDelete   string   `json:"onDelete,omitempty"` // "", NO ACTION, RESTRICT, CASCADE, SET NULL
+	OnUpdate   string   `json:"onUpdate,omitempty"`
+
+	cols []int
+}
+
+type fkRef struct {
+	child *Table
+	fk    *ForeignKey
+}
+
+// View is a named SELECT.
+type View struct {
+	Name    string   `json:"name"`
+	Columns []string `json:"columns,omitempty"`
+	SQL     string   `json:"sql"`
+
+	sel *sql.Select
+}
+
+func (c *Catalog) view(name string) *View { return c.views[strings.ToLower(name)] }
+
+// ViewNames returns the view names in the catalog.
+func (c *Catalog) ViewNames() []string {
+	var out []string
+	for _, v := range c.views {
+		out = append(out, v.Name)
+	}
+	return out
+}
+
+func viewKey(name string) []byte { return []byte("v\x00" + strings.ToLower(name)) }
+
+func (v *View) prepare() error {
+	stmts, _, err := sql.Parse(v.SQL)
+	if err != nil {
+		return fmt.Errorf("bangdb: view %s: %w", v.Name, err)
+	}
+	sel, ok := stmts[0].(*sql.Select)
+	if len(stmts) != 1 || !ok {
+		return fmt.Errorf("bangdb: view %s is not a single SELECT", v.Name)
+	}
+	v.sel = sel
+	return nil
 }
 
 func (c *Catalog) table(name string) *Table { return c.tables[strings.ToLower(name)] }
@@ -120,8 +178,20 @@ func (c *Catalog) clone() *Catalog {
 		nt := *t
 		nt.Columns = append([]Column(nil), t.Columns...)
 		nt.PrimaryKey = append([]string(nil), t.PrimaryKey...)
-		nt.indexes = nil
+		nt.Checks = append([]string(nil), t.Checks...)
+		nt.ForeignKeys = nil
+		for _, fk := range t.ForeignKeys {
+			fk.Columns = append([]string(nil), fk.Columns...)
+			fk.RefColumns = append([]string(nil), fk.RefColumns...)
+			fk.cols = nil
+			nt.ForeignKeys = append(nt.ForeignKeys, fk)
+		}
+		nt.indexes, nt.checkFns, nt.referencedBy = nil, nil, nil
 		n.tables[k] = &nt
+	}
+	for k, v := range c.views {
+		nv := *v
+		n.views[k] = &nv
 	}
 	for k, ix := range c.indexes {
 		ni := *ix
@@ -137,6 +207,20 @@ func (c *Catalog) clone() *Catalog {
 func (c *Catalog) link() {
 	for _, t := range c.tables {
 		t.indexes = t.indexes[:0]
+		t.referencedBy = t.referencedBy[:0]
+	}
+	for _, t := range c.tables {
+		for i := range t.ForeignKeys {
+			fk := &t.ForeignKeys[i]
+			fk.cols = fk.cols[:0]
+			for _, name := range fk.Columns {
+				fk.cols = append(fk.cols, t.ColIndex(name))
+			}
+			if p := c.table(fk.RefTable); p != nil {
+				p.referencedBy = append(p.referencedBy, fkRef{t, fk})
+			}
+		}
+		t.compileChecks()
 	}
 	for _, ix := range c.indexes {
 		t := c.table(ix.Table)
@@ -199,6 +283,15 @@ func loadCatalog(v *pager.View) (*Catalog, error) {
 				return nil, fmt.Errorf("bangdb: corrupt catalog entry %q: %w", k, err)
 			}
 			c.indexes[strings.ToLower(ix.Name)] = ix
+		case 'v':
+			v := &View{}
+			if err := json.Unmarshal(data, v); err != nil {
+				return nil, fmt.Errorf("bangdb: corrupt catalog entry %q: %w", k, err)
+			}
+			if err := v.prepare(); err != nil {
+				return nil, err
+			}
+			c.views[strings.ToLower(v.Name)] = v
 		}
 	}
 	if err := cur.Err(); err != nil {
@@ -323,6 +416,19 @@ func (c *Catalog) Describe(name string) string {
 		if ix.Auto && len(ix.Columns) > 1 && !strings.HasSuffix(ix.Name, "_pk") {
 			constraints = append(constraints, "UNIQUE ("+ix.columnList()+")")
 		}
+	}
+	for _, chk := range t.Checks {
+		constraints = append(constraints, "CHECK ("+chk+")")
+	}
+	for _, fk := range t.ForeignKeys {
+		s := fmt.Sprintf("FOREIGN KEY (%s) REFERENCES %s (%s)", strings.Join(fk.Columns, ", "), fk.RefTable, strings.Join(fk.RefColumns, ", "))
+		if fk.OnDelete != "" {
+			s += " ON DELETE " + fk.OnDelete
+		}
+		if fk.OnUpdate != "" {
+			s += " ON UPDATE " + fk.OnUpdate
+		}
+		constraints = append(constraints, s)
 	}
 	if len(constraints) > 0 {
 		out := strings.TrimSuffix(sb.String(), "\n")

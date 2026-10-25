@@ -16,6 +16,18 @@ type ColumnDef struct {
 	Unique        bool
 	Default       Expr   // nil = no default
 	Collate       string // NOCASE, RTRIM, BINARY or ""
+	Check         Expr   // column CHECK constraint
+	References    *ForeignKey
+}
+
+// ForeignKey is FOREIGN KEY (cols) REFERENCES table [(cols)] [actions], or
+// the column form "REFERENCES table [(col)]".
+type ForeignKey struct {
+	Columns    []string // empty for the column form
+	RefTable   string
+	RefColumns []string // empty: the referenced table's primary key
+	OnDelete   string   // NO ACTION (default), RESTRICT, CASCADE, SET NULL
+	OnUpdate   string
 }
 
 type CreateTable struct {
@@ -24,6 +36,21 @@ type CreateTable struct {
 	Columns     []ColumnDef
 	PrimaryKey  []string   // table constraint PRIMARY KEY (a, b, ...)
 	Uniques     [][]string // table constraints UNIQUE (a, b, ...)
+	Checks      []Expr     // table constraints CHECK (...)
+	ForeignKeys []ForeignKey
+}
+
+type CreateView struct {
+	Name        string
+	IfNotExists bool
+	Columns     []string // optional column names
+	Select      *Select
+	SQL         string // the SELECT's original text
+}
+
+type DropView struct {
+	Name     string
+	IfExists bool
 }
 
 type DropTable struct {
@@ -162,6 +189,8 @@ func (*AlterTableRenameColumn) stmt() {}
 func (*AlterTableDropColumn) stmt()   {}
 func (*CreateIndex) stmt()            {}
 func (*DropIndex) stmt()              {}
+func (*CreateView) stmt()             {}
+func (*DropView) stmt()               {}
 func (*Insert) stmt()                 {}
 func (*Select) stmt()                 {}
 func (*Update) stmt()                 {}

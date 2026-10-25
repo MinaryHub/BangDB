@@ -30,7 +30,7 @@ func parseAll(src string) ([]Stmt, *parser, error) {
 	if err != nil {
 		return nil, nil, err
 	}
-	p := &parser{toks: toks}
+	p := &parser{toks: toks, src: src}
 	var stmts []Stmt
 	for {
 		for p.acceptOp(";") {
@@ -51,6 +51,7 @@ func parseAll(src string) ([]Stmt, *parser, error) {
 }
 
 type parser struct {
+	src   string
 	toks  []token
 	pos   int
 	names []string // per argument slot: placeholder name or ""
@@ -240,6 +241,26 @@ func (p *parser) parseCreate() (Stmt, error) {
 					return nil, err
 				}
 				ct.Uniques = append(ct.Uniques, cols)
+			} else if p.acceptKw("CHECK") {
+				e, err := p.parseParenExpr()
+				if err != nil {
+					return nil, err
+				}
+				ct.Checks = append(ct.Checks, e)
+			} else if p.acceptKw("FOREIGN", "KEY") {
+				cols, err := p.parseColumnList()
+				if err != nil {
+					return nil, err
+				}
+				if err := p.expectKw("REFERENCES"); err != nil {
+					return nil, err
+				}
+				fk, err := p.parseReferences()
+				if err != nil {
+					return nil, err
+				}
+				fk.Columns = cols
+				ct.ForeignKeys = append(ct.ForeignKeys, *fk)
 			} else {
 				cd, err := p.parseColumnDef()
 				if err != nil {
@@ -255,6 +276,27 @@ func (p *parser) parseCreate() (Stmt, error) {
 			return nil, err
 		}
 		return ct, nil
+	}
+	if p.acceptKw("VIEW") {
+		cv := &CreateView{IfNotExists: p.acceptKw("IF", "NOT", "EXISTS")}
+		var err error
+		if cv.Name, err = p.ident(); err != nil {
+			return nil, err
+		}
+		if p.peek().kind == tOp && p.peek().text == "(" {
+			if cv.Columns, err = p.parseColumnList(); err != nil {
+				return nil, err
+			}
+		}
+		if err := p.expectKw("AS"); err != nil {
+			return nil, err
+		}
+		start := p.peek().pos
+		if cv.Select, err = p.parseSelect(); err != nil {
+			return nil, err
+		}
+		cv.SQL = strings.TrimSpace(p.src[start:p.peek().pos])
+		return cv, nil
 	}
 	unique := p.acceptKw("UNIQUE")
 	if p.acceptKw("INDEX") {
@@ -349,6 +391,18 @@ func (p *parser) parseColumnDef() (ColumnDef, error) {
 				return cd, err
 			}
 			cd.Collate = name
+		case p.acceptKw("CHECK"):
+			e, err := p.parseParenExpr()
+			if err != nil {
+				return cd, err
+			}
+			cd.Check = e
+		case p.acceptKw("REFERENCES"):
+			fk, err := p.parseReferences()
+			if err != nil {
+				return cd, err
+			}
+			cd.References = fk
 		case p.acceptKw("DEFAULT"):
 			if p.acceptOp("(") {
 				e, err := p.parseExpr()
@@ -393,7 +447,64 @@ func (p *parser) parseDrop() (Stmt, error) {
 		d.Name, err = p.ident()
 		return d, err
 	}
-	return nil, p.errf("expected TABLE or INDEX")
+	if p.acceptKw("VIEW") {
+		d := &DropView{IfExists: p.acceptKw("IF", "EXISTS")}
+		var err error
+		d.Name, err = p.ident()
+		return d, err
+	}
+	return nil, p.errf("expected TABLE, INDEX or VIEW")
+}
+
+// parseParenExpr parses "( expr )".
+func (p *parser) parseParenExpr() (Expr, error) {
+	if err := p.expectOp("("); err != nil {
+		return nil, err
+	}
+	e, err := p.parseExpr()
+	if err != nil {
+		return nil, err
+	}
+	return e, p.expectOp(")")
+}
+
+// parseReferences parses "table [(cols)] [ON DELETE action] [ON UPDATE
+// action]" after REFERENCES.
+func (p *parser) parseReferences() (*ForeignKey, error) {
+	fk := &ForeignKey{}
+	var err error
+	if fk.RefTable, err = p.ident(); err != nil {
+		return nil, err
+	}
+	if p.peek().kind == tOp && p.peek().text == "(" {
+		if fk.RefColumns, err = p.parseColumnList(); err != nil {
+			return nil, err
+		}
+	}
+	for p.acceptKw("ON") {
+		var target *string
+		switch {
+		case p.acceptKw("DELETE"):
+			target = &fk.OnDelete
+		case p.acceptKw("UPDATE"):
+			target = &fk.OnUpdate
+		default:
+			return nil, p.errf("expected DELETE or UPDATE")
+		}
+		switch {
+		case p.acceptKw("CASCADE"):
+			*target = "CASCADE"
+		case p.acceptKw("RESTRICT"):
+			*target = "RESTRICT"
+		case p.acceptKw("NO", "ACTION"):
+			*target = "NO ACTION"
+		case p.acceptKw("SET", "NULL"):
+			*target = "SET NULL"
+		default:
+			return nil, p.errf("expected CASCADE, RESTRICT, NO ACTION or SET NULL")
+		}
+	}
+	return fk, nil
 }
 
 func (p *parser) parseAlter() (Stmt, error) {

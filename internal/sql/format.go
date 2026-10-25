@@ -156,7 +156,7 @@ func ParseExpr(src string) (Expr, error) {
 	if err != nil {
 		return nil, err
 	}
-	p := &parser{toks: toks}
+	p := &parser{toks: toks, src: src}
 	e, err := p.parseExpr()
 	if err != nil {
 		return nil, err

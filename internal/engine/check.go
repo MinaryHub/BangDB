@@ -150,6 +150,12 @@ func (x *execCtx) checkRows(t *Table, add func(string, ...any)) int {
 		if t.RowidCol >= 0 && t.RowidCol < len(row) && row[t.RowidCol] != rowid {
 			add("table %s row %d: primary key column holds %v", t.Name, rowid, row[t.RowidCol])
 		}
+		if len(t.ForeignKeys) > 0 && len(row) <= len(t.Columns) {
+			full, _ := x.decodeRow(t, data)
+			if err := x.checkParents(t, full, nil); err != nil {
+				add("table %s row %d: %v", t.Name, rowid, err)
+			}
+		}
 	}
 	if err := c.Err(); err != nil {
 		add("table %s: %v", t.Name, err)

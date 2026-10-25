@@ -930,6 +930,15 @@ func (x *execCtx) buildLevels(from []sql.TableRef, lefts []bool, ons []sql.Expr,
 			if virtual == nil {
 				virtual = [][]any{}
 			}
+		} else if v := x.cat.view(ref.Name); v != nil && x.cat.table(ref.Name) == nil {
+			alias := ref.Alias
+			if alias == "" {
+				alias = v.Name
+			}
+			var err error
+			if t, virtual, err = x.viewTable(v, alias); err != nil {
+				return nil, nil, nil, err
+			}
 		} else {
 			var err error
 			if t, err = x.table(ref.Name); err != nil {

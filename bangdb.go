@@ -176,6 +176,9 @@ var ErrReadOnly = engine.ErrReadOnly
 // Tables returns the names of all tables.
 func (db *DB) Tables() []string { return db.e.Catalog().TableNames() }
 
+// Views returns the names of all views.
+func (db *DB) Views() []string { return db.e.Catalog().ViewNames() }
+
 // Engine exposes the underlying engine (used by the driver and CLI).
 func (db *DB) Engine() *engine.DB { return db.e }
 

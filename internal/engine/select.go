@@ -851,7 +851,7 @@ func (x *execCtx) execInsert(st *sql.Insert) (Result, error) {
 						return Result{}, err
 					}
 					if ok {
-						if err := x.deleteRow(t, cf.rowid, old); err != nil {
+						if err := x.removeRow(t, cf.rowid, old); err != nil {
 							return Result{}, err
 						}
 					}
@@ -944,10 +944,22 @@ func (x *execCtx) execDelete(st *sql.Delete) (Result, error) {
 		res.Columns = ret.cols
 	}
 	for _, tg := range targets {
+		if len(t.referencedBy) > 0 {
+			// Foreign key actions may have removed or changed the row.
+			row, ok, err := x.getRow(t, tg.rowid)
+			if err != nil {
+				return Result{}, err
+			}
+			if !ok {
+				res.RowsAffected--
+				continue
+			}
+			tg.row = row
+		}
 		if err := ret.add(&res, tg.rowid, tg.row); err != nil {
 			return Result{}, err
 		}
-		if err := x.deleteRow(t, tg.rowid, tg.row); err != nil {
+		if err := x.removeRow(t, tg.rowid, tg.row); err != nil {
 			return Result{}, err
 		}
 	}
@@ -986,6 +998,17 @@ func (x *execCtx) execUpdate(st *sql.Update) (Result, error) {
 	}
 	e := &env{row: make([]any, len(sc.cols)), args: x.args}
 	for _, tg := range targets {
+		if len(t.referencedBy) > 0 {
+			row, ok, err := x.getRow(t, tg.rowid)
+			if err != nil {
+				return Result{}, err
+			}
+			if !ok {
+				res.RowsAffected--
+				continue
+			}
+			tg.row = row
+		}
 		copy(e.row, tg.row)
 		e.row[len(t.Columns)] = tg.rowid
 		newRow := append([]any(nil), tg.row...)
@@ -1036,6 +1059,11 @@ func (x *execCtx) updateRow(t *Table, oldID int64, old, newRow []any) (int64, er
 			return 0, err
 		}
 	}
+	if len(t.ForeignKeys) > 0 {
+		if err := x.checkParents(t, newRow, old); err != nil {
+			return 0, err
+		}
+	}
 	if err := x.deleteRow(t, oldID, old); err != nil {
 		return 0, err
 	}
@@ -1043,6 +1071,9 @@ func (x *execCtx) updateRow(t *Table, oldID int64, old, newRow []any) (int64, er
 		return 0, err
 	}
 	x.noteRowid(t, newID)
+	if err := x.parentUpdated(t, old, newRow); err != nil {
+		return 0, err
+	}
 	return newID, x.recordSequence(t, newID)
 }
 
