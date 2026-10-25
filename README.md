@@ -8,6 +8,7 @@ Go로 작성된 **경량 임베디드 관계형 데이터베이스**입니다. �
 - SQL: `CREATE/DROP TABLE`, `ALTER TABLE ADD COLUMN`, `CREATE [UNIQUE] INDEX`, `INSERT/SELECT/UPDATE/DELETE`, `JOIN`(INNER/LEFT/CROSS), `GROUP BY/HAVING`, `ORDER BY`, `LIMIT/OFFSET`, `DISTINCT`, `CASE`, `IN`, `BETWEEN`, `LIKE`, 집계/스칼라 함수, `EXPLAIN`
 - B+트리 기반 테이블/인덱스, 인덱스를 활용하는 쿼리 플래너 (rowid·인덱스 동등/범위/IN 검색, 조인 시 인덱스 lookup)
 - 트랜잭션: `BEGIN/COMMIT/ROLLBACK`, 문장 단위 원자성, **읽기는 쓰기 트랜잭션에 막히지 않음** (커밋된 스냅샷을 읽음)
+- **온라인 백업**(서비스 중단 없이 일관된 백업 파일 생성)과 **primary → replica 미러링**(읽기 스케일 아웃, 자동 재접속, 장애 조치 승격)
 - `database/sql` 드라이버(`bangdb`) 및 대화형 CLI 제공
 
 ## 설치
@@ -86,12 +87,32 @@ db, err := sql.Open("bangdb", "app.db")
 
 같은 `*sql.DB`의 모든 커넥션은 하나의 엔진 인스턴스를 공유합니다 (`:memory:`도 커넥션 간 공유됨).
 
+### 백업과 미러링
+
+```go
+db.Backup("backup.db")   // 온라인 백업 (결과는 그대로 열 수 있는 DB 파일)
+
+// primary
+p := replication.NewPrimary(db, replication.PrimaryOptions{Token: "secret"})
+go p.ListenAndServe(":7070")
+
+// replica (다른 서버): 처음엔 스냅샷을 받고, 이후 커밋을 실시간 미러링
+rdb, _ := bangdb.Open("replica.db")
+r := replication.StartReplica(rdb, "primary:7070", replication.ReplicaOptions{Token: "secret"})
+rdb.Query("SELECT ...")   // 읽기 분산; 쓰기는 ErrReadOnly
+r.Promote()               // 장애 조치: 쓰기 가능한 primary로 승격
+```
+
+자세한 내용: [docs/REPLICATION.md](docs/REPLICATION.md)
+
 ### CLI
 
 ```bash
 go install github.com/knoxxr/bangdb/cmd/bangdb@latest
 
-bangdb app.db                         # 대화형 셸 (.help, .tables, .schema, .timer on)
+bangdb app.db                         # 대화형 셸 (.help, .tables, .schema, .timer on, .backup FILE)
+bangdb -serve :7070 app.db            # primary로 replica 접속 허용
+bangdb -replica-of host:7070 r.db     # 읽기 전용 replica (.repl 상태, .promote 승격)
 bangdb app.db "SELECT COUNT(*) FROM users"
 cat schema.sql | bangdb app.db
 ```
@@ -158,6 +179,7 @@ SEARCH users USING ROWID (rowid=?)
 ## 문서
 
 - [아키텍처](docs/ARCHITECTURE.md)
+- [백업과 미러링](docs/REPLICATION.md)
 - [시계열·인메모리 DB 확장 적합성 검토](docs/REVIEW-timeseries-inmemory.md)
 
 ## 개발

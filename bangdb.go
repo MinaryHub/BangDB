@@ -15,6 +15,7 @@
 package bangdb
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"strconv"
@@ -116,6 +117,21 @@ func (db *DB) Update(fn func(tx *Tx) error) error {
 	}
 	return tx.Commit()
 }
+
+// Backup writes a consistent copy of the database to path while it stays
+// online: readers are never blocked and commits pause only briefly. The
+// backup is a regular database file; restore it by opening (or copying) it.
+func (db *DB) Backup(path string) error { return db.e.Backup(context.Background(), path) }
+
+// BackupContext is Backup with cancellation.
+func (db *DB) BackupContext(ctx context.Context, path string) error { return db.e.Backup(ctx, path) }
+
+// Seq returns the sequence number of the last committed transaction. It
+// increases by one per commit and is shared with replicas.
+func (db *DB) Seq() uint64 { return db.e.Seq() }
+
+// ErrReadOnly is returned for writes on a replica.
+var ErrReadOnly = engine.ErrReadOnly
 
 // Tables returns the names of all tables.
 func (db *DB) Tables() []string { return db.e.Catalog().TableNames() }

@@ -9,6 +9,7 @@
 package pager
 
 import (
+	"crypto/rand"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -43,6 +44,21 @@ type Header struct {
 	PageCount uint32 // number of pages in use, including page 0
 	FreeHead  uint32 // first page of the free list (0 = empty)
 	Meta      [MetaSlots]uint32
+	Seq       uint64   // commit sequence number, +1 per commit
+	DBID      [16]byte // random identity assigned at creation; replicas share it
+}
+
+const (
+	offSeq  = 20 + MetaSlots*4
+	offDBID = offSeq + 8
+)
+
+func newHeader() Header {
+	h := Header{PageCount: 1}
+	if _, err := rand.Read(h.DBID[:]); err != nil {
+		panic(err)
+	}
+	return h
 }
 
 func (h *Header) encode() []byte {
@@ -54,6 +70,8 @@ func (h *Header) encode() []byte {
 	for i, m := range h.Meta {
 		binary.BigEndian.PutUint32(b[20+i*4:], m)
 	}
+	binary.BigEndian.PutUint64(b[offSeq:], h.Seq)
+	copy(b[offDBID:], h.DBID[:])
 	return b
 }
 
@@ -70,6 +88,8 @@ func decodeHeader(b []byte) (Header, error) {
 	for i := range h.Meta {
 		h.Meta[i] = binary.BigEndian.Uint32(b[20+i*4:])
 	}
+	h.Seq = binary.BigEndian.Uint64(b[offSeq:])
+	copy(h.DBID[:], b[offDBID:])
 	return h, nil
 }
 
@@ -89,11 +109,15 @@ type Pager struct {
 	// failpoint, when set by tests, is called at commit stages to simulate
 	// crashes.
 	failpoint func(stage string) error
+
+	// onCommit, if set, receives every committed page set (including the
+	// header page 0) while the commit lock is held. Used for replication.
+	onCommit func(seq uint64, pages map[uint32][]byte)
 }
 
 // OpenMemory creates an empty, purely in-memory pager.
 func OpenMemory() *Pager {
-	h := Header{PageCount: 1}
+	h := newHeader()
 	return &Pager{mem: map[uint32][]byte{0: h.encode()}, hdr: h}
 }
 
@@ -126,7 +150,7 @@ func Open(path string) (*Pager, error) {
 		return nil, err
 	}
 	if st.Size() == 0 {
-		p.hdr = Header{PageCount: 1}
+		p.hdr = newHeader()
 		if _, err := f.WriteAt(p.hdr.encode(), 0); err != nil {
 			p.Close()
 			return nil, err
@@ -234,6 +258,23 @@ func (p *Pager) Close() error {
 	return errors.Join(errs...)
 }
 
+// SetOnCommit installs the commit hook (see Pager.onCommit).
+func (p *Pager) SetOnCommit(fn func(seq uint64, pages map[uint32][]byte)) {
+	p.mu.Lock()
+	p.onCommit = fn
+	p.mu.Unlock()
+}
+
+// Header returns the committed header.
+func (p *Pager) Header() Header {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.hdr
+}
+
+// ReadCommitted returns the committed content of a page; see readCommitted.
+func (p *Pager) ReadCommitted(pgno uint32) ([]byte, error) { return p.readCommitted(pgno) }
+
 // readCommitted returns the committed content of a page. The returned slice
 // is shared and must not be modified.
 func (p *Pager) readCommitted(pgno uint32) ([]byte, error) {
@@ -287,9 +328,9 @@ func (p *Pager) NewView() *View {
 	return &View{p: p, dirty: map[uint32][]byte{}, hdr: p.hdr}
 }
 
-// Commit durably applies the view's changes. The caller must guarantee that
-// no reader is accessing the pager concurrently and that v is the only
-// writer.
+// Commit durably applies the view's changes and advances the commit
+// sequence number. The caller must guarantee that no reader is accessing the
+// pager concurrently and that v is the only writer.
 func (p *Pager) Commit(v *View) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -302,35 +343,122 @@ func (p *Pager) Commit(v *View) error {
 	if len(v.dirty) == 0 && v.hdr == p.hdr {
 		return nil
 	}
+	v.hdr.Seq = p.hdr.Seq + 1
 	v.dirty[0] = v.hdr.encode()
+	if err := p.applyLocked(v.dirty, v.hdr); err != nil {
+		return err
+	}
+	if p.onCommit != nil {
+		p.onCommit(v.hdr.Seq, v.dirty)
+	}
+	v.dirty = map[uint32][]byte{}
+	return nil
+}
 
+// CommitRaw durably applies a page set received from a primary (it must
+// contain the header page 0). The header, including its sequence number, is
+// taken verbatim from page 0.
+func (p *Pager) CommitRaw(pages map[uint32][]byte) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.closed {
+		return ErrClosed
+	}
+	if p.err != nil {
+		return p.err
+	}
+	hdr, err := decodeHeader(pages[0])
+	if err != nil {
+		return err
+	}
+	if err := p.applyLocked(pages, hdr); err != nil {
+		return err
+	}
+	if p.onCommit != nil {
+		p.onCommit(hdr.Seq, pages) // lets replicas be backed up or cascaded
+	}
+	return nil
+}
+
+// PutRaw writes a page directly, bypassing the WAL. It is only used while
+// building a snapshot copy that nobody reads yet; FinishRaw makes it durable.
+func (p *Pager) PutRaw(pgno uint32, data []byte) error {
+	if len(data) != PageSize {
+		return errors.New("pager: raw page of wrong size")
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
 	if p.mem != nil {
-		for pg, b := range v.dirty {
+		p.mem[pgno] = append([]byte(nil), data...)
+		return nil
+	}
+	delete(p.cache, pgno)
+	_, err := p.file.WriteAt(data, int64(pgno)*PageSize)
+	return err
+}
+
+// FinishRaw completes a snapshot copy: it stamps the header with the given
+// sequence number, syncs, and loads the header.
+func (p *Pager) FinishRaw(seq uint64) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	var b []byte
+	if p.mem != nil {
+		b = p.mem[0]
+	} else {
+		b = make([]byte, PageSize)
+		if _, err := p.file.ReadAt(b, 0); err != nil {
+			return err
+		}
+	}
+	hdr, err := decodeHeader(b)
+	if err != nil {
+		return err
+	}
+	hdr.Seq = seq
+	enc := hdr.encode()
+	if p.mem != nil {
+		p.mem[0] = enc
+	} else {
+		if _, err := p.file.WriteAt(enc, 0); err != nil {
+			return err
+		}
+		if err := p.file.Sync(); err != nil {
+			return err
+		}
+		clear(p.cache)
+	}
+	p.hdr = hdr
+	return nil
+}
+
+func (p *Pager) applyLocked(pages map[uint32][]byte, hdr Header) error {
+	if p.mem != nil {
+		for pg, b := range pages {
 			p.mem[pg] = b
 		}
 		for pg := range p.mem {
-			if pg >= v.hdr.PageCount {
+			if pg >= hdr.PageCount {
 				delete(p.mem, pg)
 			}
 		}
-		p.hdr = v.hdr
-		v.dirty = map[uint32][]byte{}
+		p.hdr = hdr
 		return nil
 	}
 
 	// 1. Write all pages + commit record to the WAL and fsync.
-	buf := make([]byte, 0, 8+len(v.dirty)*(4+PageSize)+12)
+	buf := make([]byte, 0, 8+len(pages)*(4+PageSize)+12)
 	buf = append(buf, walMagic...)
 	buf = binary.BigEndian.AppendUint32(buf, PageSize)
 	crc := crc32.NewIEEE()
-	for pg, b := range v.dirty {
+	for pg, b := range pages {
 		start := len(buf)
 		buf = binary.BigEndian.AppendUint32(buf, pg)
 		buf = append(buf, b...)
 		crc.Write(buf[start:])
 	}
 	buf = binary.BigEndian.AppendUint32(buf, commitMarker)
-	buf = binary.BigEndian.AppendUint32(buf, uint32(len(v.dirty)))
+	buf = binary.BigEndian.AppendUint32(buf, uint32(len(pages)))
 	buf = binary.BigEndian.AppendUint32(buf, crc.Sum32())
 	if err := p.wal.Truncate(0); err != nil {
 		return err
@@ -351,14 +479,11 @@ func (p *Pager) Commit(v *View) error {
 			return err
 		}
 	}
-	for pg, b := range v.dirty {
+	for pg, b := range pages {
 		if _, err := p.file.WriteAt(b, int64(pg)*PageSize); err != nil {
 			p.err = fmt.Errorf("bangdb: checkpoint failed, reopen database to recover: %w", err)
 			return p.err
 		}
-	}
-	if v.hdr.PageCount < p.hdr.PageCount {
-		p.file.Truncate(int64(v.hdr.PageCount) * PageSize)
 	}
 	if err := p.file.Sync(); err != nil {
 		p.err = fmt.Errorf("bangdb: checkpoint failed, reopen database to recover: %w", err)
@@ -368,13 +493,12 @@ func (p *Pager) Commit(v *View) error {
 		p.err = err
 		return err
 	}
-	for pg, b := range v.dirty {
+	for pg, b := range pages {
 		if _, ok := p.cache[pg]; ok || len(p.cache) < p.cacheMax {
 			p.cache[pg] = b
 		}
 	}
-	p.hdr = v.hdr
-	v.dirty = map[uint32][]byte{}
+	p.hdr = hdr
 	return nil
 }
 
@@ -467,6 +591,15 @@ func (v *View) Meta(i int) uint32 { return v.hdr.Meta[i] }
 
 // SetMeta sets a user metadata slot in the header.
 func (v *View) SetMeta(i int, val uint32) { v.hdr.Meta[i] = val }
+
+// NewIdentity gives the database a new random DBID on commit. Used when a
+// replica is promoted, so that copies of the old lineage cannot follow it
+// without a fresh snapshot.
+func (v *View) NewIdentity() {
+	if _, err := rand.Read(v.hdr.DBID[:]); err != nil {
+		panic(err)
+	}
+}
 
 // PageCount returns the number of pages as seen by the view.
 func (v *View) PageCount() uint32 { return v.hdr.PageCount }

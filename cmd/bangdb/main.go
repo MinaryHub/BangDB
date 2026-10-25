@@ -1,38 +1,72 @@
 // Command bangdb is an interactive SQL shell for BangDB databases.
 //
-//	bangdb app.db                 # interactive shell
-//	bangdb app.db "SELECT 1"      # run SQL and exit
+//	bangdb app.db                         # interactive shell
+//	bangdb app.db "SELECT 1"              # run SQL and exit
 //	echo "SELECT 1;" | bangdb app.db
+//	bangdb -serve :7070 app.db            # shell + serve replicas
+//	bangdb -replica-of host:7070 r.db     # read-only mirror of a primary
 package main
 
 import (
 	"bufio"
+	"context"
+	"flag"
 	"fmt"
 	"io"
 	"os"
+	"os/signal"
 	"sort"
 	"strings"
+	"syscall"
 	"time"
 	"unicode/utf8"
 
+	"github.com/knoxxr/bangdb"
 	"github.com/knoxxr/bangdb/internal/engine"
 	"github.com/knoxxr/bangdb/internal/value"
+	"github.com/knoxxr/bangdb/replication"
 )
 
 func main() {
-	path := ":memory:"
-	if len(os.Args) > 1 {
-		path = os.Args[1]
+	serve := flag.String("serve", "", "serve replicas on this address (primary mode)")
+	replicaOf := flag.String("replica-of", "", "mirror the primary at this address (read-only replica)")
+	token := flag.String("token", "", "replication token")
+	flag.Usage = func() {
+		fmt.Fprintln(os.Stderr, "usage: bangdb [-serve addr | -replica-of addr] [-token t] [database] [sql...]")
+		flag.PrintDefaults()
 	}
-	db, err := engine.Open(path, nil)
+	flag.Parse()
+	path := ":memory:"
+	if flag.NArg() > 0 {
+		path = flag.Arg(0)
+	}
+	pub, err := bangdb.Open(path)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
-	defer db.Close()
+	defer pub.Close()
+	db := pub.Engine()
 	sh := &shell{db: db, conn: db.Conn(), out: os.Stdout}
-	if len(os.Args) > 2 {
-		ok := sh.run(strings.Join(os.Args[2:], " "))
+	if *serve != "" {
+		p := replication.NewPrimary(pub, replication.PrimaryOptions{Token: *token})
+		go func() {
+			if err := p.ListenAndServe(*serve); err != nil {
+				fmt.Fprintln(os.Stderr, "replication:", err)
+			}
+		}()
+		defer p.Close()
+		sh.primary = p
+		fmt.Fprintf(os.Stderr, "serving replicas on %s\n", *serve)
+	}
+	if *replicaOf != "" {
+		r := replication.StartReplica(pub, *replicaOf, replication.ReplicaOptions{Token: *token})
+		defer r.Stop()
+		sh.replica = r
+		fmt.Fprintf(os.Stderr, "replicating from %s (read-only)\n", *replicaOf)
+	}
+	if flag.NArg() > 1 {
+		ok := sh.run(strings.Join(flag.Args()[1:], " "))
 		sh.conn.Close()
 		if !ok {
 			os.Exit(1)
@@ -45,6 +79,12 @@ func main() {
 	}
 	sh.loop(os.Stdin, interactive)
 	sh.conn.Close()
+	if *serve != "" || *replicaOf != "" {
+		// Keep replicating after stdin is closed until interrupted.
+		sig := make(chan os.Signal, 1)
+		signal.Notify(sig, os.Interrupt, syscall.SIGTERM)
+		<-sig
+	}
 }
 
 func isTerminal() bool {
@@ -53,10 +93,12 @@ func isTerminal() bool {
 }
 
 type shell struct {
-	db    *engine.DB
-	conn  *engine.Conn
-	out   io.Writer
-	timer bool
+	db      *engine.DB
+	conn    *engine.Conn
+	out     io.Writer
+	timer   bool
+	primary *replication.Primary
+	replica *replication.Replica
 }
 
 func (s *shell) loop(in io.Reader, interactive bool) {
@@ -108,6 +150,9 @@ func (s *shell) command(cmd string) bool {
 		fmt.Fprintln(s.out, `.tables            list tables
 .schema [table]    show table definitions
 .timer on|off      show execution time
+.backup FILE       write an online backup to FILE
+.repl              show replication status
+.promote           turn this replica into a writable primary
 .quit              exit
 SQL statements end with ';'. BEGIN/COMMIT/ROLLBACK are supported.`)
 	case ".tables":
@@ -122,6 +167,37 @@ SQL statements end with ';'. BEGIN/COMMIT/ROLLBACK are supported.`)
 				continue
 			}
 			fmt.Fprintln(s.out, s.db.Catalog().Describe(n))
+		}
+	case ".backup":
+		if len(fields) < 2 {
+			fmt.Fprintln(s.out, "usage: .backup FILE")
+			break
+		}
+		if err := s.db.Backup(context.Background(), fields[1]); err != nil {
+			fmt.Fprintln(s.out, "Error:", err)
+		} else {
+			fmt.Fprintf(s.out, "backup written to %s (seq %d)\n", fields[1], s.db.Seq())
+		}
+	case ".repl":
+		fmt.Fprintf(s.out, "seq %d, read-only %v\n", s.db.Seq(), s.db.ReadOnly())
+		if s.primary != nil {
+			for _, r := range s.primary.Replicas() {
+				fmt.Fprintf(s.out, "replica %s: sent seq %d, snapshots %d, since %s\n", r.Addr, r.Seq, r.Snapshots, r.Since.Format(time.RFC3339))
+			}
+		}
+		if s.replica != nil {
+			fmt.Fprintf(s.out, "replica status: %+v\n", s.replica.Status())
+		}
+	case ".promote":
+		if s.replica == nil {
+			fmt.Fprintln(s.out, "not a replica")
+			break
+		}
+		if err := s.replica.Promote(); err != nil {
+			fmt.Fprintln(s.out, "Error:", err)
+		} else {
+			s.replica = nil
+			fmt.Fprintln(s.out, "promoted: database is now writable")
 		}
 	case ".timer":
 		s.timer = len(fields) > 1 && fields[1] == "on"

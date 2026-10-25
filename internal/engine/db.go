@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/knoxxr/bangdb/internal/pager"
@@ -53,6 +54,10 @@ type DB struct {
 	cacheMu   sync.Mutex
 	stmtCache map[string]parsed
 
+	path     string // "" for in-memory
+	readOnly atomic.Bool
+	repl     *replLog
+
 	closeOnce sync.Once
 	closed    chan struct{}
 }
@@ -67,6 +72,7 @@ type parsed struct {
 func Open(path string, opts *Options) (*DB, error) {
 	var p *pager.Pager
 	if path == "" || path == ":memory:" {
+		path = ""
 		p = pager.OpenMemory()
 	} else {
 		var err error
@@ -75,7 +81,9 @@ func Open(path string, opts *Options) (*DB, error) {
 		}
 	}
 	db := &DB{p: p, writeSem: make(chan struct{}, 1), busyTimeout: 5 * time.Second,
-		stmtCache: map[string]parsed{}, closed: make(chan struct{})}
+		stmtCache: map[string]parsed{}, closed: make(chan struct{}), path: path}
+	db.repl = newReplLog(p.Header().Seq)
+	p.SetOnCommit(db.repl.onCommit)
 	if opts != nil && opts.BusyTimeout > 0 {
 		db.busyTimeout = opts.BusyTimeout
 	}
@@ -101,6 +109,11 @@ func (db *DB) Close() error {
 		db.commitMu.Lock()
 		err = db.p.Close()
 		db.commitMu.Unlock()
+		db.repl.mu.Lock()
+		db.repl.disabled = true
+		close(db.repl.notify)
+		db.repl.notify = make(chan struct{})
+		db.repl.mu.Unlock()
 	})
 	return err
 }
@@ -199,6 +212,9 @@ func (db *DB) Query(src string, args ...any) (Result, error) { return db.Exec(sr
 func (db *DB) Begin() (*Tx, error) {
 	if db.isClosed() {
 		return nil, pager.ErrClosed
+	}
+	if db.readOnly.Load() {
+		return nil, ErrReadOnly
 	}
 	if err := db.lockWrite(); err != nil {
 		return nil, err
@@ -403,4 +419,8 @@ func isReadOnly(s sql.Stmt) bool {
 }
 
 // PageCount returns the number of pages in the committed database.
-func (db *DB) PageCount() uint32 { return db.p.NewView().PageCount() }
+func (db *DB) PageCount() uint32 {
+	db.commitMu.RLock()
+	defer db.commitMu.RUnlock()
+	return db.p.Header().PageCount
+}
