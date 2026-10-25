@@ -311,6 +311,9 @@ func DecodeRow(b []byte) ([]any, error) {
 		return nil, errBadRow
 	}
 	b = b[k:]
+	if n > uint64(len(b)) { // every value takes at least one byte
+		return nil, errBadRow
+	}
 	vals := make([]any, 0, n)
 	for i := uint64(0); i < n; i++ {
 		if len(b) == 0 {

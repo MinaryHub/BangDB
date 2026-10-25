@@ -106,54 +106,75 @@ func (n *node) encode() []byte {
 }
 
 func decode(b []byte) (*node, error) {
+	if len(b) < pager.UsableSize {
+		return nil, errBadPage
+	}
+	b = b[:pager.UsableSize] // the rest is the page checksum
 	n := &node{}
 	switch b[0] {
 	case typeLeaf:
 		n.leaf = true
 		n.next = binary.BigEndian.Uint32(b[3:])
 	case typeInternal:
-		n.children = []uint32{binary.BigEndian.Uint32(b[3:])}
 	default:
 		return nil, errBadPage
 	}
 	cnt := int(binary.BigEndian.Uint16(b[1:]))
+	if cnt > pager.UsableSize/3 { // every cell needs at least 3 bytes
+		return nil, errBadPage
+	}
 	n.keys = make([][]byte, 0, cnt+1)
 	if n.leaf {
 		n.vals = make([]value, 0, cnt+1)
 	} else {
-		children := make([]uint32, 1, cnt+2)
-		children[0] = n.children[0]
-		n.children = children
+		n.children = make([]uint32, 1, cnt+2)
+		n.children[0] = binary.BigEndian.Uint32(b[3:])
 	}
 	off := nodeHeader
+	need := func(k int) bool { return off+k <= len(b) }
 	for i := 0; i < cnt; i++ {
-		if off+2 > len(b) {
+		if !need(2) {
 			return nil, errBadPage
 		}
 		kl := int(binary.BigEndian.Uint16(b[off:]))
 		off += 2
-		if off+kl > len(b) {
+		if !need(kl) {
 			return nil, errBadPage
 		}
 		n.keys = append(n.keys, b[off:off+kl:off+kl])
 		off += kl
 		if !n.leaf {
+			if !need(4) {
+				return nil, errBadPage
+			}
 			n.children = append(n.children, binary.BigEndian.Uint32(b[off:]))
 			off += 4
 			continue
 		}
-		if b[off] == 1 {
+		if !need(1) {
+			return nil, errBadPage
+		}
+		switch b[off] {
+		case 1:
+			if !need(9) {
+				return nil, errBadPage
+			}
 			n.vals = append(n.vals, value{overflow: true,
 				total: binary.BigEndian.Uint32(b[off+1:]), first: binary.BigEndian.Uint32(b[off+5:])})
 			off += 9
-		} else {
+		case 0:
+			if !need(3) {
+				return nil, errBadPage
+			}
 			vl := int(binary.BigEndian.Uint16(b[off+1:]))
 			off += 3
-			if off+vl > len(b) {
+			if !need(vl) {
 				return nil, errBadPage
 			}
 			n.vals = append(n.vals, value{inline: b[off : off+vl : off+vl]})
 			off += vl
+		default:
+			return nil, errBadPage
 		}
 	}
 	return n, nil
