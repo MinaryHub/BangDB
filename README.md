@@ -168,6 +168,8 @@ SEARCH users USING ROWID (rowid=?)
 
 ## 현재 제약 사항
 
+> 실서비스 투입 전 보완 항목과 개발 계획은 [docs/ROADMAP.md](docs/ROADMAP.md)를 보세요. 특히 **오래 걸리는 읽기 쿼리는 그동안의 모든 커밋을 대기시킵니다** (인덱스 없는 조인 등). `EXPLAIN`으로 전체 스캔 여부를 확인하세요.
+
 - 서브쿼리, `UNION`, 뷰, 외래 키, `CHECK`, 트리거 미지원
 - 인덱스와 PRIMARY KEY는 단일 컬럼만 지원
 - 삭제 시 B+트리 재균형을 하지 않음 → 삭제로 생긴 빈 공간은 같은 트리에서 재사용되거나 `DROP TABLE` 시 회수 (VACUUM 없음)
@@ -178,6 +180,7 @@ SEARCH users USING ROWID (rowid=?)
 
 ## 문서
 
+- [보완 검토와 개발 계획 (ROADMAP)](docs/ROADMAP.md)
 - [아키텍처](docs/ARCHITECTURE.md)
 - [백업과 미러링](docs/REPLICATION.md)
 - [시계열·인메모리 DB 확장 적합성 검토](docs/REVIEW-timeseries-inmemory.md)
