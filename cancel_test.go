@@ -24,7 +24,7 @@ func slowDB(t *testing.T, opts *Options) *DB {
 	return db
 }
 
-const slowQuery = `SELECT COUNT(*) FROM t a JOIN t b ON a.v = b.v`
+const slowQuery = `SELECT COUNT(*) FROM t a JOIN t b ON a.v < b.v`
 
 func TestQueryCancellation(t *testing.T) {
 	db := slowDB(t, nil)

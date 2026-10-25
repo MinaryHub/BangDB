@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"fmt"
 	"math"
+	"sort"
 	"strings"
 
 	"github.com/knoxxr/bangdb/internal/btree"
@@ -20,6 +21,8 @@ const (
 	accRowidIn
 	accRowidRange
 	accIndex
+	accUnion // OR of indexable conditions: union of several access paths
+	accHash  // equi-join without index: hash the table once, probe per row
 )
 
 // access is the chosen access path for one table.
@@ -41,6 +44,15 @@ type access struct {
 	desc    string
 
 	reverse bool // visit rows in descending key order (for ORDER BY ... DESC)
+
+	subs    []*access // accUnion
+	hashCol int       // accHash: hashed column (-1 = rowid)
+	hash    map[string][]hashRow
+}
+
+type hashRow struct {
+	rowid int64
+	row   []any
 }
 
 // level is one table in a FROM/JOIN chain.
@@ -243,6 +255,12 @@ func chooseAccess(sc *scope, l *level, li int, conds []sql.Expr, c *compiler) (*
 		a.desc = fmt.Sprintf("SEARCH %s USING ROWID RANGE (%s)", name, strings.Join(parts, " AND "))
 		return a, nil
 	case best == nil:
+		if a, err := orAccess(sc, l, li, conds, c); a != nil || err != nil {
+			return a, err
+		}
+		if a, err := hashAccess(sc, l, li, conds, c); a != nil || err != nil {
+			return a, err
+		}
 		return &access{kind: accFull, desc: "SCAN " + name}, nil
 	}
 
@@ -315,6 +333,79 @@ func setRange(a *access, cands []candidate, colName string, c *compiler) ([]stri
 		parts = append(parts, colName+map[bool]string{true: "<=", false: "<"}[a.hiInc]+"?")
 	}
 	return parts, nil
+}
+
+// disjuncts splits an OR tree into its parts.
+func disjuncts(e sql.Expr) []sql.Expr {
+	if b, ok := e.(*sql.Binary); ok && b.Op == "OR" {
+		return append(disjuncts(b.L), disjuncts(b.R)...)
+	}
+	return []sql.Expr{e}
+}
+
+// orAccess handles "a = 1 OR b = 2 ...": if every disjunct of an OR
+// condition can be located through the rowid or an index, the rows are the
+// union of those lookups. The OR itself is still checked as a filter.
+func orAccess(sc *scope, l *level, li int, conds []sql.Expr, c *compiler) (*access, error) {
+	for _, e := range conds {
+		parts := disjuncts(e)
+		if len(parts) < 2 {
+			continue
+		}
+		a := &access{kind: accUnion}
+		var descs []string
+		for _, d := range parts {
+			sub, err := chooseAccess(sc, l, li, conjuncts(d), c)
+			if err != nil {
+				return nil, err
+			}
+			if sub.kind == accFull || sub.kind == accHash {
+				a = nil
+				break
+			}
+			a.subs = append(a.subs, sub)
+			descs = append(descs, sub.desc)
+		}
+		if a != nil {
+			a.desc = fmt.Sprintf("SEARCH %s USING UNION (%s)", l.t.Name, strings.Join(descs, "; "))
+			return a, nil
+		}
+	}
+	return nil, nil
+}
+
+// hashAccess picks a hash join for an inner join level that is compared for
+// equality with earlier tables but has no usable index: the table is read
+// once into a hash table instead of being scanned for every outer row.
+func hashAccess(sc *scope, l *level, li int, conds []sql.Expr, c *compiler) (*access, error) {
+	if li == 0 {
+		return nil, nil
+	}
+	for _, e := range conds {
+		b, ok := e.(*sql.Binary)
+		if !ok || b.Op != "=" {
+			continue
+		}
+		col, other := 0, sql.Expr(nil)
+		if cl, ok := columnOf(b.L, sc, l, li); ok && refsBelow(b.R, sc, li) {
+			col, other = cl, b.R
+		} else if cr, ok := columnOf(b.R, sc, l, li); ok && refsBelow(b.L, sc, li) {
+			col, other = cr, b.L
+		} else {
+			continue
+		}
+		f, err := c.compile(other)
+		if err != nil {
+			return nil, err
+		}
+		name := "rowid"
+		if col >= 0 {
+			name = l.t.Columns[col].Name
+		}
+		return &access{kind: accHash, hashCol: col, eq: []evalFn{f},
+			desc: fmt.Sprintf("SCAN %s USING HASH (%s=?)", l.t.Name, name)}, nil
+	}
+	return nil, nil
 }
 
 func describeOp(col, op string, n int) string {
@@ -437,6 +528,8 @@ func (x *execCtx) scan(t *Table, acc *access, e *env, visit func(rowid int64, ro
 		return nil
 	case accIndex:
 		return x.scanIndex(acc, e, emit)
+	case accUnion:
+		return x.scanUnion(t, acc, e, visit)
 	case accRowidRange:
 		start := []byte(nil)
 		var stop []byte
@@ -517,6 +610,75 @@ func (x *execCtx) scan(t *Table, acc *access, e *env, visit func(rowid int64, ro
 	return c.Err()
 }
 
+// scanHash probes the level's hash table (built on first use).
+func (x *execCtx) scanHash(l *level, e *env, visit func(rowid int64, row []any) (bool, error)) error {
+	acc := l.acc
+	if acc.hash == nil {
+		acc.hash = map[string][]hashRow{}
+		add := func(rowid int64, row []any) (bool, error) {
+			k := any(rowid)
+			if acc.hashCol >= 0 {
+				k = row[acc.hashCol]
+			}
+			if k != nil {
+				key := string(numKey(k))
+				acc.hash[key] = append(acc.hash[key], hashRow{rowid, row})
+			}
+			return true, nil
+		}
+		var err error
+		if l.virtual != nil {
+			for i, row := range l.virtual {
+				if _, err = add(int64(i+1), row); err != nil {
+					break
+				}
+			}
+		} else {
+			err = x.scan(l.t, &access{kind: accFull}, e, add)
+		}
+		if err != nil {
+			acc.hash = nil
+			return err
+		}
+	}
+	v, err := acc.eq[0](e)
+	if err != nil || v == nil {
+		return err
+	}
+	for _, hr := range acc.hash[string(numKey(v))] {
+		if cont, err := visit(hr.rowid, hr.row); err != nil || !cont {
+			return err
+		}
+	}
+	return nil
+}
+
+// scanUnion visits the rows found by any of several access paths, once
+// each, in rowid order.
+func (x *execCtx) scanUnion(t *Table, acc *access, e *env, visit func(rowid int64, row []any) (bool, error)) error {
+	rows := map[int64][]any{}
+	for _, sub := range acc.subs {
+		err := x.scan(t, sub, e, func(rowid int64, row []any) (bool, error) {
+			rows[rowid] = row
+			return true, nil
+		})
+		if err != nil {
+			return err
+		}
+	}
+	ids := make([]int64, 0, len(rows))
+	for id := range rows {
+		ids = append(ids, id)
+	}
+	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+	for _, id := range ids {
+		if cont, err := visit(id, rows[id]); err != nil || !cont {
+			return err
+		}
+	}
+	return nil
+}
+
 // scanRowsReverse visits table rows in descending rowid order, from hi
 // (nil = the end; exclusive unless hiInc) down to lo (nil = the start,
 // inclusive).
@@ -546,6 +708,9 @@ func (x *execCtx) scanRowsReverse(t *Table, hi []byte, hiInc bool, lo []byte, fn
 
 // scanLevel visits the rows of one FROM level.
 func (x *execCtx) scanLevel(l *level, e *env, visit func(rowid int64, row []any) (bool, error)) error {
+	if l.acc.kind == accHash {
+		return x.scanHash(l, e, visit)
+	}
 	if l.virtual == nil {
 		return x.scan(l.t, l.acc, e, visit)
 	}
@@ -813,6 +978,12 @@ func (x *execCtx) buildLevels(from []sql.TableRef, lefts []bool, ons []sql.Expr,
 	for i, l := range levels {
 		if l.virtual != nil {
 			l.acc = &access{kind: accFull, desc: "SCAN SUBQUERY " + l.alias}
+			if a, err := hashAccess(sc, l, i, accessConds[i], c); err != nil {
+				return nil, nil, nil, err
+			} else if a != nil {
+				a.desc = fmt.Sprintf("SCAN SUBQUERY %s USING HASH%s", l.alias, strings.TrimPrefix(a.desc, "SCAN "+l.t.Name+" USING HASH"))
+				l.acc = a
+			}
 			continue
 		}
 		acc, err := chooseAccess(sc, l, i, accessConds[i], c)

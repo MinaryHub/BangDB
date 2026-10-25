@@ -29,6 +29,9 @@ func FuzzExec(f *testing.F) {
 		"SELECT * FROM (SELECT n, COUNT(*) c FROM t GROUP BY n) x JOIN t ON t.n = x.n WHERE t.id NOT IN (SELECT tid FROM u)",
 		"SELECT n FROM t UNION SELECT tid FROM u INTERSECT SELECT 1 EXCEPT SELECT NULL ORDER BY 1 DESC LIMIT 2",
 		"UPDATE t SET n = (SELECT MAX(tid) FROM u WHERE tid < t.id) WHERE id IN (SELECT tid FROM u UNION ALL SELECT 2)",
+		"SELECT * FROM t WHERE n = 1 OR name = 'b' OR id IN (2, 3) ORDER BY id DESC LIMIT 2",
+		"SELECT t.id, u.v FROM t JOIN u ON u.v = t.name LEFT JOIN t t2 ON t2.n = u.tid ORDER BY t.id",
+		"SELECT * FROM t WHERE name > 'a' ORDER BY name DESC, id DESC LIMIT 1 OFFSET 1",
 	} {
 		f.Add(s)
 	}

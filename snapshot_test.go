@@ -30,8 +30,8 @@ func TestLongReadDoesNotBlockCommits(t *testing.T) {
 	go func() {
 		defer close(done)
 		start := time.Now()
-		// Unindexed self-join: n*n comparisons, takes a while.
-		if err := db.QueryRow(`SELECT COUNT(*) FROM t a JOIN t b ON a.v = b.v`).Scan(&joinCount); err != nil {
+		// Non-equi self-join: n*n comparisons (cannot use a hash join).
+		if err := db.QueryRow(`SELECT COUNT(*) FROM t a JOIN t b ON a.v < b.v`).Scan(&joinCount); err != nil {
 			t.Error(err)
 		}
 		readTime = time.Since(start)
@@ -50,8 +50,8 @@ func TestLongReadDoesNotBlockCommits(t *testing.T) {
 		}
 	}
 	<-done
-	if joinCount != n {
-		t.Fatalf("long read saw %d rows, want its snapshot's %d", joinCount, n)
+	if want := n * (n - 1) / 2; joinCount != want {
+		t.Fatalf("long read counted %d pairs, want %d from its snapshot", joinCount, want)
 	}
 	if readTime < 200*time.Millisecond {
 		t.Skipf("join finished too fast (%v) to test overlap", readTime)
