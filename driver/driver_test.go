@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -108,5 +109,35 @@ func TestReturningThroughDriver(t *testing.T) {
 	}
 	if err := db.QueryRow(`INSERT INTO t (name) VALUES (?) ON CONFLICT (name) DO UPDATE SET name = excluded.name RETURNING id`, "a").Scan(&id); err != nil || id != 1 {
 		t.Fatalf("upsert id=%d err=%v", id, err)
+	}
+}
+
+func TestDriverNamedParamsAndColumnTypes(t *testing.T) {
+	db, _ := sql.Open("bangdb", ":memory:")
+	defer db.Close()
+	db.Exec(`CREATE TABLE t (id INTEGER PRIMARY KEY, name VARCHAR(20), score REAL, data BLOB)`)
+	if _, err := db.Exec(`INSERT INTO t (name, score) VALUES (:name, :score)`, sql.Named("name", "kim"), sql.Named("score", 1.5)); err != nil {
+		t.Fatal(err)
+	}
+	stmt, err := db.Prepare(`SELECT id, name, score, data, score * 2 FROM t WHERE name = ?`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := stmt.Query(); err == nil {
+		t.Fatal("NumInput should make database/sql reject a missing argument")
+	}
+	rows, err := stmt.Query("kim")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	cts, _ := rows.ColumnTypes()
+	var got []string
+	for _, ct := range cts {
+		got = append(got, ct.DatabaseTypeName()+"/"+ct.ScanType().String())
+	}
+	want := "INTEGER/int64 VARCHAR(20)/string REAL/float64 BLOB/[]uint8 /interface {}"
+	if s := fmt.Sprint(strings.Join(got, " ")); s != want {
+		t.Fatalf("column types %q, want %q", s, want)
 	}
 }

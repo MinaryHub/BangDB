@@ -17,8 +17,11 @@ import (
 	"database/sql/driver"
 	"errors"
 	"io"
+	"reflect"
+	"strings"
 
 	"github.com/knoxxr/bangdb/internal/engine"
+	"github.com/knoxxr/bangdb/internal/value"
 )
 
 func init() { sql.Register("bangdb", &Driver{}) }
@@ -120,9 +123,10 @@ func values(args []driver.NamedValue) ([]any, error) {
 	out := make([]any, len(args))
 	for i, a := range args {
 		if a.Name != "" {
-			return nil, errors.New("bangdb: named parameters are not supported; use ?")
+			out[i] = engine.NamedArg{Name: a.Name, Value: a.Value}
+		} else {
+			out[i] = a.Value
 		}
-		out[i] = a.Value
 	}
 	return out, nil
 }
@@ -144,8 +148,17 @@ type stmt struct {
 	query string
 }
 
-func (s *stmt) Close() error  { return nil }
-func (s *stmt) NumInput() int { return -1 }
+func (s *stmt) Close() error { return nil }
+
+// NumInput lets database/sql check the argument count of statements that
+// only use positional parameters.
+func (s *stmt) NumInput() int {
+	n, named, err := s.c.c.NumParams(s.query)
+	if err != nil || named {
+		return -1
+	}
+	return n
+}
 
 func (s *stmt) Exec(args []driver.Value) (driver.Result, error) {
 	return s.c.ExecContext(context.Background(), s.query, named(args))
@@ -179,7 +192,27 @@ func (r result) RowsAffected() (int64, error) { return r.r.RowsAffected, nil }
 type rows struct{ r *engine.Rows }
 
 func (r *rows) Columns() []string { return r.r.Columns() }
-func (r *rows) Close() error      { return r.r.Close() }
+
+// ColumnTypeDatabaseTypeName reports the declared type of a column.
+func (r *rows) ColumnTypeDatabaseTypeName(i int) string {
+	return strings.ToUpper(r.r.ColumnTypes()[i])
+}
+
+// ColumnTypeScanType suggests a Go type for a column.
+func (r *rows) ColumnTypeScanType(i int) reflect.Type {
+	switch value.ParseType(r.r.ColumnTypes()[i]) {
+	case value.Integer:
+		return reflect.TypeOf(int64(0))
+	case value.Real:
+		return reflect.TypeOf(float64(0))
+	case value.Text:
+		return reflect.TypeOf("")
+	case value.Blob:
+		return reflect.TypeOf([]byte(nil))
+	}
+	return reflect.TypeOf((*any)(nil)).Elem()
+}
+func (r *rows) Close() error { return r.r.Close() }
 
 func (r *rows) Next(dest []driver.Value) error {
 	if !r.r.Next() {

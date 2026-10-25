@@ -34,7 +34,11 @@ func formatExpr(sb *strings.Builder, e Expr) {
 			fmt.Fprintf(sb, "x'%x'", v)
 		}
 	case *Param:
-		sb.WriteString("?")
+		if x.Name != "" {
+			sb.WriteString(":" + x.Name)
+		} else {
+			fmt.Fprintf(sb, "?%d", x.Index+1)
+		}
 	case *ColumnRef:
 		if x.Table != "" {
 			sb.WriteString(x.Table + ".")

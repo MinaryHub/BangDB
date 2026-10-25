@@ -35,6 +35,21 @@ type AlterTableAddColumn struct {
 	Column ColumnDef
 }
 
+type AlterTableRename struct {
+	Table   string
+	NewName string
+}
+
+type AlterTableRenameColumn struct {
+	Table    string
+	Old, New string
+}
+
+type AlterTableDropColumn struct {
+	Table  string
+	Column string
+}
+
 type CreateIndex struct {
 	Name        string
 	Table       string
@@ -138,26 +153,33 @@ type Rollback struct{}
 // Explain wraps a statement whose query plan should be shown.
 type Explain struct{ Stmt Stmt }
 
-func (*CreateTable) stmt()         {}
-func (*DropTable) stmt()           {}
-func (*AlterTableAddColumn) stmt() {}
-func (*CreateIndex) stmt()         {}
-func (*DropIndex) stmt()           {}
-func (*Insert) stmt()              {}
-func (*Select) stmt()              {}
-func (*Update) stmt()              {}
-func (*Delete) stmt()              {}
-func (*Begin) stmt()               {}
-func (*Commit) stmt()              {}
-func (*Rollback) stmt()            {}
-func (*Explain) stmt()             {}
+func (*CreateTable) stmt()            {}
+func (*DropTable) stmt()              {}
+func (*AlterTableAddColumn) stmt()    {}
+func (*AlterTableRename) stmt()       {}
+func (*AlterTableRenameColumn) stmt() {}
+func (*AlterTableDropColumn) stmt()   {}
+func (*CreateIndex) stmt()            {}
+func (*DropIndex) stmt()              {}
+func (*Insert) stmt()                 {}
+func (*Select) stmt()                 {}
+func (*Update) stmt()                 {}
+func (*Delete) stmt()                 {}
+func (*Begin) stmt()                  {}
+func (*Commit) stmt()                 {}
+func (*Rollback) stmt()               {}
+func (*Explain) stmt()                {}
 
 // ---- Expressions ----
 
 type Literal struct{ Value any }
 
-// Param is a positional placeholder (?); Index is 0-based.
-type Param struct{ Index int }
+// Param is a placeholder; Index is the 0-based argument slot. Named
+// placeholders (:name, @name, $name) share a slot per name.
+type Param struct {
+	Index int
+	Name  string
+}
 
 type ColumnRef struct {
 	Table string // optional qualifier

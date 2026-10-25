@@ -11,9 +11,24 @@ import (
 // the number of '?' placeholders. Parameter indexes are numbered across the
 // whole script.
 func Parse(src string) ([]Stmt, int, error) {
+	stmts, names, err := ParseNamed(src)
+	return stmts, len(names), err
+}
+
+// ParseNamed is Parse that also returns, for every argument slot, the name
+// of its placeholder ("" for positional ones).
+func ParseNamed(src string) ([]Stmt, []string, error) {
+	stmts, p, err := parseAll(src)
+	if err != nil {
+		return nil, nil, err
+	}
+	return stmts, p.names, nil
+}
+
+func parseAll(src string) ([]Stmt, *parser, error) {
 	toks, err := lex(src)
 	if err != nil {
-		return nil, 0, err
+		return nil, nil, err
 	}
 	p := &parser{toks: toks}
 	var stmts []Stmt
@@ -25,20 +40,49 @@ func Parse(src string) ([]Stmt, int, error) {
 		}
 		s, err := p.parseStmt()
 		if err != nil {
-			return nil, 0, err
+			return nil, nil, err
 		}
 		stmts = append(stmts, s)
 		if !p.acceptOp(";") && p.peek().kind != tEOF {
-			return nil, 0, p.errf("expected ';' or end of input")
+			return nil, nil, p.errf("expected ';' or end of input")
 		}
 	}
-	return stmts, p.params, nil
+	return stmts, p, nil
 }
 
 type parser struct {
-	toks   []token
-	pos    int
-	params int
+	toks  []token
+	pos   int
+	names []string // per argument slot: placeholder name or ""
+}
+
+// param assigns the argument slot of a placeholder token.
+func (p *parser) param(t token) (*Param, error) {
+	text := t.text
+	if text == "?" {
+		p.names = append(p.names, "")
+		return &Param{Index: len(p.names) - 1}, nil
+	}
+	body := text[1:]
+	if n, err := strconv.Atoi(body); err == nil && (text[0] == '?' || text[0] == '$') {
+		if n < 1 || n > 1000 {
+			return nil, &SyntaxError{t.pos, "parameter number out of range: " + text}
+		}
+		for len(p.names) < n {
+			p.names = append(p.names, "")
+		}
+		return &Param{Index: n - 1}, nil
+	}
+	if text[0] == '?' {
+		return nil, &SyntaxError{t.pos, "invalid parameter " + text}
+	}
+	for i, name := range p.names {
+		if strings.EqualFold(name, body) {
+			return &Param{Index: i, Name: body}, nil
+		}
+	}
+	p.names = append(p.names, body)
+	return &Param{Index: len(p.names) - 1, Name: body}, nil
 }
 
 // reserved words that cannot be used as bare aliases.
@@ -268,15 +312,21 @@ func (p *parser) parseColumnDef() (ColumnDef, error) {
 	for p.peek().kind == tIdent && !isConstraintKw(p.peek().text) {
 		typ = append(typ, p.next().text)
 	}
+	size := ""
 	if len(typ) > 0 && p.acceptOp("(") {
+		var parts []string
 		for !p.acceptOp(")") {
-			if p.peek().kind == tEOF {
+			t := p.next()
+			if t.kind == tEOF {
 				return cd, p.errf("unterminated type")
 			}
-			p.next()
+			if t.text != "," {
+				parts = append(parts, t.text)
+			}
 		}
+		size = "(" + strings.Join(parts, ",") + ")"
 	}
-	cd.Type = strings.ToUpper(strings.Join(typ, " "))
+	cd.Type = strings.ToUpper(strings.Join(typ, " ")) + size
 	for {
 		switch {
 		case p.acceptKw("PRIMARY", "KEY"):
@@ -348,15 +398,35 @@ func (p *parser) parseAlter() (Stmt, error) {
 	if err != nil {
 		return nil, err
 	}
-	if err := p.expectKw("ADD"); err != nil {
-		return nil, err
+	switch {
+	case p.acceptKw("ADD"):
+		p.acceptKw("COLUMN")
+		cd, err := p.parseColumnDef()
+		if err != nil {
+			return nil, err
+		}
+		return &AlterTableAddColumn{Table: name, Column: cd}, nil
+	case p.acceptKw("DROP"):
+		p.acceptKw("COLUMN")
+		col, err := p.ident()
+		return &AlterTableDropColumn{Table: name, Column: col}, err
+	case p.acceptKw("RENAME"):
+		if p.acceptKw("TO") {
+			n, err := p.ident()
+			return &AlterTableRename{Table: name, NewName: n}, err
+		}
+		p.acceptKw("COLUMN")
+		old, err := p.ident()
+		if err != nil {
+			return nil, err
+		}
+		if err := p.expectKw("TO"); err != nil {
+			return nil, err
+		}
+		n, err := p.ident()
+		return &AlterTableRenameColumn{Table: name, Old: old, New: n}, err
 	}
-	p.acceptKw("COLUMN")
-	cd, err := p.parseColumnDef()
-	if err != nil {
-		return nil, err
-	}
-	return &AlterTableAddColumn{Table: name, Column: cd}, nil
+	return nil, p.errf("expected ADD, DROP or RENAME")
 }
 
 func (p *parser) parseInsert() (Stmt, error) {
@@ -977,8 +1047,7 @@ func (p *parser) parsePrimary() (Expr, error) {
 		return &Literal{b}, nil
 	case tParam:
 		p.next()
-		p.params++
-		return &Param{p.params - 1}, nil
+		return p.param(t)
 	case tOp:
 		if t.text == "(" {
 			p.next()

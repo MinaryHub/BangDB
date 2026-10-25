@@ -23,6 +23,7 @@ type selectPlan struct {
 	levels  []*level
 	final   []evalFn
 	cols    []string
+	types   []string
 	items   []evalFn
 	orderBy []orderFn
 	agg     bool
@@ -95,6 +96,9 @@ func (x *execCtx) planSelect(st *sql.Select) (*selectPlan, error) {
 		}
 		exprs = append(exprs, it.Expr)
 		p.cols = append(p.cols, outputName(it))
+	}
+	for _, e := range exprs {
+		p.types = append(p.types, p.declType(e))
 	}
 	for _, e := range exprs {
 		f, err := c.compile(e)
@@ -223,7 +227,33 @@ func (x *execCtx) execSelect(st *sql.Select) (Result, error) {
 	if err != nil {
 		return Result{}, err
 	}
-	return Result{Columns: r.p.cols, Rows: rows}, nil
+	return Result{Columns: r.p.cols, Types: r.p.types, Rows: rows}, nil
+}
+
+// declType returns the declared type of an output expression that is a
+// plain column reference ("" otherwise).
+func (p *selectPlan) declType(e sql.Expr) string {
+	ref, ok := e.(*sql.ColumnRef)
+	if !ok {
+		return ""
+	}
+	i, err := p.sc.resolve(ref.Table, ref.Name)
+	if err != nil {
+		return ""
+	}
+	l := p.levels[p.sc.cols[i].level]
+	col := i - l.offset
+	if col == len(l.t.Columns) {
+		return "INTEGER" // rowid
+	}
+	c := l.t.Columns[col]
+	if c.DeclType != "" {
+		return c.DeclType
+	}
+	if c.Type == value.Any {
+		return ""
+	}
+	return string(c.Type)
 }
 
 // selectRun is a planned SELECT ready to execute.
@@ -1035,7 +1065,7 @@ func (x *execCtx) prepareCompound(st *sql.Select) (*selectRun, error) {
 	if err != nil {
 		return nil, err
 	}
-	r := &selectRun{st: st, p: &selectPlan{cols: first.p.cols}, limit: -1, parts: []*selectRun{first}}
+	r := &selectRun{st: st, p: &selectPlan{cols: first.p.cols, types: first.p.types}, limit: -1, parts: []*selectRun{first}}
 	for _, op := range st.Compound {
 		part, err := x.prepareSelect(op.Select)
 		if err != nil {

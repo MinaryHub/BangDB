@@ -64,6 +64,12 @@ func (x *execCtx) exec(s sql.Stmt) (Result, error) {
 		return Result{}, x.dropIndex(st)
 	case *sql.AlterTableAddColumn:
 		return Result{}, x.addColumn(st)
+	case *sql.AlterTableRename:
+		return Result{}, x.renameTable(st)
+	case *sql.AlterTableRenameColumn:
+		return Result{}, x.renameColumn(st)
+	case *sql.AlterTableDropColumn:
+		return Result{}, x.dropColumn(st)
 	}
 	return Result{}, fmt.Errorf("bangdb: unsupported statement %T", s)
 }
@@ -599,4 +605,167 @@ func (x *execCtx) addColumn(st *sql.AlterTableAddColumn) error {
 	t.Columns = append(t.Columns, col)
 	x.cat.link()
 	return saveEntry(x.v, tableKey(t.Name), t)
+}
+
+// saveTable rewrites the catalog entries of t and its indexes.
+func (x *execCtx) saveTable(t *Table) error {
+	if err := saveEntry(x.v, tableKey(t.Name), t); err != nil {
+		return err
+	}
+	for _, ix := range t.indexes {
+		if err := saveEntry(x.v, indexKey(ix.Name), ix); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (x *execCtx) renameTable(st *sql.AlterTableRename) error {
+	t, err := x.table(st.Table)
+	if err != nil {
+		return err
+	}
+	if x.cat.table(st.NewName) != nil {
+		return fmt.Errorf("bangdb: there is already a table named %s", st.NewName)
+	}
+	if strings.HasPrefix(strings.ToLower(st.NewName), "bangdb_") {
+		return fmt.Errorf("bangdb: table names starting with bangdb_ are reserved")
+	}
+	x.mutableCatalog()
+	t = x.cat.table(st.Table)
+	old := t.Name
+	if err := deleteEntry(x.v, tableKey(old)); err != nil {
+		return err
+	}
+	delete(x.cat.tables, strings.ToLower(old))
+	t.Name = st.NewName
+	x.cat.tables[strings.ToLower(t.Name)] = t
+	oldPrefix := strings.ToLower("bangdb_autoindex_" + old + "_")
+	for _, ix := range t.indexes {
+		ix.Table = t.Name
+		if ix.Auto && strings.HasPrefix(strings.ToLower(ix.Name), oldPrefix) {
+			// Keep automatic index names tied to the table name, so that a
+			// new table with the old name can create its own.
+			if err := deleteEntry(x.v, indexKey(ix.Name)); err != nil {
+				return err
+			}
+			delete(x.cat.indexes, strings.ToLower(ix.Name))
+			ix.Name = "bangdb_autoindex_" + t.Name + "_" + ix.Name[len(oldPrefix):]
+			x.cat.indexes[strings.ToLower(ix.Name)] = ix
+		}
+	}
+	// Move the AUTOINCREMENT high-water mark.
+	if hw, err := x.sequence(&Table{Name: old, RowidCol: t.RowidCol, Columns: t.Columns}); err != nil {
+		return err
+	} else if hw > 0 {
+		if err := x.dropSequence(&Table{Name: old}); err != nil {
+			return err
+		}
+		if err := x.recordSequence(t, hw); err != nil {
+			return err
+		}
+	}
+	if id, ok := x.tx.rowids[strings.ToLower(old)]; ok {
+		delete(x.tx.rowids, strings.ToLower(old))
+		x.tx.rowids[strings.ToLower(t.Name)] = id
+	}
+	x.cat.link()
+	return x.saveTable(t)
+}
+
+func (x *execCtx) renameColumn(st *sql.AlterTableRenameColumn) error {
+	t, err := x.table(st.Table)
+	if err != nil {
+		return err
+	}
+	i := t.ColIndex(st.Old)
+	if i < 0 {
+		return fmt.Errorf("bangdb: no such column: %s.%s", t.Name, st.Old)
+	}
+	if j := t.ColIndex(st.New); j >= 0 && j != i {
+		return fmt.Errorf("bangdb: duplicate column name: %s", st.New)
+	}
+	x.mutableCatalog()
+	t = x.cat.table(st.Table)
+	old := t.Columns[i].Name
+	t.Columns[i].Name = st.New
+	for k, c := range t.PrimaryKey {
+		if strings.EqualFold(c, old) {
+			t.PrimaryKey[k] = st.New
+		}
+	}
+	for _, ix := range t.indexes {
+		for k, c := range ix.Columns {
+			if strings.EqualFold(c, old) {
+				ix.Columns[k] = st.New
+			}
+		}
+	}
+	x.cat.link()
+	return x.saveTable(t)
+}
+
+func (x *execCtx) dropColumn(st *sql.AlterTableDropColumn) error {
+	t, err := x.table(st.Table)
+	if err != nil {
+		return err
+	}
+	i := t.ColIndex(st.Column)
+	if i < 0 {
+		return fmt.Errorf("bangdb: no such column: %s.%s", t.Name, st.Column)
+	}
+	if len(t.Columns) == 1 {
+		return fmt.Errorf("bangdb: cannot drop the only column of %s", t.Name)
+	}
+	if t.Columns[i].PrimaryKey {
+		return fmt.Errorf("bangdb: cannot drop PRIMARY KEY column %s", t.Columns[i].Name)
+	}
+	for _, ix := range t.indexes {
+		for _, c := range ix.cols {
+			if c == i {
+				if ix.Auto {
+					return fmt.Errorf("bangdb: cannot drop UNIQUE column %s", t.Columns[i].Name)
+				}
+				return fmt.Errorf("bangdb: cannot drop column %s: it is used by index %s (drop the index first)", t.Columns[i].Name, ix.Name)
+			}
+		}
+	}
+	// Rewrite every row without the column (rows are collected first).
+	type rec struct {
+		key []byte
+		row []any
+	}
+	var rows []rec
+	c := btree.Open(x.v, t.Root).Seek(nil)
+	for ; c.Valid(); c.Next() {
+		if err := x.tick(); err != nil {
+			return err
+		}
+		data, err := c.Value()
+		if err != nil {
+			return err
+		}
+		row, err := x.decodeRow(t, data)
+		if err != nil {
+			return err
+		}
+		rows = append(rows, rec{append([]byte(nil), c.Key()...), append(row[:i:i], row[i+1:]...)})
+	}
+	if err := c.Err(); err != nil {
+		return err
+	}
+	tree := btree.Open(x.v, t.Root)
+	for _, r := range rows {
+		if err := tree.Put(r.key, value.EncodeRow(r.row)); err != nil {
+			return err
+		}
+	}
+	x.mutableCatalog()
+	t = x.cat.table(st.Table)
+	t.Columns = append(t.Columns[:i:i], t.Columns[i+1:]...)
+	if t.RowidCol > i {
+		t.RowidCol--
+	}
+	x.cat.link()
+	return x.saveTable(t)
 }

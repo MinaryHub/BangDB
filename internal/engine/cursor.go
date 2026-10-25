@@ -15,7 +15,8 @@ import (
 // the end closes it automatically); an open Rows pins its snapshot, which
 // prevents WAL checkpoints past it.
 type Rows struct {
-	cols []string
+	cols  []string
+	types []string
 
 	// streaming mode
 	ch     chan []any
@@ -34,6 +35,15 @@ type Rows struct {
 
 // Columns returns the result column names.
 func (r *Rows) Columns() []string { return r.cols }
+
+// ColumnTypes returns the declared type of each result column, or "" where
+// it is not a plain table column.
+func (r *Rows) ColumnTypes() []string {
+	if len(r.types) == len(r.cols) {
+		return r.types
+	}
+	return make([]string, len(r.cols))
+}
 
 // Next advances to the next row; it returns false at the end or on error
 // (see Err).
@@ -87,7 +97,9 @@ func (r *Rows) Close() error {
 }
 
 // RowsFromResult wraps a materialized result.
-func RowsFromResult(res Result) *Rows { return &Rows{cols: res.Columns, static: res.Rows} }
+func RowsFromResult(res Result) *Rows {
+	return &Rows{cols: res.Columns, types: res.Types, static: res.Rows}
+}
 
 // cursors tracks open streaming cursors so Close can stop them.
 type cursorSet struct {
@@ -142,7 +154,7 @@ func (c *Conn) QueryRows(ctx context.Context, src string, args ...any) (*Rows, e
 		}
 		return RowsFromResult(res), nil
 	}
-	nargs, err := normalizeArgs(args, pr.nparams)
+	nargs, err := normalizeArgs(args, pr.names)
 	if err != nil {
 		return nil, err
 	}
@@ -189,7 +201,7 @@ func (db *DB) stream(ctx context.Context, sel *sql.Select, args []any) (*Rows, e
 	ch := make(chan []any, 64)
 	errc := make(chan error, 1)
 	done := make(chan struct{})
-	r := &Rows{cols: run.p.cols, ch: ch, errc: errc, cancel: cancelAll, done: done}
+	r := &Rows{cols: run.p.cols, types: run.p.types, ch: ch, errc: errc, cancel: cancelAll, done: done}
 	r.unreg = db.cursors.add(cancelAll)
 	go func() {
 		defer close(done)
@@ -210,4 +222,19 @@ func (db *DB) stream(ctx context.Context, sel *sql.Select, args []any) (*Rows, e
 	// only references the channels, so r can be collected.
 	runtime.SetFinalizer(r, (*Rows).Close)
 	return r, nil
+}
+
+// NumParams returns the number of argument slots of src and whether any of
+// them is a named placeholder.
+func (c *Conn) NumParams(src string) (int, bool, error) {
+	pr, err := c.db.parse(src)
+	if err != nil {
+		return 0, false, err
+	}
+	for _, n := range pr.names {
+		if n != "" {
+			return len(pr.names), true, nil
+		}
+	}
+	return len(pr.names), false, nil
 }

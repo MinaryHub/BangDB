@@ -28,6 +28,16 @@ import (
 // Options configures a database. See engine.Options.
 type Options = engine.Options
 
+// NamedArg binds a value to a named placeholder; see Named.
+type NamedArg = engine.NamedArg
+
+// Named binds value to the placeholder :name, @name or $name:
+//
+//	db.Exec(`UPDATE t SET v = :v WHERE id = :id`, bangdb.Named("id", 1), bangdb.Named("v", "x"))
+//
+// database/sql's sql.Named values are accepted as well.
+func Named(name string, value any) NamedArg { return NamedArg{Name: name, Value: value} }
+
 // Result reports the outcome of a write statement.
 type Result struct {
 	RowsAffected int64

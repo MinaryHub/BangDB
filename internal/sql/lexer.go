@@ -108,9 +108,14 @@ func lex(src string) ([]token, error) {
 			}
 			toks = append(toks, token{tQuotedIdent, src[i+1 : i+1+j], i})
 			i += j + 2
-		case c == '?':
-			toks = append(toks, token{tParam, "?", i})
+		case c == '?' || (c == ':' || c == '@' || c == '$') && i+1 < len(src) && isIdentPart(src[i+1]):
+			// ?, ?NNN, $NNN (numbered) and :name, @name, $name (named)
+			start := i
 			i++
+			for i < len(src) && isIdentPart(src[i]) {
+				i++
+			}
+			toks = append(toks, token{tParam, src[start:i], start})
 		default:
 			two := ""
 			if i+1 < len(src) {

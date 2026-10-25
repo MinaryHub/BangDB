@@ -117,6 +117,7 @@ func (c *Catalog) clone() *Catalog {
 	for k, t := range c.tables {
 		nt := *t
 		nt.Columns = append([]Column(nil), t.Columns...)
+		nt.PrimaryKey = append([]string(nil), t.PrimaryKey...)
 		nt.indexes = nil
 		n.tables[k] = &nt
 	}

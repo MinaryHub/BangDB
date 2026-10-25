@@ -3,8 +3,10 @@ package engine
 
 import (
 	"context"
+	dbsql "database/sql"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -36,6 +38,7 @@ type Options struct {
 // Result is the outcome of executing SQL.
 type Result struct {
 	Columns      []string
+	Types        []string // declared column types where known ("" otherwise)
 	Rows         [][]any
 	RowsAffected int64
 	LastInsertID int64
@@ -73,8 +76,8 @@ type DB struct {
 }
 
 type parsed struct {
-	stmts   []sql.Stmt
-	nparams int
+	stmts []sql.Stmt
+	names []string // per argument slot: placeholder name or ""
 }
 
 // Open opens a database file. The path ":memory:" (or "") creates a private
@@ -195,11 +198,11 @@ func (db *DB) parse(src string) (parsed, error) {
 	if ok {
 		return pr, nil
 	}
-	stmts, n, err := sql.Parse(src)
+	stmts, names, err := sql.ParseNamed(src)
 	if err != nil {
 		return parsed{}, err
 	}
-	pr = parsed{stmts, n}
+	pr = parsed{stmts, names}
 	db.cacheMu.Lock()
 	if len(db.stmtCache) >= 512 {
 		clear(db.stmtCache)
@@ -209,17 +212,57 @@ func (db *DB) parse(src string) (parsed, error) {
 	return pr, nil
 }
 
-func normalizeArgs(args []any, want int) ([]any, error) {
-	if len(args) != want {
-		return nil, fmt.Errorf("bangdb: expected %d arguments, got %d", want, len(args))
-	}
-	out := make([]any, len(args))
-	for i, a := range args {
-		v, err := value.Normalize(a)
+// NamedArg binds a value to a named placeholder (:name, @name or $name).
+type NamedArg struct {
+	Name  string
+	Value any
+}
+
+// normalizeArgs binds args to the argument slots of a statement: positional
+// arguments fill the slots in order, named ones (NamedArg or database/sql's
+// sql.NamedArg) go to the slot of their placeholder.
+func normalizeArgs(args []any, names []string) ([]any, error) {
+	out := make([]any, len(names))
+	set := make([]bool, len(names))
+	pos := 0
+	for _, a := range args {
+		name, val, named := "", a, false
+		switch na := a.(type) {
+		case NamedArg:
+			name, val, named = na.Name, na.Value, true
+		case dbsql.NamedArg:
+			name, val, named = na.Name, na.Value, true
+		}
+		v, err := value.Normalize(val)
 		if err != nil {
 			return nil, err
 		}
-		out[i] = v
+		if !named {
+			if pos >= len(names) {
+				return nil, fmt.Errorf("bangdb: too many arguments: the statement has %d parameters", len(names))
+			}
+			out[pos], set[pos] = v, true
+			pos++
+			continue
+		}
+		name = strings.TrimLeft(name, ":@$")
+		found := false
+		for i, n := range names {
+			if n != "" && strings.EqualFold(n, name) {
+				out[i], set[i], found = v, true, true
+			}
+		}
+		if !found {
+			return nil, fmt.Errorf("bangdb: the statement has no parameter named %s", name)
+		}
+	}
+	for i, ok := range set {
+		if !ok {
+			if names[i] != "" {
+				return nil, fmt.Errorf("bangdb: missing argument for parameter :%s", names[i])
+			}
+			return nil, fmt.Errorf("bangdb: expected %d arguments, got %d", len(names), len(args))
+		}
 	}
 	return out, nil
 }
@@ -356,7 +399,7 @@ func (tx *Tx) ExecContext(ctx context.Context, src string, args ...any) (Result,
 	if err != nil {
 		return Result{}, err
 	}
-	nargs, err := normalizeArgs(args, pr.nparams)
+	nargs, err := normalizeArgs(args, pr.names)
 	if err != nil {
 		return Result{}, err
 	}
@@ -468,7 +511,7 @@ func (c *Conn) ExecContext(ctx context.Context, src string, args ...any) (Result
 	if err != nil {
 		return Result{}, err
 	}
-	nargs, err := normalizeArgs(args, pr.nparams)
+	nargs, err := normalizeArgs(args, pr.names)
 	if err != nil {
 		return Result{}, err
 	}
