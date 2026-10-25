@@ -252,7 +252,7 @@ func TestGroupCommitVisibility(t *testing.T) {
 	// do not see it.
 	v = p.NewView()
 	v.Write(pg, page(2))
-	c1, err := p.PrepareCommit(v)
+	c1, err := p.PrepareCommit(v, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -266,7 +266,7 @@ func TestGroupCommitVisibility(t *testing.T) {
 	s.Release()
 	v = p.NewView()
 	v.Write(pg, page(3))
-	c2, _ := p.PrepareCommit(v)
+	c2, _ := p.PrepareCommit(v, nil)
 
 	// Flushing c2 publishes c1 and c2 together, in order.
 	var published []uint64
@@ -298,10 +298,10 @@ func TestGroupCommitSyncFailure(t *testing.T) {
 
 	v = p.NewView()
 	v.Write(pg, page(2))
-	c1, _ := p.PrepareCommit(v)
+	c1, _ := p.PrepareCommit(v, nil)
 	v = p.NewView()
 	v.Write(pg, page(3))
-	c2, _ := p.PrepareCommit(v)
+	c2, _ := p.PrepareCommit(v, nil)
 	p.failpoint = func(string) error { return errCrash }
 	if err := p.Flush(c1); err == nil {
 		t.Fatal("expected sync failure")

@@ -3,6 +3,7 @@ package engine
 import (
 	"encoding/json"
 	"fmt"
+	"hash/fnv"
 	"strings"
 
 	"github.com/knoxxr/bangdb/internal/btree"
@@ -64,8 +65,8 @@ type Index struct {
 	colls []string // collation per column: keys of collated text are folded
 }
 
-// key returns the index key part for row (without the rowid), truncated to
-// keyLimit (see truncKey).
+// key returns the index key part for row (without the rowid), truncated if
+// it is long (see truncKey).
 func (ix *Index) key(row []any) []byte {
 	k, _ := truncKey(ix.fullKey(row))
 	return k
@@ -80,14 +81,32 @@ func (ix *Index) fullKey(row []any) []byte {
 	return k
 }
 
-// keyLimit is the longest index key part stored as is. Longer key parts are
-// cut to keyLimit bytes plus a 0x00 byte, so a stored part longer than
-// keyLimit marks a truncated key. Truncation keeps the order of keys (it is
-// monotonic) but different values can share a truncated key, so lookups
-// compare the rows' full keys and ordered scans sort such groups by value.
-const keyLimit = btree.MaxKey - 8 - 1
+// keyLimit is the longest index key part stored as is. A longer key part is
+// stored as its first keyLimit bytes, a 0x00 byte and an 8-byte hash of the
+// whole part; a stored part longer than keyLimit marks such a key.
+//
+// Keys sharing their first keyLimit bytes form a group: groups keep the
+// order of the values (the cut is monotonic) and are contiguous, but inside
+// a group entries are ordered by hash. So an equality search on the whole
+// key finds its entries by hash (and compares the rows' values, as hashes
+// can collide), a search on part of the key or a range uses the group
+// prefix (groupKey) and lets the level's filters recheck, and ordered scans
+// sort each group by value (keyOrder).
+const keyLimit = btree.MaxKey - 8 - 9
 
+// truncKey returns the stored form of a whole key part.
 func truncKey(k []byte) ([]byte, bool) {
+	if len(k) <= keyLimit {
+		return k, false
+	}
+	h := fnv.New64a()
+	h.Write(k)
+	return h.Sum(append(k[:keyLimit:keyLimit], 0)), true
+}
+
+// groupKey returns the search prefix for a partial key or a range bound: a
+// cut key stands for its whole group.
+func groupKey(k []byte) ([]byte, bool) {
 	if len(k) <= keyLimit {
 		return k, false
 	}
@@ -95,6 +114,9 @@ func truncKey(k []byte) ([]byte, bool) {
 }
 
 func isTruncated(part []byte) bool { return len(part) > keyLimit }
+
+// truncGroup returns the group prefix of a stored (truncated) key part.
+func truncGroup(part []byte) []byte { return part[:keyLimit+1] }
 
 // hasNull reports whether any indexed value of row is NULL (such rows never
 // conflict in a UNIQUE index).

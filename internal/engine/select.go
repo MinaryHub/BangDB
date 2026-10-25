@@ -432,7 +432,7 @@ func (x *execCtx) runSelect(r *selectRun, sink func(vals []any) (bool, error)) e
 		}
 		if cfg.limit <= 0 || seenBytes < cfg.limit/2 {
 			seen[string(k)] = true
-			seenBytes += len(k) + 64
+			seenBytes += 2*len(k) + 96
 			return ordered(row)
 		}
 		// Too many distinct rows to remember: sort the rest by value and
@@ -597,7 +597,7 @@ func (x *execCtx) runGrouped(p *selectPlan, e *env, project func() error) error 
 			g = newGroup()
 			groups[string(key)] = g
 			order = append(order, g)
-			used += len(key) + rowBytes(g.row) + 64*len(g.states)
+			used += 2*len(key) + rowBytes(g.row) + 160*len(g.states) + 160 // map entry, group, states
 			spilling = cfg.limit > 0 && used > cfg.limit/2
 		}
 		for _, st := range g.states {

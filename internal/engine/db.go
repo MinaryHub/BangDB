@@ -358,11 +358,10 @@ func (db *DB) read(ctx context.Context, fn func(x *execCtx) (Result, error), arg
 	return fn(x)
 }
 
-// prepared records a commit's catalog: it is published with the commit and
-// is the base of the next write transaction. The caller holds the write
-// lock.
-func (db *DB) prepared(c *pager.Prepared, cat *Catalog) {
-	c.Meta = cat
+// prepared records the catalog of a prepared commit (which carries it as
+// its meta) as the base of the next write transaction. The caller holds the
+// write lock.
+func (db *DB) prepared(cat *Catalog) {
 	db.catMu.Lock()
 	db.cat = cat
 	db.catMu.Unlock()
@@ -479,12 +478,12 @@ func (tx *Tx) Commit() error {
 	}
 	tx.done = true
 	p := tx.db.p // stays valid after unlocking (VACUUM may swap db.p)
-	c, err := p.PrepareCommit(tx.v)
+	c, err := p.PrepareCommit(tx.v, tx.cat)
 	if err != nil || c == nil {
 		tx.db.unlockWrite()
 		return err
 	}
-	tx.db.prepared(c, tx.cat)
+	tx.db.prepared(tx.cat)
 	// Group commit: release the write lock before waiting for the fsync, so
 	// the next writer can prepare and share it.
 	tx.db.unlockWrite()

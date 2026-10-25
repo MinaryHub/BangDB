@@ -579,7 +579,8 @@ func (p *Pager) PreparedHeader() Header {
 type Prepared struct {
 	pages map[uint32][]byte
 	hdr   Header
-	// Meta is published together with the commit (Snapshot.Meta).
+	// Meta is published together with the commit (Snapshot.Meta). It is
+	// read under the pager lock; see PrepareCommit and SetPreparedMeta.
 	Meta any
 }
 
@@ -589,8 +590,9 @@ func (c *Prepared) Seq() uint64 { return c.hdr.Seq }
 // PrepareCommit appends the view's changes to the WAL (without fsync) and
 // assigns the next sequence number. It returns nil if there is nothing to
 // commit. The next writer may build on it at once; Flush makes it durable
-// and visible to readers. Writer-side.
-func (p *Pager) PrepareCommit(v *View) (*Prepared, error) {
+// and visible to readers, together with meta (nil keeps the previous
+// commit's). Writer-side.
+func (p *Pager) PrepareCommit(v *View, meta any) (*Prepared, error) {
 	p.mu.Lock()
 	cur, err := p.prepHdr, p.usable()
 	p.mu.Unlock()
@@ -604,7 +606,7 @@ func (p *Pager) PrepareCommit(v *View) (*Prepared, error) {
 	v.dirty[0] = v.hdr.encode()
 	pages := v.dirty
 	v.dirty = map[uint32][]byte{}
-	return p.prepare(pages, v.hdr)
+	return p.prepare(pages, v.hdr, meta)
 }
 
 // PrepareRaw prepares a page set received from a primary. It must contain
@@ -620,7 +622,15 @@ func (p *Pager) PrepareRaw(pages map[uint32][]byte) (*Prepared, error) {
 	if err != nil {
 		return nil, err
 	}
-	return p.prepare(pages, hdr)
+	return p.prepare(pages, hdr, nil)
+}
+
+// SetPreparedMeta sets the meta published with c, which must not have been
+// flushed yet (for PrepareRaw, whose meta is derived from its own pages).
+func (p *Pager) SetPreparedMeta(c *Prepared, meta any) {
+	p.mu.Lock()
+	c.Meta = meta
+	p.mu.Unlock()
 }
 
 func (p *Pager) usable() error {
@@ -630,11 +640,13 @@ func (p *Pager) usable() error {
 	return p.err
 }
 
-func (p *Pager) prepare(pages map[uint32][]byte, hdr Header) (*Prepared, error) {
+func (p *Pager) prepare(pages map[uint32][]byte, hdr Header, meta any) (*Prepared, error) {
 	for _, b := range pages {
 		seal(b) // the pages are owned by the commit and not yet visible
 	}
-	c := &Prepared{pages: pages, hdr: hdr}
+	// Meta is set before the commit is queued: a concurrent Flush may
+	// publish it at any time after that.
+	c := &Prepared{pages: pages, hdr: hdr, Meta: meta}
 	var offs map[uint32]int64
 	end := p.walSize
 	if p.file != nil {
@@ -769,7 +781,7 @@ func (p *Pager) flushLocked() error {
 
 // Commit is PrepareCommit followed by Flush.
 func (p *Pager) Commit(v *View) error {
-	c, err := p.PrepareCommit(v)
+	c, err := p.PrepareCommit(v, nil)
 	if err != nil {
 		return err
 	}

@@ -280,7 +280,11 @@ func (x *execCtx) children(child *Table, fk *ForeignKey, vals []any) ([]target, 
 				}
 			}
 		}
-		prefix, _ = truncKey(prefix)
+		if len(fk.cols) == len(ix.cols) {
+			prefix, _ = truncKey(prefix)
+		} else {
+			prefix, _ = groupKey(prefix)
+		}
 		var ids []int64
 		c := btree.Open(x.v, ix.Root).Seek(prefix)
 		for ; c.Valid() && bytes.HasPrefix(c.Key(), prefix); c.Next() {

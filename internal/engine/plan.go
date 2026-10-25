@@ -761,7 +761,11 @@ func (x *execCtx) scanIndex(acc *access, e *env, emit func(int64) (bool, error))
 		}
 		prefix = value.AppendKey(prefix, foldValue(k, acc.prefColl[i]))
 	}
-	prefix, _ = truncKey(prefix)
+	if len(acc.prefix) == len(acc.ix.cols) {
+		prefix, _ = truncKey(prefix) // the whole key: find it by hash
+	} else {
+		prefix, _ = groupKey(prefix)
+	}
 	tree := btree.Open(x.v, acc.ix.Root)
 	// collect returns the row ids of entries from start on that keep the
 	// prefix, as long as accept says so.
@@ -796,7 +800,7 @@ func (x *execCtx) scanIndex(acc *access, e *env, emit func(int64) (bool, error))
 	// cut, so that entries sharing it must not be excluded by the scan (the
 	// level's filters check the real condition).
 	bound := func(k any) (b []byte, trunc bool) {
-		return truncKey(value.AppendKey(clone(prefix), foldValue(k, acc.coll)))
+		return groupKey(value.AppendKey(clone(prefix), foldValue(k, acc.coll)))
 	}
 
 	if acc.in != nil {
@@ -811,6 +815,9 @@ func (x *execCtx) scanIndex(acc *access, e *env, emit func(int64) (bool, error))
 				continue
 			}
 			p, _ := bound(k)
+			if len(acc.prefix)+1 == len(acc.ix.cols) {
+				p, _ = truncKey(value.AppendKey(clone(prefix), foldValue(k, acc.coll)))
+			}
 			if seen[string(p)] {
 				continue
 			}
@@ -827,7 +834,7 @@ func (x *execCtx) scanIndex(acc *access, e *env, emit func(int64) (bool, error))
 	if acc.lo == nil && acc.hi == nil {
 		return collect(prefix, prefix, nil)
 	}
-	start, _ := truncKey(append(clone(prefix), value.MinNonNullKey...)) // NULLs never satisfy a range
+	start, _ := groupKey(append(clone(prefix), value.MinNonNullKey...)) // NULLs never satisfy a range
 	var lowPrefix, stop []byte
 	stopInc := false
 	if acc.lo != nil {
@@ -878,13 +885,13 @@ var maxSuffix = []byte{0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF}
 func (x *execCtx) scanIndexReverse(acc *access, e *env, tree *btree.Tree, prefix []byte, emit func(int64) (bool, error)) error {
 	clone := func(b []byte) []byte { return append([]byte(nil), b...) }
 	bound := func(k any) (b []byte, trunc bool) {
-		return truncKey(value.AppendKey(clone(prefix), foldValue(k, acc.coll)))
+		return groupKey(value.AppendKey(clone(prefix), foldValue(k, acc.coll)))
 	}
 	upper := append(clone(prefix), maxSuffix...)
 	var lower []byte // stop below this key
 	lowerExcl := false
 	if acc.lo != nil || acc.hi != nil {
-		lower, _ = truncKey(append(clone(prefix), value.MinNonNullKey...)) // NULLs never satisfy a range
+		lower, _ = groupKey(append(clone(prefix), value.MinNonNullKey...)) // NULLs never satisfy a range
 	}
 	if acc.hi != nil {
 		v, err := acc.hi(e)
@@ -1109,7 +1116,7 @@ func passes(filters []evalFn, e *env) (bool, error) {
 }
 
 // keyOrder passes index entries in scan order to emit. Entries whose key was
-// truncated (see truncKey) are adjacent but ordered by rowid; keyOrder
+// truncated (see truncKey) are adjacent but ordered by hash; keyOrder
 // buffers each such group and emits it sorted by the full key, so index
 // order stays exact for ORDER BY.
 type keyOrder struct {
@@ -1127,7 +1134,7 @@ func (x *execCtx) keyOrder(ix *Index, desc bool, emit func(int64) (bool, error))
 
 func (o *keyOrder) push(key []byte) (bool, error) {
 	part, id := key[:len(key)-8], value.DecodeRowID(key[len(key)-8:])
-	if len(o.group) > 0 && bytes.Equal(part, o.part) {
+	if len(o.group) > 0 && isTruncated(part) && bytes.Equal(truncGroup(part), o.part) {
 		o.group = append(o.group, id)
 		return true, nil
 	}
@@ -1135,7 +1142,7 @@ func (o *keyOrder) push(key []byte) (bool, error) {
 		return cont, err
 	}
 	if isTruncated(part) {
-		o.part = append(o.part[:0], part...)
+		o.part = append(o.part[:0], truncGroup(part)...)
 		o.group = append(o.group, id)
 		return true, nil
 	}

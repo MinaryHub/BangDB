@@ -319,7 +319,8 @@ func (db *DB) ApplyFrame(f Frame) error {
 	if err != nil {
 		return err
 	}
-	db.prepared(c, cat)
+	db.p.SetPreparedMeta(c, cat)
+	db.prepared(cat)
 	return db.p.Flush(c)
 }
 

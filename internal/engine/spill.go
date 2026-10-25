@@ -30,9 +30,10 @@ func (x *execCtx) spillCfg() *spillConfig {
 	return defaultSpill
 }
 
-// rowBytes estimates the memory used by a row of values.
+// rowBytes estimates the memory used by a row of values: the slice, the
+// interface values and their boxed contents.
 func rowBytes(row []any) int {
-	n := 24 + 16*len(row)
+	n := 48 + 40*len(row)
 	for _, v := range row {
 		switch v := v.(type) {
 		case string:

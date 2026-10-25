@@ -116,6 +116,7 @@ r.Promote()   // 복제 중단 + 쓰기 가능 + 새 DBID 부여
 | 로그 보관 | 메모리 기반. `LogSize`를 넘게 뒤처지면 다음 접속 시 스냅샷으로 재동기화 (자동). 스냅샷 전송 시간 동안 쌓이는 커밋이 로그 상한(최소 256MiB)을 넘으면 재시도됨 |
 | 보안 | 토큰 인증 기본 제공. 암호화가 필요하면 `Serve(tls.Listener)` / `ReplicaOptions.Dial`로 TLS 연결 사용 |
 | 계단식 복제 | replica를 승격하거나, primary가 아닌 노드에서 `NewPrimary`를 띄우면 가능 (승격 시 새 DBID) |
+| VACUUM | primary에서 `VACUUM`을 실행하면 파일 배치가 바뀌므로 **새 DBID**가 부여되고 연결된 replica는 끊긴 뒤 자동으로 전체 스냅샷을 다시 받습니다 (`TestReplicaResyncsAfterVacuum`). replica에서는 실행할 수 없음(읽기 전용) |
 
 ## 5. 향후 확장 후보
 
