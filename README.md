@@ -3,11 +3,12 @@
 Go로 작성된 **경량 임베디드 관계형 데이터베이스**입니다. 외부 의존성 0개, 단일 파일 저장, 프로젝트에 라이브러리로 바로 넣어 쓰는 것을 목표로 합니다 (SQLite와 같은 사용 방식).
 
 - 순수 Go, 표준 라이브러리만 사용 (`go.mod`에 require 없음)
-- 단일 파일 + WAL(`<파일>-wal`) 기반 **원자적·내구성 있는 커밋과 크래시 복구**
+- 단일 파일 + WAL(`<파일>-wal`) 기반 **원자적·내구성 있는 커밋과 크래시 복구**, 페이지 체크섬, 무결성 검사(`IntegrityCheck`)
 - `:memory:` 인메모리 모드
 - SQL: `CREATE/DROP TABLE`, `ALTER TABLE ADD COLUMN`, `CREATE [UNIQUE] INDEX`, `INSERT/SELECT/UPDATE/DELETE`, `JOIN`(INNER/LEFT/CROSS), `GROUP BY/HAVING`, `ORDER BY`, `LIMIT/OFFSET`, `DISTINCT`, `CASE`, `IN`, `BETWEEN`, `LIKE`, 집계/스칼라 함수, `EXPLAIN`
 - B+트리 기반 테이블/인덱스, 인덱스를 활용하는 쿼리 플래너 (rowid·인덱스 동등/범위/IN 검색, 조인 시 인덱스 lookup)
-- 트랜잭션: `BEGIN/COMMIT/ROLLBACK`, 문장 단위 원자성, **읽기는 쓰기 트랜잭션에 막히지 않음** (커밋된 스냅샷을 읽음)
+- 트랜잭션: `BEGIN/COMMIT/ROLLBACK`, 문장 단위 원자성, **스냅샷 읽기** — 읽기와 쓰기가 서로를 기다리지 않음
+- 스트리밍 결과 커서, `context` 기반 쿼리 취소·타임아웃
 - **온라인 백업**(서비스 중단 없이 일관된 백업 파일 생성)과 **primary → replica 미러링**(읽기 스케일 아웃, 자동 재접속, 장애 조치 승격)
 - `database/sql` 드라이버(`bangdb`) 및 대화형 CLI 제공
 
@@ -25,8 +26,10 @@ go get github.com/knoxxr/bangdb
 package main
 
 import (
+	"context"
 	"fmt"
 	"log"
+	"time"
 
 	"github.com/knoxxr/bangdb"
 )
@@ -60,13 +63,23 @@ func main() {
 		return err
 	})
 
-	rows, _ := db.Query(`SELECT id, name, age FROM users WHERE age > ? ORDER BY age DESC`, 20)
+	// 결과는 스트리밍됩니다. 끝까지 읽지 않을 때는 반드시 Close 하세요.
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	rows, err := db.QueryContext(ctx, `SELECT id, name, age FROM users WHERE age > ? ORDER BY age DESC`, 20)
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer rows.Close()
 	for rows.Next() {
 		var id int64
 		var name string
 		var age int
 		rows.Scan(&id, &name, &age)
 		fmt.Println(id, name, age)
+	}
+	if err := rows.Err(); err != nil { // 예: 타임아웃
+		log.Fatal(err)
 	}
 
 	var count int
@@ -147,9 +160,12 @@ SEARCH users USING ROWID (rowid=?)
 
 ## 동시성과 내구성
 
+- **스냅샷 읽기**: 각 조회는 시작 시점의 커밋 상태를 읽습니다. 오래 걸리는 조회가 있어도 커밋은 기다리지 않고, 조회는 그 사이의 커밋을 보지 않습니다.
 - 쓰기 트랜잭션은 한 번에 하나입니다. 다른 쓰기는 `BusyTimeout`(기본 5초)까지 기다린 뒤 `ErrBusy`를 반환합니다.
-- 읽기는 진행 중인 쓰기 트랜잭션과 무관하게 **마지막으로 커밋된 상태**를 읽습니다. 커밋을 반영하는 짧은 순간에만 대기합니다.
-- 커밋 순서: 변경 페이지를 WAL에 기록 → fsync → DB 파일에 반영 → fsync → WAL 비움. 어느 단계에서 프로세스가 죽어도 다음 `Open` 시 커밋된 트랜잭션은 복구되고, 완료되지 않은 트랜잭션은 버려집니다.
+- **커밋**: 변경 페이지를 WAL에 추가하고 fsync 1회 후 공개합니다. WAL이 1,000페이지를 넘으면 열린 스냅샷이 허용하는 범위까지 DB 파일로 옮기는 체크포인트가 자동 실행됩니다.
+- **크래시 복구**: 다음 `Open` 시 WAL의 완전한 커밋만 재적용하고 잘린 커밋은 버립니다. `kill -9` 반복 테스트로 "응답한 커밋은 모두 남고, 진행 중이던 커밋은 전부 반영되거나 전혀 반영되지 않음"을 검증합니다.
+- **손상 감지**: 모든 페이지에 CRC32가 있어 디스크에서 읽을 때 검증합니다. `db.IntegrityCheck()`(CLI `.check`)는 트리 구조, 페이지 누수/중복 사용, 인덱스와 테이블 일치를 검사합니다.
+- **취소·타임아웃**: `ExecContext/QueryContext`의 context나 `Options.QueryTimeout`으로 실행 중인 문장을 중단하고 롤백합니다.
 - 한 파일은 한 프로세스만 열 수 있습니다 (Unix `flock`).
 
 ## 성능 (참고치)
@@ -158,25 +174,29 @@ SEARCH users USING ROWID (rowid=?)
 
 | 작업 | 시간 |
 |------|------|
-| 트랜잭션 내 INSERT (인덱스 1개 포함) | ~27 µs/행 |
-| 자동 커밋 INSERT (fsync 2회) | ~0.65 ms/행 |
+| 트랜잭션 내 INSERT (인덱스 1개 포함) | ~23 µs/행 |
+| 자동 커밋 INSERT (fsync 1회) | ~0.5 ms/행 |
 | PK 조회 (10만 행) | ~9 µs |
 | 보조 인덱스 조회 (10만 행) | ~13 µs |
 | 10만 행 전체 스캔 + GROUP BY | ~34 ms |
+| 20만 행 `SELECT *` 스트리밍 | 힙 증가 ~6 MB |
 
 대량 삽입은 반드시 트랜잭션으로 묶으세요.
 
 ## 현재 제약 사항
 
-> 실서비스 투입 전 보완 항목과 개발 계획은 [docs/ROADMAP.md](docs/ROADMAP.md)를 보세요. 특히 **오래 걸리는 읽기 쿼리는 그동안의 모든 커밋을 대기시킵니다** (인덱스 없는 조인 등). `EXPLAIN`으로 전체 스캔 여부를 확인하세요.
+> 보완 항목과 개발 계획은 [docs/ROADMAP.md](docs/ROADMAP.md)를 보세요.
 
-- 서브쿼리, `UNION`, 뷰, 외래 키, `CHECK`, 트리거 미지원
+- 서브쿼리, `UNION`, `UPSERT`, 뷰, 외래 키, `CHECK`, 트리거 미지원
 - 인덱스와 PRIMARY KEY는 단일 컬럼만 지원
-- 삭제 시 B+트리 재균형을 하지 않음 → 삭제로 생긴 빈 공간은 같은 트리에서 재사용되거나 `DROP TABLE` 시 회수 (VACUUM 없음)
-- 쿼리 결과는 메모리에 모두 적재된 뒤 반환됨 (스트리밍 커서 아님)
+- 인덱스 없는 조인은 nested loop라 느립니다 (`EXPLAIN`으로 `SCAN` 확인). 취소·타임아웃으로 상한을 두세요
+- `ORDER BY`(LIMIT 없음)·`GROUP BY`·`DISTINCT` 결과는 메모리에서 처리됨 (외부 정렬 없음)
+- 삭제 시 B+트리 재균형을 하지 않음 → 빈 공간은 같은 트리에서 재사용되거나 `DROP TABLE` 시 회수 (VACUUM 없음)
+- 열린 `Rows`·긴 조회는 그 시점 이후의 체크포인트를 막아 WAL이 커질 수 있음 → 다 읽은 `Rows`는 닫기
 - 하나의 쓰기 트랜잭션에서 변경한 페이지는 커밋 전까지 메모리에 유지됨
 - 인덱스 키 최대 약 500바이트 (긴 TEXT 컬럼은 인덱싱 불가)
 - 이름 있는 파라미터(`:name`) 미지원, `?`만 사용
+- 파일 포맷 버전 3. 개발 중 버전(1, 2)으로 만든 파일은 열 수 없음
 
 ## 문서
 
