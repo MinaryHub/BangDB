@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"sort"
@@ -678,11 +679,10 @@ func (x *execCtx) execUpdate(st *sql.Update) (Result, error) {
 			}
 		}
 		for _, ix := range t.indexes {
-			if newID == tg.rowid && value.Compare(tg.row[ix.col], newRow[ix.col]) == 0 &&
-				value.TypeOf(tg.row[ix.col]) == value.TypeOf(newRow[ix.col]) {
+			if newID == tg.rowid && bytes.Equal(ix.key(tg.row), ix.key(newRow)) {
 				continue
 			}
-			if err := x.checkUnique(t, ix, newRow[ix.col], tg.rowid); err != nil {
+			if err := x.checkUnique(t, ix, newRow, tg.rowid); err != nil {
 				return Result{}, err
 			}
 		}
@@ -706,7 +706,7 @@ func (x *execCtx) execUpdate(st *sql.Update) (Result, error) {
 // writeRow stores a row and its index entries without constraint checks.
 func (x *execCtx) writeRow(t *Table, rowid int64, row []any) error {
 	for _, ix := range t.indexes {
-		k, err := indexEntry(row[ix.col], rowid)
+		k, err := indexEntry(ix, row, rowid)
 		if err != nil {
 			return err
 		}

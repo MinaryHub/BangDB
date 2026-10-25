@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"sort"
+	"strings"
 
 	"github.com/knoxxr/bangdb/internal/btree"
 	"github.com/knoxxr/bangdb/internal/value"
@@ -174,11 +175,15 @@ func (x *execCtx) checkIndex(t *Table, ix *Index, rows int, add func(string, ...
 			add("index %s points to missing row %d of %s", ix.Name, rowid, t.Name)
 			continue
 		}
-		if want := value.AppendKey(nil, row[ix.col]); !bytes.Equal(want, valPart) {
-			add("index %s entry for row %d does not match the row's %s", ix.Name, rowid, ix.Column)
+		if want := ix.key(row); !bytes.Equal(want, valPart) {
+			add("index %s entry for row %d does not match the row's %s", ix.Name, rowid, ix.columnList())
 		}
-		if ix.Unique && prevVal != nil && bytes.Equal(prevVal, valPart) && row[ix.col] != nil {
-			add("unique index %s has duplicate value %s", ix.Name, value.Format(row[ix.col]))
+		if ix.Unique && prevVal != nil && bytes.Equal(prevVal, valPart) && !ix.hasNull(row) {
+			var vals []string
+			for _, c := range ix.cols {
+				vals = append(vals, value.Format(row[c]))
+			}
+			add("unique index %s has duplicate value %s", ix.Name, strings.Join(vals, ", "))
 		}
 		prevVal = append(prevVal[:0], valPart...)
 	}

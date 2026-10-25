@@ -57,7 +57,7 @@ func TestIntegrityCheckFindsDamage(t *testing.T) {
 	}{
 		{"missing index entry", func(tx *Tx) {
 			ix := tx.cat.index("t_body")
-			k, _ := indexEntry("y", 2)
+			k, _ := indexEntry(ix, []any{int64(2), "b", "y"}, 2)
 			btree.Open(tx.v, ix.Root).Delete(k)
 		}, "has 2 entries but table t has 3 rows"},
 		{"stale index value", func(tx *Tx) {
@@ -68,7 +68,7 @@ func TestIntegrityCheckFindsDamage(t *testing.T) {
 			tbl := tx.cat.table("t")
 			btree.Open(tx.v, tbl.Root).Put(value.EncodeRowID(4), value.EncodeRow([]any{int64(4), "a", "w"}))
 			for _, ix := range tbl.indexes {
-				k, _ := indexEntry([]any{int64(4), "a", "w"}[ix.col], 4)
+				k, _ := indexEntry(ix, []any{int64(4), "a", "w"}, 4)
 				btree.Open(tx.v, ix.Root).Put(k, nil)
 			}
 		}, "has duplicate value a"},

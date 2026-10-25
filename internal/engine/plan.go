@@ -19,21 +19,26 @@ const (
 	accRowidEq
 	accRowidIn
 	accRowidRange
-	accIndexEq
-	accIndexIn
-	accIndexRange
+	accIndex
 )
 
 // access is the chosen access path for one table.
+//
+// Index paths use equality on the first len(prefix) index columns, then
+// optionally an IN list or a range on the next column.
 type access struct {
 	kind   accessKind
-	ix     *Index     // for index paths
-	colTyp value.Type // type of the key column
-	eq     []evalFn   // eq (1 element) or IN list
+	colTyp value.Type // rowid paths: Integer; index paths: type of the IN/range column
+	eq     []evalFn   // rowid: = (1 element) or IN list
 	lo, hi evalFn
 	loInc  bool
 	hiInc  bool
-	desc   string
+
+	ix      *Index
+	prefix  []evalFn
+	prefTyp []value.Type
+	in      []evalFn
+	desc    string
 }
 
 // level is one table in a FROM/JOIN chain.
@@ -106,7 +111,7 @@ var flipOp = map[string]string{"=": "=", "<": ">", "<=": ">=", ">": "<", ">=": "
 // chooseAccess picks the cheapest access path for level li given the
 // conditions that may be used to locate its rows.
 func chooseAccess(sc *scope, l *level, li int, conds []sql.Expr, c *compiler) (*access, error) {
-	var cands []candidate
+	byCol := map[int][]candidate{}
 	for _, e := range conds {
 		switch x := e.(type) {
 		case *sql.Binary:
@@ -115,9 +120,9 @@ func chooseAccess(sc *scope, l *level, li int, conds []sql.Expr, c *compiler) (*
 				continue
 			}
 			if col, ok := columnOf(x.L, sc, l, li); ok && refsBelow(x.R, sc, li) {
-				cands = append(cands, candidate{col: col, op: x.Op, other: x.R})
+				byCol[col] = append(byCol[col], candidate{col: col, op: x.Op, other: x.R})
 			} else if col, ok := columnOf(x.R, sc, l, li); ok && refsBelow(x.L, sc, li) {
-				cands = append(cands, candidate{col: col, op: op, other: x.L})
+				byCol[col] = append(byCol[col], candidate{col: col, op: op, other: x.L})
 			}
 		case *sql.In:
 			if x.Not {
@@ -129,145 +134,182 @@ func chooseAccess(sc *scope, l *level, li int, conds []sql.Expr, c *compiler) (*
 					all = all && refsBelow(a, sc, li)
 				}
 				if all {
-					cands = append(cands, candidate{col: col, op: "IN", list: x.List})
+					byCol[col] = append(byCol[col], candidate{col: col, op: "IN", list: x.List})
 				}
 			}
 		}
 	}
-	indexFor := func(col int) *Index {
-		var best *Index
-		for _, ix := range l.t.indexes {
-			if ix.col == col && l.t.Columns[col].Type != value.Any && (best == nil || ix.Unique && !best.Unique) {
-				best = ix
+	find := func(col int, ops ...string) *candidate {
+		for i, cd := range byCol[col] {
+			for _, op := range ops {
+				if cd.op == op {
+					return &byCol[col][i]
+				}
 			}
 		}
-		return best
+		return nil
+	}
+	compileList := func(list []sql.Expr) ([]evalFn, error) {
+		var out []evalFn
+		for _, e := range list {
+			f, err := c.compile(e)
+			if err != nil {
+				return nil, err
+			}
+			out = append(out, f)
+		}
+		return out, nil
 	}
 	name := l.t.Name
-	compile := func(e sql.Expr) (evalFn, error) { return c.compile(e) }
-	// Priority: equality on rowid, unique index, index; IN lists; ranges.
-	for _, pass := range []string{"=", "IN"} {
-		var best *access
-		for _, cd := range cands {
-			if cd.op != pass {
-				continue
-			}
-			var fns []evalFn
-			if pass == "=" {
-				f, err := compile(cd.other)
-				if err != nil {
-					return nil, err
-				}
-				fns = []evalFn{f}
-			} else {
-				for _, a := range cd.list {
-					f, err := compile(a)
-					if err != nil {
-						return nil, err
-					}
-					fns = append(fns, f)
-				}
-			}
-			if cd.col < 0 {
-				k := accRowidEq
-				if pass == "IN" {
-					k = accRowidIn
-				}
-				return &access{kind: k, eq: fns, colTyp: value.Integer,
-					desc: fmt.Sprintf("SEARCH %s USING ROWID (%s)", name, describeOp("rowid", pass, len(fns)))}, nil
-			}
-			ix := indexFor(cd.col)
-			if ix == nil || best != nil && (best.ix.Unique || !ix.Unique) {
-				continue
-			}
-			k := accIndexEq
-			if pass == "IN" {
-				k = accIndexIn
-			}
-			best = &access{kind: k, ix: ix, eq: fns, colTyp: l.t.Columns[cd.col].Type,
-				desc: fmt.Sprintf("SEARCH %s USING INDEX %s (%s)", name, ix.Name, describeOp(ix.Column, pass, len(fns)))}
+
+	// Equality on the rowid always wins.
+	if cd := find(-1, "="); cd != nil {
+		fns, err := compileList([]sql.Expr{cd.other})
+		if err != nil {
+			return nil, err
 		}
-		if best != nil {
-			return best, nil
+		return &access{kind: accRowidEq, eq: fns, colTyp: value.Integer,
+			desc: fmt.Sprintf("SEARCH %s USING ROWID (rowid=?)", name)}, nil
+	}
+
+	// Score every index by how much of its key the conditions pin down.
+	type plan struct {
+		ix    *Index
+		eqN   int
+		in    *candidate
+		rng   bool
+		score int
+	}
+	var best *plan
+	for _, ix := range l.t.indexes {
+		p := &plan{ix: ix}
+		for _, col := range ix.cols {
+			if l.t.Columns[col].Type == value.Any || find(col, "=") == nil {
+				break
+			}
+			p.eqN++
 		}
-	}
-	// Ranges: prefer rowid, then any index. Combine lower and upper bounds.
-	type rng struct {
-		lo, hi       sql.Expr
-		loInc, hiInc bool
-	}
-	ranges := map[int]*rng{}
-	order := []int{}
-	for _, cd := range cands {
-		if cd.op == "=" || cd.op == "IN" {
+		if p.eqN < len(ix.cols) && l.t.Columns[ix.cols[p.eqN]].Type != value.Any {
+			next := ix.cols[p.eqN]
+			p.in = find(next, "IN")
+			p.rng = p.in == nil && find(next, "<", "<=", ">", ">=") != nil
+		}
+		switch {
+		case p.eqN == len(ix.cols) && ix.Unique:
+			p.score = 900
+		case p.eqN > 0:
+			p.score = 100 + 10*p.eqN
+			if p.in != nil {
+				p.score += 5
+			} else if p.rng {
+				p.score += 3
+			}
+			if ix.Unique {
+				p.score++
+			}
+		case p.in != nil:
+			p.score = 70
+		case p.rng:
+			p.score = 40
+		default:
 			continue
 		}
-		if cd.col >= 0 && indexFor(cd.col) == nil {
-			continue
-		}
-		r := ranges[cd.col]
-		if r == nil {
-			r = &rng{}
-			ranges[cd.col] = r
-			order = append(order, cd.col)
-		}
-		switch cd.op {
-		case ">", ">=":
-			if r.lo == nil {
-				r.lo, r.loInc = cd.other, cd.op == ">="
-			}
-		case "<", "<=":
-			if r.hi == nil {
-				r.hi, r.hiInc = cd.other, cd.op == "<="
-			}
+		if best == nil || p.score > best.score {
+			best = p
 		}
 	}
-	pick := -2
-	for _, col := range order {
-		if col == -1 {
-			pick = -1
-			break
+	rowidIn, rowidRange := find(-1, "IN"), find(-1, "<", "<=", ">", ">=") != nil
+	switch {
+	case best != nil && best.score >= 100:
+	case rowidIn != nil:
+		fns, err := compileList(rowidIn.list)
+		if err != nil {
+			return nil, err
 		}
-		if pick == -2 {
-			pick = col
+		return &access{kind: accRowidIn, eq: fns, colTyp: value.Integer,
+			desc: fmt.Sprintf("SEARCH %s USING ROWID (rowid IN (%d values))", name, len(fns))}, nil
+	case best != nil && best.score >= 70:
+	case rowidRange:
+		a := &access{kind: accRowidRange, colTyp: value.Integer}
+		parts, err := setRange(a, byCol[-1], "rowid", c)
+		if err != nil {
+			return nil, err
 		}
-	}
-	if pick == -2 {
+		a.desc = fmt.Sprintf("SEARCH %s USING ROWID RANGE (%s)", name, strings.Join(parts, " AND "))
+		return a, nil
+	case best == nil:
 		return &access{kind: accFull, desc: "SCAN " + name}, nil
 	}
-	r := ranges[pick]
-	a := &access{loInc: r.loInc, hiInc: r.hiInc}
-	var err error
-	if r.lo != nil {
-		if a.lo, err = compile(r.lo); err != nil {
+
+	ix := best.ix
+	a := &access{kind: accIndex, ix: ix}
+	var parts []string
+	for _, col := range ix.cols[:best.eqN] {
+		f, err := c.compile(find(col, "=").other)
+		if err != nil {
 			return nil, err
 		}
+		a.prefix = append(a.prefix, f)
+		a.prefTyp = append(a.prefTyp, l.t.Columns[col].Type)
+		parts = append(parts, l.t.Columns[col].Name+"=?")
 	}
-	if r.hi != nil {
-		if a.hi, err = compile(r.hi); err != nil {
-			return nil, err
+	if best.eqN < len(ix.cols) {
+		next := ix.cols[best.eqN]
+		a.colTyp = l.t.Columns[next].Type
+		colName := l.t.Columns[next].Name
+		if best.in != nil {
+			fns, err := compileList(best.in.list)
+			if err != nil {
+				return nil, err
+			}
+			a.in = fns
+			parts = append(parts, fmt.Sprintf("%s IN (%d values)", colName, len(fns)))
+		} else if best.rng {
+			rp, err := setRange(a, byCol[next], colName, c)
+			if err != nil {
+				return nil, err
+			}
+			parts = append(parts, rp...)
 		}
 	}
-	colName := "rowid"
-	if pick == -1 {
-		a.kind, a.colTyp = accRowidRange, value.Integer
-	} else {
-		a.kind, a.ix, a.colTyp = accIndexRange, indexFor(pick), l.t.Columns[pick].Type
-		colName = a.ix.Column
+	kind := ""
+	if best.rng {
+		kind = " RANGE"
+	}
+	a.desc = fmt.Sprintf("SEARCH %s USING INDEX %s%s (%s)", name, ix.Name, kind, strings.Join(parts, " AND "))
+	return a, nil
+}
+
+// setRange fills a's bounds from the range candidates of one column.
+func setRange(a *access, cands []candidate, colName string, c *compiler) ([]string, error) {
+	var lo, hi sql.Expr
+	for _, cd := range cands {
+		switch cd.op {
+		case ">", ">=":
+			if lo == nil {
+				lo, a.loInc = cd.other, cd.op == ">="
+			}
+		case "<", "<=":
+			if hi == nil {
+				hi, a.hiInc = cd.other, cd.op == "<="
+			}
+		}
 	}
 	var parts []string
-	if r.lo != nil {
-		parts = append(parts, colName+map[bool]string{true: ">=", false: ">"}[r.loInc]+"?")
+	var err error
+	if lo != nil {
+		if a.lo, err = c.compile(lo); err != nil {
+			return nil, err
+		}
+		parts = append(parts, colName+map[bool]string{true: ">=", false: ">"}[a.loInc]+"?")
 	}
-	if r.hi != nil {
-		parts = append(parts, colName+map[bool]string{true: "<=", false: "<"}[r.hiInc]+"?")
+	if hi != nil {
+		if a.hi, err = c.compile(hi); err != nil {
+			return nil, err
+		}
+		parts = append(parts, colName+map[bool]string{true: "<=", false: "<"}[a.hiInc]+"?")
 	}
-	if pick == -1 {
-		a.desc = fmt.Sprintf("SEARCH %s USING ROWID RANGE (%s)", name, strings.Join(parts, " AND "))
-	} else {
-		a.desc = fmt.Sprintf("SEARCH %s USING INDEX %s RANGE (%s)", name, a.ix.Name, strings.Join(parts, " AND "))
-	}
-	return a, nil
+	return parts, nil
 }
 
 func describeOp(col, op string, n int) string {
@@ -365,51 +407,25 @@ func (x *execCtx) scan(t *Table, acc *access, e *env, visit func(rowid int64, ro
 		return fn(rowid, row)
 	}
 	switch acc.kind {
-	case accRowidEq, accRowidIn, accIndexEq, accIndexIn:
-		seen := map[string]bool{}
+	case accRowidEq, accRowidIn:
+		seen := map[int64]bool{}
 		for _, f := range acc.eq {
 			v, err := f(e)
 			if err != nil {
 				return err
 			}
-			k, ok := keyValue(v, acc.colTyp)
-			if !ok {
+			k, ok := keyValue(v, value.Integer)
+			if !ok || seen[k.(int64)] {
 				continue // NULL or incomparable type: cannot be equal
 			}
-			if acc.kind == accRowidEq || acc.kind == accRowidIn {
-				key := value.EncodeRowID(k.(int64))
-				if seen[string(key)] {
-					continue
-				}
-				seen[string(key)] = true
-				if cont, err := emit(k.(int64)); err != nil || !cont {
-					return err
-				}
-				continue
-			}
-			prefix := value.AppendKey(nil, k)
-			if seen[string(prefix)] {
-				continue
-			}
-			seen[string(prefix)] = true
-			var ids []int64
-			c := btree.Open(x.v, acc.ix.Root).Seek(prefix)
-			for ; c.Valid() && bytes.HasPrefix(c.Key(), prefix); c.Next() {
-				if err := x.tick(); err != nil {
-					return err
-				}
-				ids = append(ids, value.DecodeRowID(c.Key()[len(prefix):]))
-			}
-			if err := c.Err(); err != nil {
+			seen[k.(int64)] = true
+			if cont, err := emit(k.(int64)); err != nil || !cont {
 				return err
-			}
-			for _, id := range ids {
-				if cont, err := emit(id); err != nil || !cont {
-					return err
-				}
 			}
 		}
 		return nil
+	case accIndex:
+		return x.scanIndex(acc, e, emit)
 	case accRowidRange:
 		start := []byte(nil)
 		var stop []byte
@@ -466,67 +482,6 @@ func (x *execCtx) scan(t *Table, acc *access, e *env, visit func(rowid int64, ro
 			}
 		}
 		return c.Err()
-	case accIndexRange:
-		start := value.MinNonNullKey
-		var lowPrefix, stop []byte
-		stopInc := false
-		if acc.lo != nil {
-			v, err := acc.lo(e)
-			if err != nil {
-				return err
-			}
-			if v == nil {
-				return nil
-			}
-			if k, ok, inc := rangeBound(v, acc.colTyp, true, acc.loInc); ok {
-				start = value.AppendKey(nil, k)
-				if !inc {
-					lowPrefix = start
-				}
-			}
-		}
-		if acc.hi != nil {
-			v, err := acc.hi(e)
-			if err != nil {
-				return err
-			}
-			if v == nil {
-				return nil
-			}
-			if k, ok, inc := rangeBound(v, acc.colTyp, false, acc.hiInc); ok {
-				stop, stopInc = value.AppendKey(nil, k), inc
-			}
-		}
-		var ids []int64
-		c := btree.Open(x.v, acc.ix.Root).Seek(start)
-		for ; c.Valid(); c.Next() {
-			if err := x.tick(); err != nil {
-				return err
-			}
-			key := c.Key()
-			if lowPrefix != nil && bytes.HasPrefix(key, lowPrefix) {
-				continue
-			}
-			if stop != nil {
-				if bytes.HasPrefix(key, stop) {
-					if !stopInc {
-						break
-					}
-				} else if bytes.Compare(key, stop) > 0 {
-					break
-				}
-			}
-			ids = append(ids, value.DecodeRowID(key[len(key)-8:]))
-		}
-		if err := c.Err(); err != nil {
-			return err
-		}
-		for _, id := range ids {
-			if cont, err := emit(id); err != nil || !cont {
-				return err
-			}
-		}
-		return nil
 	}
 	c := tree.Seek(nil)
 	for ; c.Valid(); c.Next() {
@@ -543,6 +498,120 @@ func (x *execCtx) scan(t *Table, acc *access, e *env, visit func(rowid int64, ro
 		}
 	}
 	return c.Err()
+}
+
+// scanIndex visits the rows located by an index access path: equality on
+// the leading columns, then an IN list or a range on the next column. Row ids
+// are collected before rows are fetched so that callers may modify the table.
+func (x *execCtx) scanIndex(acc *access, e *env, emit func(int64) (bool, error)) error {
+	var prefix []byte
+	for i, f := range acc.prefix {
+		v, err := f(e)
+		if err != nil {
+			return err
+		}
+		k, ok := keyValue(v, acc.prefTyp[i])
+		if !ok {
+			return nil // NULL or incomparable: no row can be equal
+		}
+		prefix = value.AppendKey(prefix, k)
+	}
+	tree := btree.Open(x.v, acc.ix.Root)
+	// collect returns the row ids of entries from start on that keep the
+	// prefix, as long as accept says so.
+	collect := func(start, prefix []byte, accept func(key []byte) (keep, more bool)) error {
+		var ids []int64
+		c := tree.Seek(start)
+		for ; c.Valid() && bytes.HasPrefix(c.Key(), prefix); c.Next() {
+			if err := x.tick(); err != nil {
+				return err
+			}
+			keep, more := true, true
+			if accept != nil {
+				keep, more = accept(c.Key())
+			}
+			if !more {
+				break
+			}
+			if keep {
+				ids = append(ids, value.DecodeRowID(c.Key()[len(c.Key())-8:]))
+			}
+		}
+		if err := c.Err(); err != nil {
+			return err
+		}
+		for _, id := range ids {
+			if cont, err := emit(id); err != nil || !cont {
+				return err
+			}
+		}
+		return nil
+	}
+	clone := func(b []byte) []byte { return append([]byte(nil), b...) }
+
+	if acc.in != nil {
+		seen := map[string]bool{}
+		for _, f := range acc.in {
+			v, err := f(e)
+			if err != nil {
+				return err
+			}
+			k, ok := keyValue(v, acc.colTyp)
+			if !ok {
+				continue
+			}
+			p := value.AppendKey(clone(prefix), k)
+			if seen[string(p)] {
+				continue
+			}
+			seen[string(p)] = true
+			if err := collect(p, p, nil); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	if acc.lo == nil && acc.hi == nil {
+		return collect(prefix, prefix, nil)
+	}
+	start := append(clone(prefix), value.MinNonNullKey...) // NULLs never satisfy a range
+	var lowPrefix, stop []byte
+	stopInc := false
+	if acc.lo != nil {
+		v, err := acc.lo(e)
+		if err != nil || v == nil {
+			return err
+		}
+		if k, ok, inc := rangeBound(v, acc.colTyp, true, acc.loInc); ok {
+			start = value.AppendKey(clone(prefix), k)
+			if !inc {
+				lowPrefix = start
+			}
+		}
+	}
+	if acc.hi != nil {
+		v, err := acc.hi(e)
+		if err != nil || v == nil {
+			return err
+		}
+		if k, ok, inc := rangeBound(v, acc.colTyp, false, acc.hiInc); ok {
+			stop, stopInc = value.AppendKey(clone(prefix), k), inc
+		}
+	}
+	return collect(start, prefix, func(key []byte) (bool, bool) {
+		if lowPrefix != nil && bytes.HasPrefix(key, lowPrefix) {
+			return false, true
+		}
+		if stop != nil {
+			if bytes.HasPrefix(key, stop) {
+				return stopInc, stopInc
+			}
+			if bytes.Compare(key, stop) > 0 {
+				return false, false
+			}
+		}
+		return true, true
+	})
 }
 
 // buildLevels resolves the FROM clause into a scope and per-table levels,

@@ -21,6 +21,8 @@ type CreateTable struct {
 	Name        string
 	IfNotExists bool
 	Columns     []ColumnDef
+	PrimaryKey  []string   // table constraint PRIMARY KEY (a, b, ...)
+	Uniques     [][]string // table constraints UNIQUE (a, b, ...)
 }
 
 type DropTable struct {
@@ -36,7 +38,7 @@ type AlterTableAddColumn struct {
 type CreateIndex struct {
 	Name        string
 	Table       string
-	Column      string
+	Columns     []string
 	Unique      bool
 	IfNotExists bool
 }

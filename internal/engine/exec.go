@@ -108,8 +108,8 @@ func (x *execCtx) getRow(t *Table, rowid int64) ([]any, bool, error) {
 	return row, err == nil, err
 }
 
-func indexEntry(val any, rowid int64) ([]byte, error) {
-	k := value.AppendKey(nil, val)
+func indexEntry(ix *Index, row []any, rowid int64) ([]byte, error) {
+	k := ix.key(row)
 	k = append(k, value.EncodeRowID(rowid)...)
 	if len(k) > btree.MaxKey {
 		return nil, fmt.Errorf("bangdb: value too large to be indexed (max %d bytes)", btree.MaxKey-16)
@@ -117,15 +117,15 @@ func indexEntry(val any, rowid int64) ([]byte, error) {
 	return k, nil
 }
 
-// checkUnique fails if another row (not self) already has val in ix.
-func (x *execCtx) checkUnique(t *Table, ix *Index, val any, self int64) error {
-	if !ix.Unique || val == nil {
+// checkUnique fails if another row (not self) has the same values in ix.
+func (x *execCtx) checkUnique(t *Table, ix *Index, row []any, self int64) error {
+	if !ix.Unique || ix.hasNull(row) {
 		return nil
 	}
-	prefix := value.AppendKey(nil, val)
+	prefix := ix.key(row)
 	for c := btree.Open(x.v, ix.Root).Seek(prefix); c.Valid() && bytes.HasPrefix(c.Key(), prefix); c.Next() {
 		if value.DecodeRowID(c.Key()[len(prefix):]) != self {
-			return constraintErr("UNIQUE constraint failed: %s.%s", t.Name, ix.Column)
+			return constraintErr("UNIQUE constraint failed: %s.%s", t.Name, strings.Join(ix.Columns, ", "+t.Name+"."))
 		}
 	}
 	return nil
@@ -256,12 +256,12 @@ func (x *execCtx) insertRow(t *Table, row []any) (int64, error) {
 		}
 	}
 	for _, ix := range t.indexes {
-		if err := x.checkUnique(t, ix, row[ix.col], rowid); err != nil {
+		if err := x.checkUnique(t, ix, row, rowid); err != nil {
 			return 0, err
 		}
 	}
 	for _, ix := range t.indexes {
-		k, err := indexEntry(row[ix.col], rowid)
+		k, err := indexEntry(ix, row, rowid)
 		if err != nil {
 			return 0, err
 		}
@@ -274,7 +274,7 @@ func (x *execCtx) insertRow(t *Table, row []any) (int64, error) {
 
 func (x *execCtx) deleteRow(t *Table, rowid int64, row []any) error {
 	for _, ix := range t.indexes {
-		k, err := indexEntry(row[ix.col], rowid)
+		k, err := indexEntry(ix, row, rowid)
 		if err != nil {
 			return err
 		}
@@ -305,7 +305,7 @@ func (x *execCtx) createTable(st *sql.CreateTable) error {
 		return fmt.Errorf("bangdb: table names starting with bangdb_ are reserved")
 	}
 	t := &Table{Name: st.Name, RowidCol: -1}
-	pkCount := 0
+	var pkCols []int
 	for _, cd := range st.Columns {
 		if t.ColIndex(cd.Name) >= 0 {
 			return fmt.Errorf("bangdb: duplicate column name: %s", cd.Name)
@@ -315,21 +315,83 @@ func (x *execCtx) createTable(st *sql.CreateTable) error {
 			return err
 		}
 		if col.PrimaryKey {
-			pkCount++
-			if col.Type == value.Integer && strings.Contains(col.DeclType, "INT") {
-				t.RowidCol = len(t.Columns)
-			} else if col.AutoIncrement {
-				return fmt.Errorf("bangdb: AUTOINCREMENT is only allowed on an INTEGER PRIMARY KEY")
-			}
+			pkCols = append(pkCols, len(t.Columns))
 		}
 		t.Columns = append(t.Columns, col)
-	}
-	if pkCount > 1 {
-		return fmt.Errorf("bangdb: table %s has more than one primary key", st.Name)
 	}
 	if len(t.Columns) == 0 {
 		return fmt.Errorf("bangdb: table %s must have at least one column", st.Name)
 	}
+	resolve := func(names []string) ([]int, []string, error) {
+		var idx []int
+		var canon []string
+		for _, n := range names {
+			i := t.ColIndex(n)
+			if i < 0 {
+				return nil, nil, fmt.Errorf("bangdb: no such column %s in table %s", n, st.Name)
+			}
+			for _, j := range idx {
+				if j == i {
+					return nil, nil, fmt.Errorf("bangdb: column %s listed twice", n)
+				}
+			}
+			idx = append(idx, i)
+			canon = append(canon, t.Columns[i].Name)
+		}
+		return idx, canon, nil
+	}
+	if st.PrimaryKey != nil {
+		if len(pkCols) > 0 {
+			return fmt.Errorf("bangdb: table %s has more than one primary key", st.Name)
+		}
+		var err error
+		if pkCols, _, err = resolve(st.PrimaryKey); err != nil {
+			return err
+		}
+		for _, i := range pkCols {
+			t.Columns[i].PrimaryKey = true
+		}
+	}
+	if len(pkCols) > 1 && len(st.PrimaryKey) == 0 {
+		return fmt.Errorf("bangdb: table %s has more than one primary key", st.Name)
+	}
+	for _, i := range pkCols {
+		if t.Columns[i].AutoIncrement && len(pkCols) > 1 {
+			return fmt.Errorf("bangdb: AUTOINCREMENT is only allowed on an INTEGER PRIMARY KEY")
+		}
+	}
+	if len(pkCols) == 1 {
+		c := t.Columns[pkCols[0]]
+		if c.Type == value.Integer && strings.Contains(c.DeclType, "INT") {
+			t.RowidCol = pkCols[0]
+		} else if c.AutoIncrement {
+			return fmt.Errorf("bangdb: AUTOINCREMENT is only allowed on an INTEGER PRIMARY KEY")
+		}
+	}
+	type autoIdx struct {
+		cols []string
+		pk   bool
+	}
+	var autos []autoIdx
+	if len(pkCols) > 1 {
+		for _, i := range pkCols {
+			t.PrimaryKey = append(t.PrimaryKey, t.Columns[i].Name)
+		}
+		autos = append(autos, autoIdx{t.PrimaryKey, true})
+	}
+	for i, c := range t.Columns {
+		if i != t.RowidCol && (c.Unique || c.PrimaryKey && len(pkCols) == 1) {
+			autos = append(autos, autoIdx{[]string{c.Name}, c.PrimaryKey})
+		}
+	}
+	for _, u := range st.Uniques {
+		_, canon, err := resolve(u)
+		if err != nil {
+			return err
+		}
+		autos = append(autos, autoIdx{cols: canon})
+	}
+
 	root, err := btree.Create(x.v)
 	if err != nil {
 		return err
@@ -340,12 +402,15 @@ func (x *execCtx) createTable(st *sql.CreateTable) error {
 	if err := saveEntry(x.v, tableKey(t.Name), t); err != nil {
 		return err
 	}
-	for i, c := range t.Columns {
-		if i == t.RowidCol || !(c.Unique || c.PrimaryKey) {
-			continue
+	for _, a := range autos {
+		name := fmt.Sprintf("bangdb_autoindex_%s_%s", t.Name, strings.Join(a.cols, "_"))
+		if a.pk {
+			name = fmt.Sprintf("bangdb_autoindex_%s_pk", t.Name)
 		}
-		name := fmt.Sprintf("bangdb_autoindex_%s_%s", t.Name, c.Name)
-		if err := x.addIndex(&Index{Name: name, Table: t.Name, Column: c.Name, Unique: true, Auto: true}); err != nil {
+		if x.cat.index(name) != nil {
+			continue // e.g. UNIQUE (a) next to a UNIQUE column a
+		}
+		if err := x.addIndex(&Index{Name: name, Table: t.Name, Columns: a.cols, Unique: true, Auto: true}); err != nil {
 			return err
 		}
 	}
@@ -421,12 +486,21 @@ func (x *execCtx) createIndex(st *sql.CreateIndex) error {
 	if err != nil {
 		return err
 	}
-	col := t.ColIndex(st.Column)
-	if col < 0 {
-		return fmt.Errorf("bangdb: no such column: %s.%s", t.Name, st.Column)
+	var cols []string
+	for _, name := range st.Columns {
+		i := t.ColIndex(name)
+		if i < 0 {
+			return fmt.Errorf("bangdb: no such column: %s.%s", t.Name, name)
+		}
+		for _, c := range cols {
+			if strings.EqualFold(c, name) {
+				return fmt.Errorf("bangdb: column %s listed twice in index %s", name, st.Name)
+			}
+		}
+		cols = append(cols, t.Columns[i].Name)
 	}
 	x.mutableCatalog()
-	if err := x.addIndex(&Index{Name: st.Name, Table: t.Name, Column: t.Columns[col].Name, Unique: st.Unique}); err != nil {
+	if err := x.addIndex(&Index{Name: st.Name, Table: t.Name, Columns: cols, Unique: st.Unique}); err != nil {
 		return err
 	}
 	x.cat.link()
@@ -437,7 +511,7 @@ func (x *execCtx) createIndex(st *sql.CreateIndex) error {
 // in the catalog. The catalog must already be mutable.
 func (x *execCtx) addIndex(ix *Index) error {
 	t := x.cat.table(ix.Table)
-	ix.col = t.ColIndex(ix.Column)
+	ix.resolve(t)
 	root, err := btree.Create(x.v)
 	if err != nil {
 		return err
@@ -458,10 +532,10 @@ func (x *execCtx) addIndex(ix *Index) error {
 			return err
 		}
 		rowid := value.DecodeRowID(c.Key())
-		if err := x.checkUnique(t, ix, row[ix.col], rowid); err != nil {
+		if err := x.checkUnique(t, ix, row, rowid); err != nil {
 			return err
 		}
-		k, err := indexEntry(row[ix.col], rowid)
+		k, err := indexEntry(ix, row, rowid)
 		if err != nil {
 			return err
 		}

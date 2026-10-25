@@ -174,34 +174,27 @@ func (p *parser) parseCreate() (Stmt, error) {
 			return nil, err
 		}
 		for {
-			if p.isKw("PRIMARY") {
-				// Table constraint: PRIMARY KEY (col)
-				p.next()
-				if err := p.expectKw("KEY"); err != nil {
+			if p.acceptKw("CONSTRAINT") {
+				if _, err := p.ident(); err != nil {
 					return nil, err
 				}
-				if err := p.expectOp("("); err != nil {
-					return nil, err
+			}
+			if p.acceptKw("PRIMARY", "KEY") {
+				if ct.PrimaryKey != nil {
+					return nil, p.errf("more than one PRIMARY KEY constraint")
 				}
-				col, err := p.ident()
+				cols, err := p.parseColumnList()
 				if err != nil {
 					return nil, err
 				}
-				if p.acceptOp(",") {
-					return nil, p.errf("composite primary keys are not supported")
-				}
-				if err := p.expectOp(")"); err != nil {
+				ct.PrimaryKey = cols
+			} else if p.isKw("UNIQUE") && p.peekAt(1).kind == tOp && p.peekAt(1).text == "(" {
+				p.next()
+				cols, err := p.parseColumnList()
+				if err != nil {
 					return nil, err
 				}
-				found := false
-				for i := range ct.Columns {
-					if strings.EqualFold(ct.Columns[i].Name, col) {
-						ct.Columns[i].PrimaryKey, found = true, true
-					}
-				}
-				if !found {
-					return nil, fmt.Errorf("bangdb: unknown column %q in PRIMARY KEY", col)
-				}
+				ct.Uniques = append(ct.Uniques, cols)
 			} else {
 				cd, err := p.parseColumnDef()
 				if err != nil {
@@ -232,21 +225,35 @@ func (p *parser) parseCreate() (Stmt, error) {
 		if ci.Table, err = p.ident(); err != nil {
 			return nil, err
 		}
-		if err := p.expectOp("("); err != nil {
-			return nil, err
-		}
-		if ci.Column, err = p.ident(); err != nil {
-			return nil, err
-		}
-		if p.acceptOp(",") {
-			return nil, p.errf("multi-column indexes are not supported")
-		}
-		if err := p.expectOp(")"); err != nil {
+		if ci.Columns, err = p.parseColumnList(); err != nil {
 			return nil, err
 		}
 		return ci, nil
 	}
 	return nil, p.errf("expected TABLE or INDEX")
+}
+
+// parseColumnList parses "(a [ASC|DESC], b, ...)". Sort directions are
+// accepted for compatibility and ignored.
+func (p *parser) parseColumnList() ([]string, error) {
+	if err := p.expectOp("("); err != nil {
+		return nil, err
+	}
+	var cols []string
+	for {
+		c, err := p.ident()
+		if err != nil {
+			return nil, err
+		}
+		cols = append(cols, c)
+		if !p.acceptKw("ASC") {
+			p.acceptKw("DESC")
+		}
+		if !p.acceptOp(",") {
+			break
+		}
+	}
+	return cols, p.expectOp(")")
 }
 
 func (p *parser) parseColumnDef() (ColumnDef, error) {

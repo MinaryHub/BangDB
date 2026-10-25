@@ -35,22 +35,49 @@ type Table struct {
 	Columns  []Column `json:"columns"`
 	Root     uint32   `json:"root"`
 	RowidCol int      `json:"rowidCol"` // INTEGER PRIMARY KEY column, or -1
+	// PrimaryKey lists the primary key columns when the key is composite
+	// (single-column keys are flagged on the column).
+	PrimaryKey []string `json:"primaryKey,omitempty"`
 
 	indexes []*Index
 }
 
-// Index is a secondary index on a single column. Entries are keyed by
-// key(value) || rowid and have empty values.
+// Index is a secondary index on one or more columns. Entries are keyed by
+// key(v1) || key(v2) || ... || rowid and have empty values; the value keys
+// are prefix-free, so any leading subset of the columns can be searched.
 type Index struct {
-	Name   string `json:"name"`
-	Table  string `json:"table"`
-	Column string `json:"column"`
-	Unique bool   `json:"unique,omitempty"`
-	Auto   bool   `json:"auto,omitempty"` // created for UNIQUE / PRIMARY KEY
-	Root   uint32 `json:"root"`
+	Name    string   `json:"name"`
+	Table   string   `json:"table"`
+	Columns []string `json:"columns"`
+	Column  string   `json:"column,omitempty"` // legacy single-column form
+	Unique  bool     `json:"unique,omitempty"`
+	Auto    bool     `json:"auto,omitempty"` // created for UNIQUE / PRIMARY KEY
+	Root    uint32   `json:"root"`
 
-	col int
+	cols []int
 }
+
+// key returns the index key part for row (without the rowid).
+func (ix *Index) key(row []any) []byte {
+	var k []byte
+	for _, c := range ix.cols {
+		k = value.AppendKey(k, row[c])
+	}
+	return k
+}
+
+// hasNull reports whether any indexed value of row is NULL (such rows never
+// conflict in a UNIQUE index).
+func (ix *Index) hasNull(row []any) bool {
+	for _, c := range ix.cols {
+		if row[c] == nil {
+			return true
+		}
+	}
+	return false
+}
+
+func (ix *Index) columnList() string { return strings.Join(ix.Columns, ", ") }
 
 // ColIndex returns the column position by name (case-insensitive), or -1.
 func (t *Table) ColIndex(name string) int {
@@ -95,6 +122,8 @@ func (c *Catalog) clone() *Catalog {
 	}
 	for k, ix := range c.indexes {
 		ni := *ix
+		ni.Columns = append([]string(nil), ix.Columns...)
+		ni.cols = nil
 		n.indexes[k] = &ni
 	}
 	n.link()
@@ -111,8 +140,18 @@ func (c *Catalog) link() {
 		if t == nil {
 			continue
 		}
-		ix.col = t.ColIndex(ix.Column)
+		ix.resolve(t)
 		t.indexes = append(t.indexes, ix)
+	}
+}
+
+func (ix *Index) resolve(t *Table) {
+	if len(ix.Columns) == 0 && ix.Column != "" {
+		ix.Columns, ix.Column = []string{ix.Column}, ""
+	}
+	ix.cols = ix.cols[:0]
+	for _, c := range ix.Columns {
+		ix.cols = append(ix.cols, t.ColIndex(c))
 	}
 }
 
@@ -244,7 +283,7 @@ func (c *Catalog) Describe(name string) string {
 		if col.DeclType != "" {
 			sb.WriteString(" " + col.DeclType)
 		}
-		if col.PrimaryKey {
+		if col.PrimaryKey && len(t.PrimaryKey) == 0 {
 			sb.WriteString(" PRIMARY KEY")
 		}
 		if col.AutoIncrement {
@@ -264,6 +303,20 @@ func (c *Catalog) Describe(name string) string {
 		}
 		sb.WriteString("\n")
 	}
+	var constraints []string
+	if len(t.PrimaryKey) > 0 {
+		constraints = append(constraints, "PRIMARY KEY ("+strings.Join(t.PrimaryKey, ", ")+")")
+	}
+	for _, ix := range t.indexes {
+		if ix.Auto && len(ix.Columns) > 1 && !strings.HasSuffix(ix.Name, "_pk") {
+			constraints = append(constraints, "UNIQUE ("+ix.columnList()+")")
+		}
+	}
+	if len(constraints) > 0 {
+		out := strings.TrimSuffix(sb.String(), "\n")
+		sb.Reset()
+		sb.WriteString(out + ",\n  " + strings.Join(constraints, ",\n  ") + "\n")
+	}
 	sb.WriteString(");")
 	for _, ix := range t.indexes {
 		if ix.Auto {
@@ -273,7 +326,7 @@ func (c *Catalog) Describe(name string) string {
 		if ix.Unique {
 			u = "UNIQUE "
 		}
-		fmt.Fprintf(&sb, "\nCREATE %sINDEX %s ON %s (%s);", u, ix.Name, t.Name, ix.Column)
+		fmt.Fprintf(&sb, "\nCREATE %sINDEX %s ON %s (%s);", u, ix.Name, t.Name, ix.columnList())
 	}
 	return sb.String()
 }
