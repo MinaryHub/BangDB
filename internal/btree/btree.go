@@ -29,7 +29,7 @@ const (
 
 	nodeHeader = 7 // type(1) n(2) next-or-child0(4)
 	ovHeader   = 7 // type(1) next(4) used(2)
-	ovChunk    = pager.PageSize - ovHeader
+	ovChunk    = pager.UsableSize - ovHeader
 )
 
 // ErrKeyTooLarge is returned when a key exceeds MaxKey bytes.
@@ -356,7 +356,7 @@ func (t *Tree) insert(pg uint32, key []byte, v value) (*split, error) {
 			copy(n.vals[i+1:], n.vals[i:])
 			n.vals[i] = v
 		}
-		if n.size() <= pager.PageSize {
+		if n.size() <= pager.UsableSize {
 			t.store(pg, n)
 			return nil, nil
 		}
@@ -373,7 +373,7 @@ func (t *Tree) insert(pg uint32, key []byte, v value) (*split, error) {
 	n.children = append(n.children, 0)
 	copy(n.children[ci+2:], n.children[ci+1:])
 	n.children[ci+1] = s.right
-	if n.size() <= pager.PageSize {
+	if n.size() <= pager.UsableSize {
 		t.store(pg, n)
 		return nil, nil
 	}

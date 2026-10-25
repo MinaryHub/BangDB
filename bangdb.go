@@ -151,6 +151,11 @@ func (db *DB) Backup(path string) error { return db.e.Backup(context.Background(
 // BackupContext is Backup with cancellation.
 func (db *DB) BackupContext(ctx context.Context, path string) error { return db.e.Backup(ctx, path) }
 
+// IntegrityCheck verifies checksums, B+tree structure, page accounting and
+// index/table consistency on a snapshot, without blocking other work. It
+// returns the problems found; an empty slice means the database is sound.
+func (db *DB) IntegrityCheck() ([]string, error) { return db.e.IntegrityCheck(context.Background()) }
+
 // Seq returns the sequence number of the last committed transaction. It
 // increases by one per commit and is shared with replicas.
 func (db *DB) Seq() uint64 { return db.e.Seq() }

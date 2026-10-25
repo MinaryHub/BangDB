@@ -32,7 +32,7 @@ func TestCommitAndReopen(t *testing.T) {
 	defer p.Close()
 	v = p.NewView()
 	b, err := v.Read(pg)
-	if err != nil || !bytes.Equal(b, page(7)) || v.Meta(3) != 42 {
+	if err != nil || !sameContent(b, 7) || v.Meta(3) != 42 {
 		t.Fatalf("data not persisted: %v", err)
 	}
 }
@@ -61,7 +61,7 @@ func TestRecoverFromWALAfterCrash(t *testing.T) {
 	}
 	defer p.Close()
 	b, _ := p.NewView().Read(pg)
-	if !bytes.Equal(b, page(2)) {
+	if !sameContent(b, 2) {
 		t.Fatal("committed transaction was not recovered from WAL")
 	}
 	if st, _ := os.Stat(path + "-wal"); st.Size() != 0 {
@@ -94,7 +94,7 @@ func TestTornWALIsIgnored(t *testing.T) {
 	}
 	defer p.Close()
 	b, _ := p.NewView().Read(pg)
-	if !bytes.Equal(b, page(1)) {
+	if !sameContent(b, 1) {
 		t.Fatal("torn transaction must not be applied")
 	}
 }
@@ -108,7 +108,7 @@ func TestSavepointAndFreeList(t *testing.T) {
 	v.Write(a, page(5))
 	v.Free(b)
 	v.Restore(sp)
-	if got, _ := v.Read(a); !bytes.Equal(got, make([]byte, PageSize)) {
+	if got, _ := v.Read(a); !sameContent(got, 0) {
 		t.Fatal("restore did not undo write")
 	}
 	v.Free(b)
@@ -131,3 +131,32 @@ func TestSecondProcessLock(t *testing.T) {
 }
 
 var errCrash = errors.New("crash")
+
+// sameContent compares a page's content (excluding its checksum) with a page
+// filled with b.
+func sameContent(got []byte, b byte) bool {
+	return bytes.Equal(got[:UsableSize], page(b)[:UsableSize])
+}
+
+func TestChecksumDetectsCorruption(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "c.db")
+	p, _ := Open(path)
+	v := p.NewView()
+	pg, _ := v.Alloc()
+	v.Write(pg, page(7))
+	p.Commit(v)
+	p.Close()
+
+	f, _ := os.OpenFile(path, os.O_RDWR, 0)
+	f.WriteAt([]byte{0x42}, int64(pg)*PageSize+100) // flip a byte on disk
+	f.Close()
+
+	p, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer p.Close()
+	if _, err := p.NewView().Read(pg); !errors.Is(err, ErrCorrupt) {
+		t.Fatalf("corruption not detected: %v", err)
+	}
+}

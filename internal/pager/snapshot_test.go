@@ -1,7 +1,6 @@
 package pager
 
 import (
-	"bytes"
 	"math/rand"
 	"path/filepath"
 	"testing"
@@ -47,7 +46,7 @@ func runSnapshotModel(t *testing.T, mode string) {
 			if err != nil {
 				t.Fatalf("snapshot %d page %d: %v", sn.seq, no, err)
 			}
-			if !bytes.Equal(got, page(b)) {
+			if !sameContent(got, b) {
 				t.Fatalf("snapshot %d page %d: got %d want %d (latest %d)", sn.seq, no, got[0], b, cur)
 			}
 		}

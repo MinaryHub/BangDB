@@ -151,6 +151,7 @@ func (s *shell) command(cmd string) bool {
 .schema [table]    show table definitions
 .timer on|off      show execution time
 .backup FILE       write an online backup to FILE
+.check             verify checksums, structure and indexes
 .repl              show replication status
 .promote           turn this replica into a writable primary
 .quit              exit
@@ -177,6 +178,16 @@ SQL statements end with ';'. BEGIN/COMMIT/ROLLBACK are supported.`)
 			fmt.Fprintln(s.out, "Error:", err)
 		} else {
 			fmt.Fprintf(s.out, "backup written to %s (seq %d)\n", fields[1], s.db.Seq())
+		}
+	case ".check":
+		problems, err := s.db.IntegrityCheck(context.Background())
+		switch {
+		case err != nil:
+			fmt.Fprintln(s.out, "Error:", err)
+		case len(problems) == 0:
+			fmt.Fprintln(s.out, "ok")
+		default:
+			fmt.Fprintln(s.out, strings.Join(problems, "\n"))
 		}
 	case ".repl":
 		fmt.Fprintf(s.out, "seq %d, read-only %v\n", s.db.Seq(), s.db.ReadOnly())

@@ -19,8 +19,23 @@ func open(t *testing.T) *DB {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { db.Close() })
+	t.Cleanup(func() {
+		checkIntegrity(t, db)
+		db.Close()
+	})
 	return db
+}
+
+// checkIntegrity fails the test if the database has any structural problem.
+func checkIntegrity(t *testing.T, db *DB) {
+	t.Helper()
+	problems, err := db.IntegrityCheck()
+	if err != nil {
+		t.Errorf("integrity check: %v", err)
+	}
+	for _, p := range problems {
+		t.Errorf("integrity: %s", p)
+	}
 }
 
 func exec(t *testing.T, db *DB, q string, args ...any) Result {
@@ -399,6 +414,7 @@ func TestPersistenceAndLargeValues(t *testing.T) {
 		t.Fatalf("blob = %v", data)
 	}
 	expect(t, db, `SELECT COUNT(*) FROM docs WHERE title >= 'title-1990' AND title < 'title-2000'`, "10")
+	checkIntegrity(t, db)
 
 	// Dropping and recreating reuses freed pages instead of growing the file.
 	pagesBefore := db.Engine().PageCount()

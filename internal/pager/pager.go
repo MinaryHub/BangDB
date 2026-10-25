@@ -36,13 +36,18 @@ import (
 // PageSize is the size of every page in bytes.
 const PageSize = 4096
 
+// UsableSize is the part of a page available to its content; the last 4
+// bytes hold a CRC32 checksum of the rest, verified whenever a page is read
+// from disk.
+const UsableSize = PageSize - 4
+
 // MetaSlots is the number of user-defined uint32 slots in the header page.
 const MetaSlots = 8
 
-// FormatVersion is the on-disk format written by this version. Files with a
-// newer version are rejected; version 1 files are read and upgraded on the
-// next commit (the layout is compatible).
-const FormatVersion = 2
+// FormatVersion is the on-disk format written by this version. Version 3 is
+// the first stable format (page checksums); files of other versions are
+// rejected with an explanatory error.
+const FormatVersion = 3
 
 const (
 	magicPrefix  = "BangDB\x00" // followed by the format version byte
@@ -99,7 +104,21 @@ func (h *Header) encode() []byte {
 	}
 	binary.BigEndian.PutUint64(b[offSeq:], h.Seq)
 	copy(b[offDBID:], h.DBID[:])
+	seal(b)
 	return b
+}
+
+// seal stores the page checksum.
+func seal(b []byte) {
+	binary.BigEndian.PutUint32(b[UsableSize:], crc32.ChecksumIEEE(b[:UsableSize]))
+}
+
+// verify checks a page read from disk.
+func verify(pgno uint32, b []byte) error {
+	if binary.BigEndian.Uint32(b[UsableSize:]) != crc32.ChecksumIEEE(b[:UsableSize]) {
+		return fmt.Errorf("%w: checksum mismatch on page %d", ErrCorrupt, pgno)
+	}
+	return nil
 }
 
 func decodeHeader(b []byte) (Header, error) {
@@ -107,8 +126,14 @@ func decodeHeader(b []byte) (Header, error) {
 	if len(b) < PageSize || string(b[:len(magicPrefix)]) != magicPrefix {
 		return h, ErrCorrupt
 	}
-	if v := b[len(magicPrefix)]; v == 0 || v > FormatVersion {
-		return h, fmt.Errorf("bangdb: database format version %d is not supported by this build (max %d)", v, FormatVersion)
+	if v := b[len(magicPrefix)]; v != FormatVersion {
+		if v < FormatVersion {
+			return h, fmt.Errorf("bangdb: database format version %d was written by a pre-release build and is not supported; recreate the database", v)
+		}
+		return h, fmt.Errorf("bangdb: database format version %d is newer than this build supports (%d)", v, FormatVersion)
+	}
+	if err := verify(0, b); err != nil {
+		return h, err
 	}
 	if binary.BigEndian.Uint32(b[8:]) != PageSize {
 		return h, fmt.Errorf("bangdb: unsupported page size %d", binary.BigEndian.Uint32(b[8:]))
@@ -402,7 +427,7 @@ func (p *Pager) readAt(pgno uint32, seq uint64) ([]byte, error) {
 	vs := p.versions[pgno]
 	for i := len(vs) - 1; i >= 0; i-- {
 		if vs[i].seq <= seq {
-			return p.versionData(vs[i])
+			return p.versionData(pgno, vs[i])
 		}
 	}
 	if p.file == nil {
@@ -419,18 +444,24 @@ func (p *Pager) readAt(pgno uint32, seq uint64) ([]byte, error) {
 	if _, err := p.file.ReadAt(b, int64(pgno)*PageSize); err != nil {
 		return nil, fmt.Errorf("bangdb: read page %d: %w", pgno, err)
 	}
+	if err := verify(pgno, b); err != nil {
+		return nil, err
+	}
 	p.cachePut(pgno, b)
 	return b, nil
 }
 
 // versionData must be called with p.mu held.
-func (p *Pager) versionData(v version) ([]byte, error) {
+func (p *Pager) versionData(no uint32, v version) ([]byte, error) {
 	if v.data != nil {
 		return v.data, nil
 	}
 	b := make([]byte, PageSize)
 	if _, err := p.wal.ReadAt(b, v.off); err != nil {
 		return nil, fmt.Errorf("bangdb: read WAL: %w", err)
+	}
+	if err := verify(no, b); err != nil {
+		return nil, err
 	}
 	return b, nil
 }
@@ -560,6 +591,9 @@ func (p *Pager) usable() error {
 }
 
 func (p *Pager) prepare(pages map[uint32][]byte, hdr Header) (*Prepared, error) {
+	for _, b := range pages {
+		seal(b) // the pages are owned by the commit and not yet visible
+	}
 	c := &Prepared{pages: pages, hdr: hdr}
 	if p.file == nil {
 		return c, nil
@@ -718,7 +752,7 @@ func (p *Pager) Checkpoint() error {
 	for i := range items {
 		vs := p.versions[items[i].no]
 		k := sort.Search(len(vs), func(j int) bool { return vs[j].seq > items[i].seq })
-		data, err := p.versionData(vs[k-1])
+		data, err := p.versionData(items[i].no, vs[k-1])
 		if err != nil {
 			p.mu.Unlock()
 			return err
@@ -932,6 +966,9 @@ func (v *View) NewIdentity() {
 		panic(err)
 	}
 }
+
+// FreeHead returns the first page of the free list as seen by the view.
+func (v *View) FreeHead() uint32 { return v.hdr.FreeHead }
 
 // PageCount returns the number of pages as seen by the view.
 func (v *View) PageCount() uint32 { return v.hdr.PageCount }

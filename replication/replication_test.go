@@ -30,6 +30,9 @@ func openDB(t *testing.T, path string) *bangdb.DB {
 // dump renders every table so that two databases can be compared.
 func dump(t *testing.T, db *bangdb.DB) string {
 	t.Helper()
+	if problems, err := db.IntegrityCheck(); err != nil || len(problems) > 0 {
+		t.Fatalf("integrity check: %v %v", err, problems)
+	}
 	names := db.Tables()
 	sort.Strings(names)
 	var sb strings.Builder
