@@ -97,3 +97,16 @@ func TestContextCancellation(t *testing.T) {
 		t.Fatalf("want DeadlineExceeded, got %v", err)
 	}
 }
+
+func TestReturningThroughDriver(t *testing.T) {
+	db, _ := sql.Open("bangdb", ":memory:")
+	defer db.Close()
+	db.Exec(`CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT UNIQUE)`)
+	var id int64
+	if err := db.QueryRow(`INSERT INTO t (name) VALUES (?) RETURNING id`, "a").Scan(&id); err != nil || id != 1 {
+		t.Fatalf("id=%d err=%v", id, err)
+	}
+	if err := db.QueryRow(`INSERT INTO t (name) VALUES (?) ON CONFLICT (name) DO UPDATE SET name = excluded.name RETURNING id`, "a").Scan(&id); err != nil || id != 1 {
+		t.Fatalf("upsert id=%d err=%v", id, err)
+	}
+}

@@ -93,18 +93,7 @@ func (x *execCtx) planSelect(st *sql.Select) (*selectPlan, error) {
 			continue
 		}
 		exprs = append(exprs, it.Expr)
-		switch {
-		case it.Alias != "":
-			p.cols = append(p.cols, it.Alias)
-		case isColumn(it.Expr):
-			p.cols = append(p.cols, it.Expr.(*sql.ColumnRef).Name)
-		default:
-			name := sql.FormatExpr(it.Expr)
-			if _, isBin := it.Expr.(*sql.Binary); isBin {
-				name = name[1 : len(name)-1]
-			}
-			p.cols = append(p.cols, name)
-		}
+		p.cols = append(p.cols, outputName(it))
 	}
 	for _, e := range exprs {
 		f, err := c.compile(e)
@@ -169,6 +158,21 @@ func (x *execCtx) planSelect(st *sql.Select) (*selectPlan, error) {
 }
 
 func isColumn(e sql.Expr) bool { _, ok := e.(*sql.ColumnRef); return ok }
+
+// outputName is the result column name of a select item.
+func outputName(it sql.SelectItem) string {
+	switch {
+	case it.Alias != "":
+		return it.Alias
+	case isColumn(it.Expr):
+		return it.Expr.(*sql.ColumnRef).Name
+	}
+	name := sql.FormatExpr(it.Expr)
+	if _, isBin := it.Expr.(*sql.Binary); isBin {
+		name = name[1 : len(name)-1]
+	}
+	return name
+}
 
 func (p *selectPlan) displayName(col scopeCol) string {
 	for _, l := range p.levels {
@@ -510,6 +514,133 @@ func (x *execCtx) explain(s sql.Stmt) (Result, error) {
 
 // ---- DML ----
 
+// tableScope is the scope of one table's columns plus its hidden rowid.
+func tableScope(t *Table, alias string, level int, qualifiedOnly bool) []scopeCol {
+	var cols []scopeCol
+	for _, c := range t.Columns {
+		cols = append(cols, scopeCol{table: strings.ToLower(alias), name: strings.ToLower(c.Name), level: level, hidden: qualifiedOnly})
+	}
+	return append(cols, scopeCol{table: strings.ToLower(alias), name: "rowid", level: level, hidden: true})
+}
+
+// returning evaluates a RETURNING list for changed rows.
+type returning struct {
+	cols []string
+	fns  []evalFn
+	e    *env
+}
+
+func (x *execCtx) compileReturning(t *Table, items []sql.SelectItem) (*returning, error) {
+	if len(items) == 0 {
+		return nil, nil
+	}
+	sc := &scope{cols: tableScope(t, t.Name, 0, false)}
+	c := &compiler{sc: sc}
+	r := &returning{e: &env{row: make([]any, len(sc.cols)), args: x.args}}
+	for _, it := range items {
+		if it.Star {
+			if it.StarTable != "" && !strings.EqualFold(it.StarTable, t.Name) {
+				return nil, fmt.Errorf("bangdb: no such table: %s", it.StarTable)
+			}
+			for i, col := range t.Columns {
+				i := i
+				r.cols = append(r.cols, col.Name)
+				r.fns = append(r.fns, func(e *env) (any, error) { return e.row[i], nil })
+			}
+			continue
+		}
+		if hasAggregate(it.Expr) {
+			return nil, errors.New("bangdb: aggregate functions are not allowed in RETURNING")
+		}
+		f, err := c.compile(it.Expr)
+		if err != nil {
+			return nil, err
+		}
+		r.cols = append(r.cols, outputName(it))
+		r.fns = append(r.fns, f)
+	}
+	return r, nil
+}
+
+// add appends the RETURNING values of one row to res.
+func (r *returning) add(res *Result, rowid int64, row []any) error {
+	if r == nil {
+		return nil
+	}
+	copy(r.e.row, row)
+	r.e.row[len(row)] = rowid
+	out := make([]any, len(r.fns))
+	for i, f := range r.fns {
+		v, err := f(r.e)
+		if err != nil {
+			return err
+		}
+		out[i] = v
+	}
+	res.Rows = append(res.Rows, out)
+	return nil
+}
+
+// conflict is an existing row that clashes with a new row.
+type conflict struct {
+	rowid int64
+	cols  []string // the PRIMARY KEY / UNIQUE columns that clash
+}
+
+// conflicts lists existing rows that share a key with row.
+func (x *execCtx) conflicts(t *Table, row []any) ([]conflict, error) {
+	var out []conflict
+	if t.RowidCol >= 0 && row[t.RowidCol] != nil {
+		if _, ok, err := x.getRow(t, row[t.RowidCol].(int64)); err != nil {
+			return nil, err
+		} else if ok {
+			out = append(out, conflict{row[t.RowidCol].(int64), []string{t.Columns[t.RowidCol].Name}})
+		}
+	}
+	for _, ix := range t.indexes {
+		if !ix.Unique || ix.hasNull(row) {
+			continue
+		}
+		prefix := ix.key(row)
+		c := btree.Open(x.v, ix.Root).Seek(prefix)
+		if c.Valid() && bytes.HasPrefix(c.Key(), prefix) {
+			out = append(out, conflict{value.DecodeRowID(c.Key()[len(prefix):]), ix.Columns})
+		}
+		if err := c.Err(); err != nil {
+			return nil, err
+		}
+	}
+	return out, nil
+}
+
+func sameColumns(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for _, x := range a {
+		found := false
+		for _, y := range b {
+			found = found || strings.EqualFold(x, y)
+		}
+		if !found {
+			return false
+		}
+	}
+	return true
+}
+
+// upsert is a compiled ON CONFLICT DO UPDATE clause.
+type upsert struct {
+	sets  []colSet
+	where evalFn
+	e     *env
+}
+
+type colSet struct {
+	col int
+	fn  evalFn
+}
+
 func (x *execCtx) execInsert(st *sql.Insert) (Result, error) {
 	t, err := x.table(st.Table)
 	if err != nil {
@@ -543,25 +674,86 @@ func (x *execCtx) execInsert(st *sql.Insert) (Result, error) {
 			}
 		}
 	}
-	c := &compiler{}
 	e := &env{args: x.args}
-	var res Result
-	var maxID int64
-	for _, exprs := range st.Rows {
-		if len(exprs) != len(positions) {
-			return Result{}, fmt.Errorf("bangdb: %d values for %d columns", len(exprs), len(positions))
+
+	// Source rows: evaluated completely before anything is inserted, so
+	// INSERT INTO t SELECT ... FROM t sees the table as it was.
+	var src [][]any
+	if st.Select != nil {
+		res, err := x.execSelect(st.Select)
+		if err != nil {
+			return Result{}, err
 		}
+		if len(res.Columns) != len(positions) {
+			return Result{}, fmt.Errorf("bangdb: SELECT returns %d columns for %d target columns", len(res.Columns), len(positions))
+		}
+		src = res.Rows
+	} else {
+		c := &compiler{}
+		for _, exprs := range st.Rows {
+			if len(exprs) != len(positions) {
+				return Result{}, fmt.Errorf("bangdb: %d values for %d columns", len(exprs), len(positions))
+			}
+			vals := make([]any, len(exprs))
+			for j, ex := range exprs {
+				f, err := c.compile(ex)
+				if err != nil {
+					return Result{}, err
+				}
+				if vals[j], err = f(e); err != nil {
+					return Result{}, err
+				}
+			}
+			src = append(src, vals)
+		}
+	}
+
+	ret, err := x.compileReturning(t, st.Returning)
+	if err != nil {
+		return Result{}, err
+	}
+	oc := st.OnConflict
+	if oc != nil && len(oc.Target) > 0 {
+		ok := t.RowidCol >= 0 && sameColumns(oc.Target, []string{t.Columns[t.RowidCol].Name})
+		for _, ix := range t.indexes {
+			ok = ok || ix.Unique && sameColumns(oc.Target, ix.Columns)
+		}
+		if !ok {
+			return Result{}, errors.New("bangdb: ON CONFLICT target does not match any PRIMARY KEY or UNIQUE constraint")
+		}
+	}
+	var up *upsert
+	if oc != nil && !oc.DoNothing {
+		sc := &scope{cols: append(tableScope(t, t.Name, 0, false), tableScope(t, "excluded", 1, true)...)}
+		c := &compiler{sc: sc}
+		up = &upsert{e: &env{row: make([]any, len(sc.cols)), args: x.args}}
+		for _, a := range oc.Sets {
+			i := t.ColIndex(a.Column)
+			if i < 0 {
+				return Result{}, fmt.Errorf("bangdb: no such column: %s", a.Column)
+			}
+			f, err := c.compile(a.Value)
+			if err != nil {
+				return Result{}, err
+			}
+			up.sets = append(up.sets, colSet{i, f})
+		}
+		if oc.Where != nil {
+			if up.where, err = c.compile(oc.Where); err != nil {
+				return Result{}, err
+			}
+		}
+	}
+
+	res := Result{Columns: nil}
+	if ret != nil {
+		res.Columns = ret.cols
+	}
+	var maxID int64
+	for _, vals := range src {
 		row := make([]any, len(t.Columns))
 		given := make([]bool, len(t.Columns))
-		for j, ex := range exprs {
-			f, err := c.compile(ex)
-			if err != nil {
-				return Result{}, err
-			}
-			v, err := f(e)
-			if err != nil {
-				return Result{}, err
-			}
+		for j, v := range vals {
 			row[positions[j]] = v
 			given[positions[j]] = true
 		}
@@ -575,6 +767,77 @@ func (x *execCtx) execInsert(st *sql.Insert) (Result, error) {
 		if err := prepareRow(t, row); err != nil {
 			return Result{}, err
 		}
+		if oc != nil || st.Or != "" {
+			clashes, err := x.conflicts(t, row)
+			if err != nil {
+				return Result{}, err
+			}
+			var hit *conflict
+			for i := range clashes {
+				if oc == nil || len(oc.Target) == 0 || sameColumns(oc.Target, clashes[i].cols) {
+					hit = &clashes[i]
+					break
+				}
+			}
+			switch {
+			case hit == nil:
+				// No (matching) conflict: insert normally; other conflicts
+				// raise the usual constraint error.
+			case st.Or == "IGNORE" || oc != nil && oc.DoNothing:
+				continue
+			case st.Or == "REPLACE":
+				done := map[int64]bool{}
+				for _, cf := range clashes {
+					if done[cf.rowid] {
+						continue
+					}
+					done[cf.rowid] = true
+					old, ok, err := x.getRow(t, cf.rowid)
+					if err != nil {
+						return Result{}, err
+					}
+					if ok {
+						if err := x.deleteRow(t, cf.rowid, old); err != nil {
+							return Result{}, err
+						}
+					}
+				}
+			default: // DO UPDATE
+				old, _, err := x.getRow(t, hit.rowid)
+				if err != nil {
+					return Result{}, err
+				}
+				n := len(t.Columns) + 1
+				copy(up.e.row, old)
+				up.e.row[n-1] = hit.rowid
+				copy(up.e.row[n:], row)
+				up.e.row[2*n-1] = nil
+				if up.where != nil {
+					v, err := up.where(up.e)
+					if err != nil {
+						return Result{}, err
+					}
+					if ok, _ := value.Truthy(v); !ok {
+						continue
+					}
+				}
+				newRow := append([]any(nil), old...)
+				for _, s := range up.sets {
+					if newRow[s.col], err = s.fn(up.e); err != nil {
+						return Result{}, err
+					}
+				}
+				id, err := x.updateRow(t, hit.rowid, old, newRow)
+				if err != nil {
+					return Result{}, err
+				}
+				res.RowsAffected++
+				if err := ret.add(&res, id, newRow); err != nil {
+					return Result{}, err
+				}
+				continue
+			}
+		}
 		id, err := x.insertRow(t, row)
 		if err != nil {
 			return Result{}, err
@@ -582,6 +845,9 @@ func (x *execCtx) execInsert(st *sql.Insert) (Result, error) {
 		res.RowsAffected++
 		res.LastInsertID = id
 		maxID = max(maxID, id)
+		if err := ret.add(&res, id, row); err != nil {
+			return Result{}, err
+		}
 	}
 	return res, x.recordSequence(t, maxID)
 }
@@ -611,20 +877,35 @@ func (x *execCtx) execDelete(st *sql.Delete) (Result, error) {
 	if err != nil {
 		return Result{}, err
 	}
+	ret, err := x.compileReturning(t, st.Returning)
+	if err != nil {
+		return Result{}, err
+	}
 	_, targets, err := x.collect(t, st.Where)
 	if err != nil {
 		return Result{}, err
 	}
+	res := Result{RowsAffected: int64(len(targets))}
+	if ret != nil {
+		res.Columns = ret.cols
+	}
 	for _, tg := range targets {
+		if err := ret.add(&res, tg.rowid, tg.row); err != nil {
+			return Result{}, err
+		}
 		if err := x.deleteRow(t, tg.rowid, tg.row); err != nil {
 			return Result{}, err
 		}
 	}
-	return Result{RowsAffected: int64(len(targets))}, nil
+	return res, nil
 }
 
 func (x *execCtx) execUpdate(st *sql.Update) (Result, error) {
 	t, err := x.table(st.Table)
+	if err != nil {
+		return Result{}, err
+	}
+	ret, err := x.compileReturning(t, st.Returning)
 	if err != nil {
 		return Result{}, err
 	}
@@ -633,11 +914,7 @@ func (x *execCtx) execUpdate(st *sql.Update) (Result, error) {
 		return Result{}, err
 	}
 	c := &compiler{sc: sc}
-	type set struct {
-		col int
-		fn  evalFn
-	}
-	var sets []set
+	var sets []colSet
 	for _, a := range st.Sets {
 		i := t.ColIndex(a.Column)
 		if i < 0 {
@@ -647,7 +924,11 @@ func (x *execCtx) execUpdate(st *sql.Update) (Result, error) {
 		if err != nil {
 			return Result{}, err
 		}
-		sets = append(sets, set{i, f})
+		sets = append(sets, colSet{i, f})
+	}
+	res := Result{RowsAffected: int64(len(targets))}
+	if ret != nil {
+		res.Columns = ret.cols
 	}
 	e := &env{row: make([]any, len(sc.cols)), args: x.args}
 	for _, tg := range targets {
@@ -661,46 +942,54 @@ func (x *execCtx) execUpdate(st *sql.Update) (Result, error) {
 			}
 			newRow[s.col] = v
 		}
-		if err := prepareRow(t, newRow); err != nil {
+		id, err := x.updateRow(t, tg.rowid, tg.row, newRow)
+		if err != nil {
 			return Result{}, err
 		}
-		newID := tg.rowid
-		if t.RowidCol >= 0 {
-			if newRow[t.RowidCol] == nil {
-				return Result{}, constraintErr("NOT NULL constraint failed: %s.%s", t.Name, t.Columns[t.RowidCol].Name)
-			}
-			newID = newRow[t.RowidCol].(int64)
-		}
-		if newID != tg.rowid {
-			if _, exists, err := x.getRow(t, newID); err != nil {
-				return Result{}, err
-			} else if exists {
-				return Result{}, constraintErr("UNIQUE constraint failed: %s.%s", t.Name, t.Columns[t.RowidCol].Name)
-			}
-		}
-		for _, ix := range t.indexes {
-			if newID == tg.rowid && bytes.Equal(ix.key(tg.row), ix.key(newRow)) {
-				continue
-			}
-			if err := x.checkUnique(t, ix, newRow, tg.rowid); err != nil {
-				return Result{}, err
-			}
-		}
-		if err := x.deleteRow(t, tg.rowid, tg.row); err != nil {
-			return Result{}, err
-		}
-		if t.RowidCol >= 0 {
-			newRow[t.RowidCol] = newID
-		}
-		if err := x.writeRow(t, newID, newRow); err != nil {
-			return Result{}, err
-		}
-		x.noteRowid(t, newID)
-		if err := x.recordSequence(t, newID); err != nil {
+		if err := ret.add(&res, id, newRow); err != nil {
 			return Result{}, err
 		}
 	}
-	return Result{RowsAffected: int64(len(targets))}, nil
+	return res, nil
+}
+
+// updateRow replaces row oldID (with content old) by newRow, checking
+// types, NOT NULL and uniqueness and maintaining indexes. It returns the
+// row's (possibly changed) rowid.
+func (x *execCtx) updateRow(t *Table, oldID int64, old, newRow []any) (int64, error) {
+	if err := prepareRow(t, newRow); err != nil {
+		return 0, err
+	}
+	newID := oldID
+	if t.RowidCol >= 0 {
+		if newRow[t.RowidCol] == nil {
+			return 0, constraintErr("NOT NULL constraint failed: %s.%s", t.Name, t.Columns[t.RowidCol].Name)
+		}
+		newID = newRow[t.RowidCol].(int64)
+	}
+	if newID != oldID {
+		if _, exists, err := x.getRow(t, newID); err != nil {
+			return 0, err
+		} else if exists {
+			return 0, constraintErr("UNIQUE constraint failed: %s.%s", t.Name, t.Columns[t.RowidCol].Name)
+		}
+	}
+	for _, ix := range t.indexes {
+		if newID == oldID && bytes.Equal(ix.key(old), ix.key(newRow)) {
+			continue
+		}
+		if err := x.checkUnique(t, ix, newRow, oldID); err != nil {
+			return 0, err
+		}
+	}
+	if err := x.deleteRow(t, oldID, old); err != nil {
+		return 0, err
+	}
+	if err := x.writeRow(t, newID, newRow); err != nil {
+		return 0, err
+	}
+	x.noteRowid(t, newID)
+	return newID, x.recordSequence(t, newID)
 }
 
 // writeRow stores a row and its index entries without constraint checks.

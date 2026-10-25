@@ -49,9 +49,22 @@ type DropIndex struct {
 }
 
 type Insert struct {
-	Table   string
-	Columns []string
-	Rows    [][]Expr
+	Table      string
+	Columns    []string
+	Rows       [][]Expr // VALUES rows, or
+	Select     *Select  // INSERT ... SELECT
+	Or         string   // "", "IGNORE" or "REPLACE" (INSERT OR ...)
+	OnConflict *OnConflict
+	Returning  []SelectItem
+}
+
+// OnConflict is the UPSERT clause:
+// ON CONFLICT [(cols)] DO NOTHING | DO UPDATE SET ... [WHERE ...].
+type OnConflict struct {
+	Target    []string // empty: any uniqueness conflict
+	DoNothing bool
+	Sets      []Assignment
+	Where     Expr
 }
 
 type TableRef struct {
@@ -96,14 +109,16 @@ type Assignment struct {
 }
 
 type Update struct {
-	Table string
-	Sets  []Assignment
-	Where Expr
+	Table     string
+	Sets      []Assignment
+	Where     Expr
+	Returning []SelectItem
 }
 
 type Delete struct {
-	Table string
-	Where Expr
+	Table     string
+	Where     Expr
+	Returning []SelectItem
 }
 
 type Begin struct{}

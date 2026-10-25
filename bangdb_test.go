@@ -603,3 +603,10 @@ func randArg(rng *rand.Rand, col string, randVal func(string) any) any {
 	}
 	return randVal(col)
 }
+
+func TestSelectWithoutFrom(t *testing.T) {
+	db := open(t)
+	expect(t, db, `SELECT 1 WHERE 0`, "")
+	expect(t, db, `SELECT 'yes' WHERE 1 = 1`, "yes")
+	expect(t, db, `SELECT COUNT(*) WHERE 0`, "0")
+}

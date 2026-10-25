@@ -673,8 +673,9 @@ func (x *execCtx) buildLevels(from []sql.TableRef, lefts []bool, ons []sql.Expr,
 		}
 		lvl = max(lvl, 0)
 		// A WHERE condition on an outer-joined table must see the
-		// NULL-extended row, so it is evaluated after the join.
-		if levels[lvl].left {
+		// NULL-extended row, so it is evaluated after the join. Without
+		// any table (SELECT ... WHERE ...) everything is a final filter.
+		if len(levels) == 0 || levels[lvl].left {
 			final = append(final, f)
 			continue
 		}

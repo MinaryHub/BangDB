@@ -40,10 +40,10 @@ func TestCompositeKeys(t *testing.T) {
 	}
 	for q, want := range map[string]string{
 		`SELECT * FROM enroll WHERE student = 'kim' AND course = 'db' AND term = 1`: "bangdb_autoindex_enroll_pk (student=? AND course=? AND term=?)",
-		`SELECT * FROM enroll WHERE student = 'kim'`:                               "bangdb_autoindex_enroll_pk (student=?)",
-		`SELECT * FROM enroll WHERE course = 'db' AND term > 2025`:                 "enroll_course_term RANGE (course=? AND term>?)",
-		`SELECT * FROM enroll WHERE term = 2026`:                                   "SCAN enroll",
-		`SELECT * FROM seats WHERE room = 'A' AND seat IN (1, 2)`:                  "u", // composite UNIQUE index
+		`SELECT * FROM enroll WHERE student = 'kim'`:                                "bangdb_autoindex_enroll_pk (student=?)",
+		`SELECT * FROM enroll WHERE course = 'db' AND term > 2025`:                  "enroll_course_term RANGE (course=? AND term>?)",
+		`SELECT * FROM enroll WHERE term = 2026`:                                    "SCAN enroll",
+		`SELECT * FROM seats WHERE room = 'A' AND seat IN (1, 2)`:                   "u", // composite UNIQUE index
 	} {
 		if p := plan(q); !strings.Contains(p, want) {
 			t.Errorf("%s\n plan %s\n want %s", q, p, want)

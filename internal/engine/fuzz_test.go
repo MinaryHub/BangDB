@@ -21,6 +21,10 @@ func FuzzExec(f *testing.F) {
 		"INSERT INTO u (tid, v) VALUES (1, x'00'), (2, NULL); SELECT LENGTH(v), TYPEOF(v) FROM u",
 		"SELECT SUBSTR(name, -1, 2), ROUND(n / 3.0, 1), COALESCE(NULL, n), CAST(name AS INTEGER) FROM t",
 		"DROP TABLE u; CREATE TABLE u (k TEXT PRIMARY KEY)",
+		"INSERT INTO t (name, n) VALUES ('a', 5) ON CONFLICT (name) DO UPDATE SET n = excluded.n + t.n WHERE excluded.n > 0 RETURNING *",
+		"INSERT OR REPLACE INTO t (id, name) SELECT id + 1, name || 'x' FROM t RETURNING id",
+		"CREATE TABLE p (a INT, b TEXT, c REAL, PRIMARY KEY (a, b), UNIQUE (b, c)); INSERT INTO p VALUES (1, 'x', 1.5) ON CONFLICT DO NOTHING",
+		"UPDATE u SET tid = tid + 1 WHERE tid IN (1, 3) RETURNING rowid, tid; DELETE FROM u RETURNING v",
 	} {
 		f.Add(s)
 	}

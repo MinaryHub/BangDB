@@ -48,7 +48,7 @@ var reserved = map[string]bool{
 	"OUTER": true, "ON": true, "AND": true, "OR": true, "NOT": true, "AS": true, "SET": true,
 	"VALUES": true, "UNION": true, "BY": true, "ASC": true, "DESC": true, "IS": true, "IN": true,
 	"LIKE": true, "BETWEEN": true, "NULL": true, "CASE": true, "WHEN": true, "THEN": true,
-	"ELSE": true, "END": true, "DISTINCT": true, "INTO": true,
+	"ELSE": true, "END": true, "DISTINCT": true, "INTO": true, "RETURNING": true,
 }
 
 func (p *parser) peek() token { return p.toks[p.pos] }
@@ -359,126 +359,91 @@ func (p *parser) parseAlter() (Stmt, error) {
 }
 
 func (p *parser) parseInsert() (Stmt, error) {
+	ins := &Insert{}
+	if p.acceptKw("OR") {
+		switch {
+		case p.acceptKw("IGNORE"):
+			ins.Or = "IGNORE"
+		case p.acceptKw("REPLACE"):
+			ins.Or = "REPLACE"
+		default:
+			return nil, p.errf("expected IGNORE or REPLACE")
+		}
+	}
 	if err := p.expectKw("INTO"); err != nil {
 		return nil, err
 	}
-	ins := &Insert{}
 	var err error
 	if ins.Table, err = p.ident(); err != nil {
 		return nil, err
 	}
-	if p.acceptOp("(") {
+	if p.peek().kind == tOp && p.peek().text == "(" {
+		if ins.Columns, err = p.parseColumnList(); err != nil {
+			return nil, err
+		}
+	}
+	if p.isKw("SELECT") {
+		if ins.Select, err = p.parseSelect(); err != nil {
+			return nil, err
+		}
+	} else {
+		if err := p.expectKw("VALUES"); err != nil {
+			return nil, err
+		}
 		for {
-			c, err := p.ident()
+			if err := p.expectOp("("); err != nil {
+				return nil, err
+			}
+			row, err := p.parseExprList()
 			if err != nil {
 				return nil, err
 			}
-			ins.Columns = append(ins.Columns, c)
+			if err := p.expectOp(")"); err != nil {
+				return nil, err
+			}
+			ins.Rows = append(ins.Rows, row)
 			if !p.acceptOp(",") {
 				break
 			}
 		}
-		if err := p.expectOp(")"); err != nil {
-			return nil, err
-		}
 	}
-	if err := p.expectKw("VALUES"); err != nil {
-		return nil, err
+	if p.acceptKw("ON", "CONFLICT") {
+		if ins.Or != "" {
+			return nil, p.errf("INSERT OR %s cannot be combined with ON CONFLICT", ins.Or)
+		}
+		oc := &OnConflict{}
+		if p.peek().kind == tOp && p.peek().text == "(" {
+			if oc.Target, err = p.parseColumnList(); err != nil {
+				return nil, err
+			}
+		}
+		if err := p.expectKw("DO"); err != nil {
+			return nil, err
+		}
+		if p.acceptKw("NOTHING") {
+			oc.DoNothing = true
+		} else {
+			if err := p.expectKw("UPDATE", "SET"); err != nil {
+				return nil, err
+			}
+			if oc.Sets, err = p.parseAssignments(); err != nil {
+				return nil, err
+			}
+			if p.acceptKw("WHERE") {
+				if oc.Where, err = p.parseExpr(); err != nil {
+					return nil, err
+				}
+			}
+		}
+		ins.OnConflict = oc
 	}
-	for {
-		if err := p.expectOp("("); err != nil {
-			return nil, err
-		}
-		row, err := p.parseExprList()
-		if err != nil {
-			return nil, err
-		}
-		if err := p.expectOp(")"); err != nil {
-			return nil, err
-		}
-		ins.Rows = append(ins.Rows, row)
-		if !p.acceptOp(",") {
-			break
-		}
-	}
-	return ins, nil
+	ins.Returning, err = p.parseReturning()
+	return ins, err
 }
 
-func (p *parser) parseUpdate() (Stmt, error) {
-	up := &Update{}
-	var err error
-	if up.Table, err = p.ident(); err != nil {
-		return nil, err
-	}
-	if err := p.expectKw("SET"); err != nil {
-		return nil, err
-	}
-	for {
-		col, err := p.ident()
-		if err != nil {
-			return nil, err
-		}
-		if err := p.expectOp("="); err != nil {
-			return nil, err
-		}
-		e, err := p.parseExpr()
-		if err != nil {
-			return nil, err
-		}
-		up.Sets = append(up.Sets, Assignment{col, e})
-		if !p.acceptOp(",") {
-			break
-		}
-	}
-	if p.acceptKw("WHERE") {
-		if up.Where, err = p.parseExpr(); err != nil {
-			return nil, err
-		}
-	}
-	return up, nil
-}
-
-func (p *parser) parseDelete() (Stmt, error) {
-	if err := p.expectKw("FROM"); err != nil {
-		return nil, err
-	}
-	d := &Delete{}
-	var err error
-	if d.Table, err = p.ident(); err != nil {
-		return nil, err
-	}
-	if p.acceptKw("WHERE") {
-		if d.Where, err = p.parseExpr(); err != nil {
-			return nil, err
-		}
-	}
-	return d, nil
-}
-
-func (p *parser) parseTableRef() (TableRef, error) {
-	var tr TableRef
-	var err error
-	if tr.Name, err = p.ident(); err != nil {
-		return tr, err
-	}
-	if p.acceptKw("AS") {
-		tr.Alias, err = p.ident()
-	} else if t := p.peek(); t.kind == tQuotedIdent || t.kind == tIdent && !reserved[strings.ToUpper(t.text)] {
-		tr.Alias, err = p.ident()
-	}
-	return tr, err
-}
-
-func (p *parser) parseSelect() (*Select, error) {
-	if err := p.expectKw("SELECT"); err != nil {
-		return nil, err
-	}
-	s := &Select{}
-	if p.acceptKw("DISTINCT") {
-		s.Distinct = true
-	} else {
-		p.acceptKw("ALL")
-	}
+// parseSelectItems parses a select list (also used by RETURNING).
+func (p *parser) parseSelectItems() ([]SelectItem, error) {
+	var items []SelectItem
 	for {
 		var item SelectItem
 		switch {
@@ -506,11 +471,110 @@ func (p *parser) parseSelect() (*Select, error) {
 				item.Alias, _ = p.ident()
 			}
 		}
-		s.Items = append(s.Items, item)
+		items = append(items, item)
 		if !p.acceptOp(",") {
-			break
+			return items, nil
 		}
 	}
+}
+
+// parseReturning parses an optional RETURNING clause.
+func (p *parser) parseReturning() ([]SelectItem, error) {
+	if !p.acceptKw("RETURNING") {
+		return nil, nil
+	}
+	return p.parseSelectItems()
+}
+
+func (p *parser) parseAssignments() ([]Assignment, error) {
+	var sets []Assignment
+	for {
+		col, err := p.ident()
+		if err != nil {
+			return nil, err
+		}
+		if err := p.expectOp("="); err != nil {
+			return nil, err
+		}
+		e, err := p.parseExpr()
+		if err != nil {
+			return nil, err
+		}
+		sets = append(sets, Assignment{col, e})
+		if !p.acceptOp(",") {
+			return sets, nil
+		}
+	}
+}
+
+func (p *parser) parseUpdate() (Stmt, error) {
+	up := &Update{}
+	var err error
+	if up.Table, err = p.ident(); err != nil {
+		return nil, err
+	}
+	if err := p.expectKw("SET"); err != nil {
+		return nil, err
+	}
+	if up.Sets, err = p.parseAssignments(); err != nil {
+		return nil, err
+	}
+	if p.acceptKw("WHERE") {
+		if up.Where, err = p.parseExpr(); err != nil {
+			return nil, err
+		}
+	}
+	up.Returning, err = p.parseReturning()
+	return up, err
+}
+
+func (p *parser) parseDelete() (Stmt, error) {
+	if err := p.expectKw("FROM"); err != nil {
+		return nil, err
+	}
+	d := &Delete{}
+	var err error
+	if d.Table, err = p.ident(); err != nil {
+		return nil, err
+	}
+	if p.acceptKw("WHERE") {
+		if d.Where, err = p.parseExpr(); err != nil {
+			return nil, err
+		}
+	}
+	d.Returning, err = p.parseReturning()
+	return d, err
+}
+
+func (p *parser) parseTableRef() (TableRef, error) {
+	var tr TableRef
+	var err error
+	if tr.Name, err = p.ident(); err != nil {
+		return tr, err
+	}
+	if p.acceptKw("AS") {
+		tr.Alias, err = p.ident()
+	} else if t := p.peek(); t.kind == tQuotedIdent || t.kind == tIdent && !reserved[strings.ToUpper(t.text)] {
+		tr.Alias, err = p.ident()
+	}
+	return tr, err
+}
+
+func (p *parser) parseSelect() (*Select, error) {
+	if err := p.expectKw("SELECT"); err != nil {
+		return nil, err
+	}
+	s := &Select{}
+	if p.acceptKw("DISTINCT") {
+		s.Distinct = true
+	} else {
+		p.acceptKw("ALL")
+	}
+	items, err := p.parseSelectItems()
+	if err != nil {
+		return nil, err
+	}
+	s.Items = items
 	if p.acceptKw("FROM") {
 		tr, err := p.parseTableRef()
 		if err != nil {
@@ -541,7 +605,6 @@ func (p *parser) parseSelect() (*Select, error) {
 		}
 	doneJoins:
 	}
-	var err error
 	if p.acceptKw("WHERE") {
 		if s.Where, err = p.parseExpr(); err != nil {
 			return nil, err
