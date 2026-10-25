@@ -77,31 +77,31 @@ func (c *conn) Begin() (driver.Tx, error) { return c.BeginTx(context.Background(
 
 // BeginTx starts a transaction. Read-only transactions are served as
 // regular ones (they take the single-writer lock).
-func (c *conn) BeginTx(context.Context, driver.TxOptions) (driver.Tx, error) {
-	if _, err := c.c.Exec("BEGIN"); err != nil {
+func (c *conn) BeginTx(ctx context.Context, _ driver.TxOptions) (driver.Tx, error) {
+	if _, err := c.c.ExecContext(ctx, "BEGIN"); err != nil {
 		return nil, err
 	}
 	return &tx{c: c}, nil
 }
 
-func (c *conn) ExecContext(_ context.Context, query string, args []driver.NamedValue) (driver.Result, error) {
+func (c *conn) ExecContext(ctx context.Context, query string, args []driver.NamedValue) (driver.Result, error) {
 	vals, err := values(args)
 	if err != nil {
 		return nil, err
 	}
-	r, err := c.c.Exec(query, vals...)
+	r, err := c.c.ExecContext(ctx, query, vals...)
 	if err != nil {
 		return nil, err
 	}
 	return result{r}, nil
 }
 
-func (c *conn) QueryContext(_ context.Context, query string, args []driver.NamedValue) (driver.Rows, error) {
+func (c *conn) QueryContext(ctx context.Context, query string, args []driver.NamedValue) (driver.Rows, error) {
 	vals, err := values(args)
 	if err != nil {
 		return nil, err
 	}
-	r, err := c.c.Exec(query, vals...)
+	r, err := c.c.ExecContext(ctx, query, vals...)
 	if err != nil {
 		return nil, err
 	}

@@ -1,9 +1,13 @@
 package driver_test
 
 import (
+	"context"
 	"database/sql"
+	"errors"
+	"fmt"
 	"path/filepath"
 	"testing"
+	"time"
 
 	_ "github.com/knoxxr/bangdb/driver"
 )
@@ -73,5 +77,23 @@ func TestMemoryIsSharedAcrossConnections(t *testing.T) {
 	var n int
 	if err := db.QueryRow(`SELECT COUNT(*) FROM t`).Scan(&n); err != nil || n != 1 {
 		t.Fatalf("n=%d err=%v", n, err)
+	}
+}
+
+func TestContextCancellation(t *testing.T) {
+	db, _ := sql.Open("bangdb", ":memory:")
+	defer db.Close()
+	db.Exec(`CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)`)
+	tx, _ := db.Begin()
+	for i := 0; i < 3000; i++ {
+		tx.Exec(`INSERT INTO t (v) VALUES (?)`, fmt.Sprint(i))
+	}
+	tx.Commit()
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	var n int
+	err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM t a JOIN t b ON a.v = b.v`).Scan(&n)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("want DeadlineExceeded, got %v", err)
 	}
 }

@@ -496,6 +496,7 @@ func (x *execCtx) execInsert(st *sql.Insert) (Result, error) {
 	c := &compiler{}
 	e := &env{args: x.args}
 	var res Result
+	var maxID int64
 	for _, exprs := range st.Rows {
 		if len(exprs) != len(positions) {
 			return Result{}, fmt.Errorf("bangdb: %d values for %d columns", len(exprs), len(positions))
@@ -530,8 +531,9 @@ func (x *execCtx) execInsert(st *sql.Insert) (Result, error) {
 		}
 		res.RowsAffected++
 		res.LastInsertID = id
+		maxID = max(maxID, id)
 	}
-	return res, nil
+	return res, x.recordSequence(t, maxID)
 }
 
 type target struct {
@@ -645,6 +647,9 @@ func (x *execCtx) execUpdate(st *sql.Update) (Result, error) {
 			return Result{}, err
 		}
 		x.noteRowid(t, newID)
+		if err := x.recordSequence(t, newID); err != nil {
+			return Result{}, err
+		}
 	}
 	return Result{RowsAffected: int64(len(targets))}, nil
 }

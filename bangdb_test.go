@@ -249,6 +249,27 @@ func TestRowidAndAutoincrement(t *testing.T) {
 	if r.LastInsertID != 101 {
 		t.Fatalf("id after explicit 100 = %d", r.LastInsertID)
 	}
+	// AUTOINCREMENT never reuses the id of a deleted maximum row, also
+	// across transactions and after reopening.
+	exec(t, db, `CREATE TABLE a (id INTEGER PRIMARY KEY AUTOINCREMENT, v TEXT)`)
+	exec(t, db, `INSERT INTO a (v) VALUES ('1'), ('2'), ('3')`)
+	exec(t, db, `DELETE FROM a WHERE id = 3`)
+	if r := exec(t, db, `INSERT INTO a (v) VALUES ('4')`); r.LastInsertID != 4 {
+		t.Fatalf("AUTOINCREMENT reused id: %d", r.LastInsertID)
+	}
+	exec(t, db, `DELETE FROM a`)
+	if r := exec(t, db, `INSERT INTO a (v) VALUES ('5')`); r.LastInsertID != 5 {
+		t.Fatalf("AUTOINCREMENT after delete-all: %d", r.LastInsertID)
+	}
+	// Plain INTEGER PRIMARY KEY may reuse (documented, like SQLite).
+	exec(t, db, `DELETE FROM t WHERE id = 101`)
+	if r := exec(t, db, `INSERT INTO t (v) VALUES ('x')`); r.LastInsertID != 101 {
+		t.Fatalf("rowid table: %d", r.LastInsertID)
+	}
+	exec(t, db, `DROP TABLE a; CREATE TABLE a (id INTEGER PRIMARY KEY AUTOINCREMENT, v TEXT)`)
+	if r := exec(t, db, `INSERT INTO a (v) VALUES ('fresh')`); r.LastInsertID != 1 {
+		t.Fatalf("dropped table kept its sequence: %d", r.LastInsertID)
+	}
 	exec(t, db, `INSERT INTO n VALUES ('x'), ('y')`)
 	expect(t, db, `SELECT rowid, v FROM n ORDER BY rowid DESC`, "2|y;1|x")
 	expect(t, db, `SELECT * FROM n`, "x;y")

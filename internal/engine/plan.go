@@ -349,7 +349,13 @@ func rangeBound(v any, t value.Type, lower bool, inc bool) (any, bool, bool) {
 }
 
 // scan feeds every row located by acc to fn. fn returns false to stop.
-func (x *execCtx) scan(t *Table, acc *access, e *env, fn func(rowid int64, row []any) (bool, error)) error {
+func (x *execCtx) scan(t *Table, acc *access, e *env, visit func(rowid int64, row []any) (bool, error)) error {
+	fn := func(rowid int64, row []any) (bool, error) {
+		if err := x.tick(); err != nil {
+			return false, err
+		}
+		return visit(rowid, row)
+	}
 	tree := btree.Open(x.v, t.Root)
 	emit := func(rowid int64) (bool, error) {
 		row, ok, err := x.getRow(t, rowid)
@@ -389,6 +395,9 @@ func (x *execCtx) scan(t *Table, acc *access, e *env, fn func(rowid int64, row [
 			var ids []int64
 			c := btree.Open(x.v, acc.ix.Root).Seek(prefix)
 			for ; c.Valid() && bytes.HasPrefix(c.Key(), prefix); c.Next() {
+				if err := x.tick(); err != nil {
+					return err
+				}
 				ids = append(ids, value.DecodeRowID(c.Key()[len(prefix):]))
 			}
 			if err := c.Err(); err != nil {
@@ -491,6 +500,9 @@ func (x *execCtx) scan(t *Table, acc *access, e *env, fn func(rowid int64, row [
 		var ids []int64
 		c := btree.Open(x.v, acc.ix.Root).Seek(start)
 		for ; c.Valid(); c.Next() {
+			if err := x.tick(); err != nil {
+				return err
+			}
 			key := c.Key()
 			if lowPrefix != nil && bytes.HasPrefix(key, lowPrefix) {
 				continue

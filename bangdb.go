@@ -73,9 +73,22 @@ func (db *DB) Exec(query string, args ...any) (Result, error) {
 	return Result{r.RowsAffected, r.LastInsertID}, err
 }
 
+// ExecContext is Exec with cancellation: when ctx is canceled or its
+// deadline passes, the running statement stops, is rolled back, and the
+// error matches context.Canceled / context.DeadlineExceeded.
+func (db *DB) ExecContext(ctx context.Context, query string, args ...any) (Result, error) {
+	r, err := db.e.ExecContext(ctx, query, args...)
+	return Result{r.RowsAffected, r.LastInsertID}, err
+}
+
 // Query runs a query and returns its (fully materialized) rows.
 func (db *DB) Query(query string, args ...any) (*Rows, error) {
-	r, err := db.e.Query(query, args...)
+	return db.QueryContext(context.Background(), query, args...)
+}
+
+// QueryContext is Query with cancellation (see ExecContext).
+func (db *DB) QueryContext(ctx context.Context, query string, args ...any) (*Rows, error) {
+	r, err := db.e.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -84,14 +97,22 @@ func (db *DB) Query(query string, args ...any) (*Rows, error) {
 
 // QueryRow runs a query expected to return at most one row.
 func (db *DB) QueryRow(query string, args ...any) *Row {
-	rows, err := db.Query(query, args...)
+	return db.QueryRowContext(context.Background(), query, args...)
+}
+
+// QueryRowContext is QueryRow with cancellation.
+func (db *DB) QueryRowContext(ctx context.Context, query string, args ...any) *Row {
+	rows, err := db.QueryContext(ctx, query, args...)
 	return &Row{rows: rows, err: err}
 }
 
 // Begin starts a write transaction. Only one write transaction can be active
 // at a time; others wait up to the busy timeout. Readers are not blocked.
-func (db *DB) Begin() (*Tx, error) {
-	tx, err := db.e.Begin()
+func (db *DB) Begin() (*Tx, error) { return db.BeginContext(context.Background()) }
+
+// BeginContext is Begin; ctx bounds the wait for the write lock.
+func (db *DB) BeginContext(ctx context.Context) (*Tx, error) {
+	tx, err := db.e.BeginContext(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -149,9 +170,20 @@ func (tx *Tx) Exec(query string, args ...any) (Result, error) {
 	return Result{r.RowsAffected, r.LastInsertID}, err
 }
 
+// ExecContext is Exec with cancellation of the running statement.
+func (tx *Tx) ExecContext(ctx context.Context, query string, args ...any) (Result, error) {
+	r, err := tx.t.ExecContext(ctx, query, args...)
+	return Result{r.RowsAffected, r.LastInsertID}, err
+}
+
 // Query runs a query inside the transaction (it sees uncommitted changes).
 func (tx *Tx) Query(query string, args ...any) (*Rows, error) {
-	r, err := tx.t.Query(query, args...)
+	return tx.QueryContext(context.Background(), query, args...)
+}
+
+// QueryContext is Query with cancellation.
+func (tx *Tx) QueryContext(ctx context.Context, query string, args ...any) (*Rows, error) {
+	r, err := tx.t.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, err
 	}

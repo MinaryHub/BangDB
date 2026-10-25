@@ -2,6 +2,7 @@ package engine
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"math"
@@ -15,10 +16,24 @@ import (
 
 // execCtx carries what a single statement needs to run.
 type execCtx struct {
-	v    *pager.View
-	cat  *Catalog
-	tx   *Tx // nil for read-only execution
-	args []any
+	v     *pager.View
+	cat   *Catalog
+	tx    *Tx // nil for read-only execution
+	args  []any
+	ctx   context.Context
+	ticks uint32
+}
+
+// tick is called once per row visited; every 256 rows it checks whether the
+// statement was canceled or timed out.
+func (x *execCtx) tick() error {
+	x.ticks++
+	if x.ticks&255 == 0 && x.ctx != nil {
+		if err := x.ctx.Err(); err != nil {
+			return interrupted(err)
+		}
+	}
+	return nil
 }
 
 func (x *execCtx) exec(s sql.Stmt) (Result, error) {
@@ -125,16 +140,73 @@ func (x *execCtx) nextRowid(t *Table) (int64, error) {
 	if err != nil {
 		return 0, err
 	}
-	next := int64(1)
+	high := int64(0)
 	if ok {
-		lastID := value.DecodeRowID(last)
-		if lastID == math.MaxInt64 {
-			return 0, errors.New("bangdb: rowid space exhausted")
-		}
-		next = max(lastID+1, 1)
+		high = value.DecodeRowID(last)
 	}
+	if t.autoIncrement() {
+		// AUTOINCREMENT never reuses ids, even after the largest row was
+		// deleted: honour the recorded high-water mark.
+		if hw, err := x.sequence(t); err != nil {
+			return 0, err
+		} else if hw > high {
+			high = hw
+		}
+	}
+	if high == math.MaxInt64 {
+		return 0, errors.New("bangdb: rowid space exhausted")
+	}
+	next := max(high+1, 1)
 	x.tx.rowids[key] = next
 	return next, nil
+}
+
+// metaSequenceRoot is the header meta slot of the AUTOINCREMENT high-water
+// mark tree (table name -> largest rowid ever issued).
+const metaSequenceRoot = 1
+
+func (t *Table) autoIncrement() bool {
+	return t.RowidCol >= 0 && t.Columns[t.RowidCol].AutoIncrement
+}
+
+func (x *execCtx) sequence(t *Table) (int64, error) {
+	root := x.v.Meta(metaSequenceRoot)
+	if root == 0 {
+		return 0, nil
+	}
+	b, ok, err := btree.Open(x.v, root).Get([]byte(strings.ToLower(t.Name)))
+	if err != nil || !ok {
+		return 0, err
+	}
+	return value.DecodeRowID(b), nil
+}
+
+// recordSequence raises the AUTOINCREMENT high-water mark of t to id.
+func (x *execCtx) recordSequence(t *Table, id int64) error {
+	if !t.autoIncrement() {
+		return nil
+	}
+	if hw, err := x.sequence(t); err != nil || hw >= id {
+		return err
+	}
+	root := x.v.Meta(metaSequenceRoot)
+	if root == 0 {
+		var err error
+		if root, err = btree.Create(x.v); err != nil {
+			return err
+		}
+		x.v.SetMeta(metaSequenceRoot, root)
+	}
+	return btree.Open(x.v, root).Put([]byte(strings.ToLower(t.Name)), value.EncodeRowID(id))
+}
+
+func (x *execCtx) dropSequence(t *Table) error {
+	root := x.v.Meta(metaSequenceRoot)
+	if root == 0 {
+		return nil
+	}
+	_, err := btree.Open(x.v, root).Delete([]byte(strings.ToLower(t.Name)))
+	return err
 }
 
 func (x *execCtx) noteRowid(t *Table, id int64) {
@@ -331,6 +403,9 @@ func (x *execCtx) dropTable(st *sql.DropTable) error {
 	}
 	delete(x.cat.tables, strings.ToLower(t.Name))
 	delete(x.tx.rowids, strings.ToLower(t.Name))
+	if err := x.dropSequence(t); err != nil {
+		return err
+	}
 	x.cat.link()
 	return nil
 }
@@ -371,6 +446,9 @@ func (x *execCtx) addIndex(ix *Index) error {
 	tree := btree.Open(x.v, root)
 	c := btree.Open(x.v, t.Root).Seek(nil)
 	for ; c.Valid(); c.Next() {
+		if err := x.tick(); err != nil {
+			return err
+		}
 		data, err := c.Value()
 		if err != nil {
 			return err

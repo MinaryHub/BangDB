@@ -300,7 +300,7 @@ func (db *DB) ReadOnly() bool { return db.readOnly.Load() }
 // ApplyFrame applies a frame from the primary. Frames at or below the local
 // sequence are ignored (idempotent re-delivery). Readers are not blocked.
 func (db *DB) ApplyFrame(f Frame) error {
-	if err := db.lockWrite(); err != nil {
+	if err := db.lockWrite(context.Background()); err != nil {
 		return err
 	}
 	defer db.unlockWrite()
@@ -431,7 +431,7 @@ func (db *DB) InstallSnapshot(w *SnapshotWriter) error {
 	if w.path != db.path && !(w.path == "" && db.path == "") {
 		return errors.New("bangdb: snapshot was built for a different path")
 	}
-	if err := db.lockWrite(); err != nil {
+	if err := db.lockWrite(context.Background()); err != nil {
 		return err
 	}
 	defer db.unlockWrite()

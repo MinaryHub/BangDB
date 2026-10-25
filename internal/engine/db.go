@@ -2,6 +2,7 @@
 package engine
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"sync"
@@ -27,6 +28,9 @@ type Options struct {
 	// BusyTimeout is how long a writer waits for another write transaction
 	// to finish. Default: 5s.
 	BusyTimeout time.Duration
+	// QueryTimeout limits the run time of every statement whose context has
+	// no deadline of its own. Default: no limit.
+	QueryTimeout time.Duration
 }
 
 // Result is the outcome of executing SQL.
@@ -52,10 +56,11 @@ type DB struct {
 	pubMu sync.Mutex
 	// swapMu guards the pager pointer: readers hold R for a statement,
 	// replacing or closing the pager takes W.
-	swapMu      sync.RWMutex
-	catMu       sync.Mutex
-	cat         *Catalog // committed catalog (immutable)
-	busyTimeout time.Duration
+	swapMu       sync.RWMutex
+	catMu        sync.Mutex
+	cat          *Catalog // committed catalog (immutable)
+	busyTimeout  time.Duration
+	queryTimeout time.Duration
 
 	cacheMu   sync.Mutex
 	stmtCache map[string]parsed
@@ -93,6 +98,9 @@ func Open(path string, opts *Options) (*DB, error) {
 	if opts != nil && opts.BusyTimeout > 0 {
 		db.busyTimeout = opts.BusyTimeout
 	}
+	if opts != nil {
+		db.queryTimeout = opts.QueryTimeout
+	}
 	cat, err := loadCatalog(p.NewView())
 	if err != nil {
 		p.Close()
@@ -107,7 +115,7 @@ func Open(path string, opts *Options) (*DB, error) {
 func (db *DB) Close() error {
 	var err error
 	db.closeOnce.Do(func() {
-		if lerr := db.lockWrite(); lerr != nil {
+		if lerr := db.lockWrite(context.Background()); lerr != nil {
 			err = fmt.Errorf("bangdb: close: %w", lerr)
 			return
 		}
@@ -133,7 +141,9 @@ func (db *DB) isClosed() bool {
 	}
 }
 
-func (db *DB) lockWrite() error {
+// lockWrite takes the single-writer lock, waiting up to the busy timeout
+// or until ctx is done.
+func (db *DB) lockWrite(ctx context.Context) error {
 	select {
 	case db.writeSem <- struct{}{}:
 		return nil
@@ -146,7 +156,24 @@ func (db *DB) lockWrite() error {
 		return nil
 	case <-t.C:
 		return ErrBusy
+	case <-ctx.Done():
+		return interrupted(ctx.Err())
 	}
+}
+
+// interrupted wraps a context error; errors.Is(err, context.Canceled /
+// context.DeadlineExceeded) still works.
+func interrupted(err error) error { return fmt.Errorf("bangdb: statement interrupted: %w", err) }
+
+// stmtContext applies the default query timeout to ctx.
+func (db *DB) stmtContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if _, has := ctx.Deadline(); !has && db.queryTimeout > 0 {
+		return context.WithTimeout(ctx, db.queryTimeout)
+	}
+	return ctx, func() {}
 }
 
 func (db *DB) unlockWrite() { <-db.writeSem }
@@ -199,8 +226,14 @@ func normalizeArgs(args []any, want int) ([]any, error) {
 // Exec runs one or more statements. Scripts may contain BEGIN/COMMIT; a
 // transaction left open at the end of the script is rolled back.
 func (db *DB) Exec(src string, args ...any) (Result, error) {
+	return db.ExecContext(context.Background(), src, args...)
+}
+
+// ExecContext is Exec with cancellation: when ctx is done, the running
+// statement stops and is rolled back.
+func (db *DB) ExecContext(ctx context.Context, src string, args ...any) (Result, error) {
 	c := db.Conn()
-	res, err := c.Exec(src, args...)
+	res, err := c.ExecContext(ctx, src, args...)
 	if c.tx != nil {
 		c.tx.Rollback()
 		if err == nil {
@@ -213,16 +246,24 @@ func (db *DB) Exec(src string, args ...any) (Result, error) {
 // Query is Exec; it exists for readability at call sites.
 func (db *DB) Query(src string, args ...any) (Result, error) { return db.Exec(src, args...) }
 
+// QueryContext is ExecContext; it exists for readability at call sites.
+func (db *DB) QueryContext(ctx context.Context, src string, args ...any) (Result, error) {
+	return db.ExecContext(ctx, src, args...)
+}
+
 // Begin starts an explicit write transaction. It blocks (up to the busy
 // timeout) while another write transaction is active.
-func (db *DB) Begin() (*Tx, error) {
+func (db *DB) Begin() (*Tx, error) { return db.BeginContext(context.Background()) }
+
+// BeginContext is Begin; ctx only bounds the wait for the write lock.
+func (db *DB) BeginContext(ctx context.Context) (*Tx, error) {
 	if db.isClosed() {
 		return nil, pager.ErrClosed
 	}
 	if db.readOnly.Load() {
 		return nil, ErrReadOnly
 	}
-	if err := db.lockWrite(); err != nil {
+	if err := db.lockWrite(ctx); err != nil {
 		return nil, err
 	}
 	if db.isClosed() {
@@ -233,7 +274,7 @@ func (db *DB) Begin() (*Tx, error) {
 }
 
 // read runs fn against a snapshot of the latest commit.
-func (db *DB) read(fn func(x *execCtx) (Result, error), args []any) (Result, error) {
+func (db *DB) read(ctx context.Context, fn func(x *execCtx) (Result, error), args []any) (Result, error) {
 	db.swapMu.RLock()
 	defer db.swapMu.RUnlock()
 	if db.isClosed() {
@@ -247,7 +288,7 @@ func (db *DB) read(fn func(x *execCtx) (Result, error), args []any) (Result, err
 		return Result{}, err
 	}
 	defer snap.Release()
-	x := &execCtx{v: snap.View(), cat: cat, args: args}
+	x := &execCtx{v: snap.View(), cat: cat, args: args, ctx: ctx}
 	return fn(x)
 }
 
@@ -278,7 +319,7 @@ func (db *DB) publish(c *pager.Prepared, cat func() (*Catalog, error)) error {
 // far as active readers allow. It runs automatically; calling it explicitly
 // is only useful before copying the database file by hand.
 func (db *DB) Checkpoint() error {
-	if err := db.lockWrite(); err != nil {
+	if err := db.lockWrite(context.Background()); err != nil {
 		return err
 	}
 	defer db.unlockWrite()
@@ -300,6 +341,11 @@ type Tx struct {
 // Exec runs statements inside the transaction. A failing statement is rolled
 // back on its own; the transaction stays usable.
 func (tx *Tx) Exec(src string, args ...any) (Result, error) {
+	return tx.ExecContext(context.Background(), src, args...)
+}
+
+// ExecContext is Exec with cancellation of the running statement.
+func (tx *Tx) ExecContext(ctx context.Context, src string, args ...any) (Result, error) {
 	if tx.done {
 		return Result{}, ErrTxDone
 	}
@@ -317,7 +363,7 @@ func (tx *Tx) Exec(src string, args ...any) (Result, error) {
 		case *sql.Begin, *sql.Commit, *sql.Rollback:
 			return res, errors.New("bangdb: use Tx.Commit / Tx.Rollback instead of transaction statements")
 		}
-		if res, err = tx.execStmt(s, nargs); err != nil {
+		if res, err = tx.execStmt(ctx, s, nargs); err != nil {
 			return res, err
 		}
 	}
@@ -327,14 +373,21 @@ func (tx *Tx) Exec(src string, args ...any) (Result, error) {
 // Query is Exec; it exists for readability at call sites.
 func (tx *Tx) Query(src string, args ...any) (Result, error) { return tx.Exec(src, args...) }
 
-func (tx *Tx) execStmt(s sql.Stmt, args []any) (Result, error) {
+// QueryContext is ExecContext; it exists for readability at call sites.
+func (tx *Tx) QueryContext(ctx context.Context, src string, args ...any) (Result, error) {
+	return tx.ExecContext(ctx, src, args...)
+}
+
+func (tx *Tx) execStmt(ctx context.Context, s sql.Stmt, args []any) (Result, error) {
+	ctx, cancel := tx.db.stmtContext(ctx)
+	defer cancel()
 	sp := tx.v.Savepoint()
 	cat := tx.cat
 	rowids := make(map[string]int64, len(tx.rowids))
 	for k, v := range tx.rowids {
 		rowids[k] = v
 	}
-	x := &execCtx{v: tx.v, cat: tx.cat, tx: tx, args: args}
+	x := &execCtx{v: tx.v, cat: tx.cat, tx: tx, args: args, ctx: ctx}
 	res, err := x.exec(s)
 	if err != nil {
 		tx.v.Restore(sp)
@@ -395,6 +448,11 @@ func (c *Conn) Close() error {
 
 // Exec runs one or more statements in the session.
 func (c *Conn) Exec(src string, args ...any) (Result, error) {
+	return c.ExecContext(context.Background(), src, args...)
+}
+
+// ExecContext is Exec with cancellation of the running statement.
+func (c *Conn) ExecContext(ctx context.Context, src string, args ...any) (Result, error) {
 	pr, err := c.db.parse(src)
 	if err != nil {
 		return Result{}, err
@@ -405,20 +463,20 @@ func (c *Conn) Exec(src string, args ...any) (Result, error) {
 	}
 	var res Result
 	for _, s := range pr.stmts {
-		if res, err = c.execStmt(s, nargs); err != nil {
+		if res, err = c.execStmt(ctx, s, nargs); err != nil {
 			return res, err
 		}
 	}
 	return res, nil
 }
 
-func (c *Conn) execStmt(s sql.Stmt, args []any) (Result, error) {
+func (c *Conn) execStmt(ctx context.Context, s sql.Stmt, args []any) (Result, error) {
 	switch s.(type) {
 	case *sql.Begin:
 		if c.tx != nil {
 			return Result{}, errors.New("bangdb: cannot start a transaction within a transaction")
 		}
-		tx, err := c.db.Begin()
+		tx, err := c.db.BeginContext(ctx)
 		if err != nil {
 			return Result{}, err
 		}
@@ -440,16 +498,18 @@ func (c *Conn) execStmt(s sql.Stmt, args []any) (Result, error) {
 		return Result{}, tx.Rollback()
 	}
 	if c.tx != nil {
-		return c.tx.execStmt(s, args)
+		return c.tx.execStmt(ctx, s, args)
 	}
 	if isReadOnly(s) {
-		return c.db.read(func(x *execCtx) (Result, error) { return x.exec(s) }, args)
+		ctx, cancel := c.db.stmtContext(ctx)
+		defer cancel()
+		return c.db.read(ctx, func(x *execCtx) (Result, error) { return x.exec(s) }, args)
 	}
-	tx, err := c.db.Begin()
+	tx, err := c.db.BeginContext(ctx)
 	if err != nil {
 		return Result{}, err
 	}
-	res, err := tx.execStmt(s, args)
+	res, err := tx.execStmt(ctx, s, args)
 	if err != nil {
 		tx.Rollback()
 		return Result{}, err
