@@ -25,6 +25,10 @@ func FuzzExec(f *testing.F) {
 		"INSERT OR REPLACE INTO t (id, name) SELECT id + 1, name || 'x' FROM t RETURNING id",
 		"CREATE TABLE p (a INT, b TEXT, c REAL, PRIMARY KEY (a, b), UNIQUE (b, c)); INSERT INTO p VALUES (1, 'x', 1.5) ON CONFLICT DO NOTHING",
 		"UPDATE u SET tid = tid + 1 WHERE tid IN (1, 3) RETURNING rowid, tid; DELETE FROM u RETURNING v",
+		"SELECT name, (SELECT COUNT(*) FROM u WHERE u.tid = t.id) FROM t WHERE EXISTS (SELECT 1 FROM u WHERE tid = t.id)",
+		"SELECT * FROM (SELECT n, COUNT(*) c FROM t GROUP BY n) x JOIN t ON t.n = x.n WHERE t.id NOT IN (SELECT tid FROM u)",
+		"SELECT n FROM t UNION SELECT tid FROM u INTERSECT SELECT 1 EXCEPT SELECT NULL ORDER BY 1 DESC LIMIT 2",
+		"UPDATE t SET n = (SELECT MAX(tid) FROM u WHERE tid < t.id) WHERE id IN (SELECT tid FROM u UNION ALL SELECT 2)",
 	} {
 		f.Add(s)
 	}

@@ -70,6 +70,7 @@ type OnConflict struct {
 type TableRef struct {
 	Name  string
 	Alias string
+	Sub   *Select // derived table: FROM (SELECT ...) AS alias
 }
 
 type Join struct {
@@ -98,9 +99,18 @@ type Select struct {
 	Where    Expr
 	GroupBy  []Expr
 	Having   Expr
+	// Compound holds further SELECTs combined with UNION [ALL] / INTERSECT /
+	// EXCEPT. When present, OrderBy/Limit/Offset apply to the combined result.
+	Compound []SetOp
 	OrderBy  []OrderItem
 	Limit    Expr
 	Offset   Expr
+}
+
+// SetOp is one "UNION [ALL] | INTERSECT | EXCEPT <select>" step.
+type SetOp struct {
+	Op     string // "UNION", "UNION ALL", "INTERSECT", "EXCEPT"
+	Select *Select
 }
 
 type Assignment struct {
@@ -172,7 +182,17 @@ type IsNull struct {
 type In struct {
 	X    Expr
 	List []Expr
+	Sub  *Select // x IN (SELECT ...)
 	Not  bool
+}
+
+// Subquery is a scalar subquery: (SELECT ...).
+type Subquery struct{ Select *Select }
+
+// Exists is [NOT] EXISTS (SELECT ...).
+type Exists struct {
+	Select *Select
+	Not    bool
 }
 
 type Between struct {
@@ -211,3 +231,5 @@ func (*Between) expr()   {}
 func (*Like) expr()      {}
 func (*Func) expr()      {}
 func (*Case) expr()      {}
+func (*Subquery) expr()  {}
+func (*Exists) expr()    {}

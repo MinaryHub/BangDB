@@ -66,6 +66,9 @@ func formatExpr(sb *strings.Builder, e Expr) {
 			sb.WriteString(" NOT")
 		}
 		sb.WriteString(" IN (")
+		if x.Sub != nil {
+			sb.WriteString("SELECT ...")
+		}
 		for i, a := range x.List {
 			if i > 0 {
 				sb.WriteString(", ")
@@ -114,6 +117,10 @@ func formatExpr(sb *strings.Builder, e Expr) {
 			formatExpr(sb, a)
 		}
 		sb.WriteString(")")
+	case *Subquery:
+		sb.WriteString("(SELECT ...)")
+	case *Exists:
+		sb.WriteString("EXISTS (SELECT ...)")
 	case *Case:
 		sb.WriteString("CASE")
 		if x.Operand != nil {

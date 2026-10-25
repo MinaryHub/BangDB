@@ -22,6 +22,7 @@ type execCtx struct {
 	args  []any
 	ctx   context.Context
 	ticks uint32
+	outer *outerCtx // set when planning a subquery
 }
 
 // tick is called once per row visited; every 256 rows it checks whether the

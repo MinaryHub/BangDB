@@ -69,7 +69,7 @@ func (x *execCtx) planSelect(st *sql.Select) (*selectPlan, error) {
 			p.agg = true
 		}
 	}
-	c := &compiler{sc: p.sc, allowAgg: p.agg, aggs: &p.aggs}
+	c := &compiler{x: x, sc: p.sc, allowAgg: p.agg, aggs: &p.aggs}
 
 	// Projection.
 	var exprs []sql.Expr
@@ -137,7 +137,7 @@ func (x *execCtx) planSelect(st *sql.Select) (*selectPlan, error) {
 	}
 
 	if p.agg {
-		gc := &compiler{sc: p.sc}
+		gc := &compiler{x: x, sc: p.sc}
 		for _, g := range st.GroupBy {
 			if hasAggregate(g) {
 				return nil, errors.New("bangdb: aggregate functions are not allowed in GROUP BY")
@@ -227,9 +227,22 @@ type selectRun struct {
 	st            *sql.Select
 	p             *selectPlan
 	limit, offset int64
+
+	// compound SELECT (UNION / INTERSECT / EXCEPT)
+	parts []*selectRun
+	ops   []string
+	order []compoundOrder
+}
+
+type compoundOrder struct {
+	col  int
+	desc bool
 }
 
 func (x *execCtx) prepareSelect(st *sql.Select) (*selectRun, error) {
+	if len(st.Compound) > 0 {
+		return x.prepareCompound(st)
+	}
 	p, err := x.planSelect(st)
 	if err != nil {
 		return nil, err
@@ -254,6 +267,9 @@ func (x *execCtx) prepareSelect(st *sql.Select) (*selectRun, error) {
 // DISTINCT stream rows as they are found; others are buffered (sorting with
 // LIMIT keeps only the top rows in memory).
 func (x *execCtx) runSelect(r *selectRun, sink func(vals []any) (bool, error)) error {
+	if r.parts != nil {
+		return x.runCompound(r, sink)
+	}
 	p, st, limit, offset := r.p, r.st, r.limit, r.offset
 	e := &env{row: make([]any, len(p.sc.cols)), args: x.args}
 	streaming := !p.agg && len(p.orderBy) == 0 && !st.Distinct
@@ -535,7 +551,7 @@ func (x *execCtx) compileReturning(t *Table, items []sql.SelectItem) (*returning
 		return nil, nil
 	}
 	sc := &scope{cols: tableScope(t, t.Name, 0, false)}
-	c := &compiler{sc: sc}
+	c := &compiler{x: x, sc: sc}
 	r := &returning{e: &env{row: make([]any, len(sc.cols)), args: x.args}}
 	for _, it := range items {
 		if it.Star {
@@ -689,7 +705,7 @@ func (x *execCtx) execInsert(st *sql.Insert) (Result, error) {
 		}
 		src = res.Rows
 	} else {
-		c := &compiler{}
+		c := &compiler{x: x}
 		for _, exprs := range st.Rows {
 			if len(exprs) != len(positions) {
 				return Result{}, fmt.Errorf("bangdb: %d values for %d columns", len(exprs), len(positions))
@@ -725,7 +741,7 @@ func (x *execCtx) execInsert(st *sql.Insert) (Result, error) {
 	var up *upsert
 	if oc != nil && !oc.DoNothing {
 		sc := &scope{cols: append(tableScope(t, t.Name, 0, false), tableScope(t, "excluded", 1, true)...)}
-		c := &compiler{sc: sc}
+		c := &compiler{x: x, sc: sc}
 		up = &upsert{e: &env{row: make([]any, len(sc.cols)), args: x.args}}
 		for _, a := range oc.Sets {
 			i := t.ColIndex(a.Column)
@@ -913,7 +929,7 @@ func (x *execCtx) execUpdate(st *sql.Update) (Result, error) {
 	if err != nil {
 		return Result{}, err
 	}
-	c := &compiler{sc: sc}
+	c := &compiler{x: x, sc: sc}
 	var sets []colSet
 	for _, a := range st.Sets {
 		i := t.ColIndex(a.Column)
@@ -1004,4 +1020,139 @@ func (x *execCtx) writeRow(t *Table, rowid int64, row []any) error {
 		}
 	}
 	return btree.Open(x.v, t.Root).Put(value.EncodeRowID(rowid), value.EncodeRow(row))
+}
+
+// prepareCompound plans every SELECT of a UNION / INTERSECT / EXCEPT chain.
+// ORDER BY may name result columns or use their ordinal positions.
+func (x *execCtx) prepareCompound(st *sql.Select) (*selectRun, error) {
+	head := *st
+	head.Compound, head.OrderBy, head.Limit, head.Offset = nil, nil, nil, nil
+	first, err := x.prepareSelect(&head)
+	if err != nil {
+		return nil, err
+	}
+	r := &selectRun{st: st, p: &selectPlan{cols: first.p.cols}, limit: -1, parts: []*selectRun{first}}
+	for _, op := range st.Compound {
+		part, err := x.prepareSelect(op.Select)
+		if err != nil {
+			return nil, err
+		}
+		if len(part.p.cols) != len(first.p.cols) {
+			return nil, fmt.Errorf("bangdb: SELECTs to the left and right of %s do not have the same number of result columns", op.Op)
+		}
+		r.parts = append(r.parts, part)
+		r.ops = append(r.ops, op.Op)
+	}
+	for _, o := range st.OrderBy {
+		col := -1
+		switch e := o.Expr.(type) {
+		case *sql.Literal:
+			if n, ok := e.Value.(int64); ok && n >= 1 && int(n) <= len(r.p.cols) {
+				col = int(n) - 1
+			}
+		case *sql.ColumnRef:
+			for i, name := range r.p.cols {
+				if e.Table == "" && strings.EqualFold(name, e.Name) {
+					col = i
+					break
+				}
+			}
+		}
+		if col < 0 {
+			return nil, fmt.Errorf("bangdb: ORDER BY term %s does not match any column of the compound result", sql.FormatExpr(o.Expr))
+		}
+		r.order = append(r.order, compoundOrder{col, o.Desc})
+	}
+	if st.Limit != nil {
+		if r.limit, err = evalInt(st.Limit, x.args, "LIMIT"); err != nil {
+			return nil, err
+		}
+	}
+	if st.Offset != nil {
+		if r.offset, err = evalInt(st.Offset, x.args, "OFFSET"); err != nil {
+			return nil, err
+		}
+		r.offset = max(r.offset, 0)
+	}
+	return r, nil
+}
+
+func rowKey(vals []any) string {
+	var k []byte
+	for _, v := range vals {
+		k = append(k, numKey(v)...)
+	}
+	return string(k)
+}
+
+func (x *execCtx) runCompound(r *selectRun, sink func(vals []any) (bool, error)) error {
+	collect := func(part *selectRun) ([][]any, error) {
+		var rows [][]any
+		err := x.runSelect(part, func(vals []any) (bool, error) {
+			rows = append(rows, vals)
+			return true, nil
+		})
+		return rows, err
+	}
+	distinct := func(rows [][]any) [][]any {
+		seen := map[string]bool{}
+		out := rows[:0]
+		for _, row := range rows {
+			if k := rowKey(row); !seen[k] {
+				seen[k] = true
+				out = append(out, row)
+			}
+		}
+		return out
+	}
+	rows, err := collect(r.parts[0])
+	if err != nil {
+		return err
+	}
+	for i, op := range r.ops {
+		right, err := collect(r.parts[i+1])
+		if err != nil {
+			return err
+		}
+		switch op {
+		case "UNION ALL":
+			rows = append(rows, right...)
+		case "UNION":
+			rows = distinct(append(rows, right...))
+		case "INTERSECT", "EXCEPT":
+			in := map[string]bool{}
+			for _, row := range right {
+				in[rowKey(row)] = true
+			}
+			var out [][]any
+			for _, row := range distinct(rows) {
+				if in[rowKey(row)] == (op == "INTERSECT") {
+					out = append(out, row)
+				}
+			}
+			rows = out
+		}
+	}
+	if len(r.order) > 0 {
+		sort.SliceStable(rows, func(i, j int) bool {
+			for _, o := range r.order {
+				if c := value.Compare(rows[i][o.col], rows[j][o.col]); c != 0 {
+					return (c < 0) != o.desc
+				}
+			}
+			return false
+		})
+	}
+	if r.offset > 0 {
+		rows = rows[min(int(r.offset), len(rows)):]
+	}
+	if r.limit >= 0 && int64(len(rows)) > r.limit {
+		rows = rows[:r.limit]
+	}
+	for _, row := range rows {
+		if cont, err := sink(row); err != nil || !cont {
+			return err
+		}
+	}
+	return nil
 }

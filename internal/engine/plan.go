@@ -49,6 +49,7 @@ type level struct {
 	left    bool
 	acc     *access
 	filters []evalFn // conditions checked once this level's row is bound
+	virtual [][]any  // rows of a derived table (FROM (SELECT ...))
 }
 
 func (l *level) rowidSlot() int { return l.offset + len(l.t.Columns) }
@@ -76,6 +77,8 @@ func maxLevel(e sql.Expr, sc *scope) (int, error) {
 			var i int
 			if i, err = sc.resolve(c.Table, c.Name); err == nil {
 				lvl = max(lvl, sc.cols[i].level)
+			} else if sc.isOuter(c.Table, c.Name) {
+				err = nil // a constant for this query
 			}
 		}
 	})
@@ -326,11 +329,17 @@ func refsBelow(e sql.Expr, sc *scope, li int) bool {
 		switch x := n.(type) {
 		case *sql.ColumnRef:
 			i, err := sc.resolve(x.Table, x.Name)
-			if err != nil || sc.cols[i].level >= li {
+			if err != nil && !sc.isOuter(x.Table, x.Name) || err == nil && sc.cols[i].level >= li {
 				ok = false
 			}
 		case *sql.Func:
 			if isAggregateCall(x) {
+				ok = false
+			}
+		case *sql.Subquery, *sql.Exists:
+			ok = false
+		case *sql.In:
+			if x.Sub != nil {
 				ok = false
 			}
 		}
@@ -500,6 +509,22 @@ func (x *execCtx) scan(t *Table, acc *access, e *env, visit func(rowid int64, ro
 	return c.Err()
 }
 
+// scanLevel visits the rows of one FROM level.
+func (x *execCtx) scanLevel(l *level, e *env, visit func(rowid int64, row []any) (bool, error)) error {
+	if l.virtual == nil {
+		return x.scan(l.t, l.acc, e, visit)
+	}
+	for i, row := range l.virtual {
+		if err := x.tick(); err != nil {
+			return err
+		}
+		if cont, err := visit(int64(i+1), row); err != nil || !cont {
+			return err
+		}
+	}
+	return nil
+}
+
 // scanIndex visits the rows located by an index access path: equality on
 // the leading columns, then an IN list or a range on the next column. Row ids
 // are collected before rows are fetched so that callers may modify the table.
@@ -619,13 +644,31 @@ func (x *execCtx) scanIndex(acc *access, e *env, emit func(int64) (bool, error))
 // evaluated and chooses an access path per level. Remaining conditions are
 // returned as the final filter.
 func (x *execCtx) buildLevels(from []sql.TableRef, lefts []bool, ons []sql.Expr, where sql.Expr) (*scope, []*level, []evalFn, error) {
-	sc := &scope{}
+	sc := &scope{outer: x.outer}
 	var levels []*level
 	seen := map[string]bool{}
 	for i, ref := range from {
-		t, err := x.table(ref.Name)
-		if err != nil {
-			return nil, nil, nil, err
+		var t *Table
+		var virtual [][]any
+		if ref.Sub != nil {
+			// Derived table: run the subquery once and scan its rows.
+			res, err := x.execSelect(ref.Sub)
+			if err != nil {
+				return nil, nil, nil, err
+			}
+			t = &Table{Name: ref.Alias, RowidCol: -1}
+			for _, c := range res.Columns {
+				t.Columns = append(t.Columns, Column{Name: c, Type: value.Any})
+			}
+			virtual = res.Rows
+			if virtual == nil {
+				virtual = [][]any{}
+			}
+		} else {
+			var err error
+			if t, err = x.table(ref.Name); err != nil {
+				return nil, nil, nil, err
+			}
 		}
 		alias := ref.Alias
 		if alias == "" {
@@ -635,14 +678,14 @@ func (x *execCtx) buildLevels(from []sql.TableRef, lefts []bool, ons []sql.Expr,
 			return nil, nil, nil, fmt.Errorf("bangdb: ambiguous table name %s (use an alias)", alias)
 		}
 		seen[strings.ToLower(alias)] = true
-		l := &level{t: t, alias: alias, offset: len(sc.cols), left: lefts[i]}
+		l := &level{t: t, alias: alias, offset: len(sc.cols), left: lefts[i], virtual: virtual}
 		for _, c := range t.Columns {
 			sc.cols = append(sc.cols, scopeCol{table: strings.ToLower(alias), name: strings.ToLower(c.Name), level: i})
 		}
 		sc.cols = append(sc.cols, scopeCol{table: strings.ToLower(alias), name: "rowid", level: i, hidden: true})
 		levels = append(levels, l)
 	}
-	c := &compiler{sc: sc}
+	c := &compiler{x: x, sc: sc}
 	accessConds := make([][]sql.Expr, len(levels))
 	var final []evalFn
 	// ON conditions belong to their join level.
@@ -656,7 +699,9 @@ func (x *execCtx) buildLevels(from []sql.TableRef, lefts []bool, ons []sql.Expr,
 				return nil, nil, nil, err
 			}
 			levels[i].filters = append(levels[i].filters, f)
-			accessConds[i] = append(accessConds[i], cj)
+			if !containsSubquery(cj) {
+				accessConds[i] = append(accessConds[i], cj)
+			}
 		}
 	}
 	for _, cj := range conjuncts(where) {
@@ -675,7 +720,8 @@ func (x *execCtx) buildLevels(from []sql.TableRef, lefts []bool, ons []sql.Expr,
 		// A WHERE condition on an outer-joined table must see the
 		// NULL-extended row, so it is evaluated after the join. Without
 		// any table (SELECT ... WHERE ...) everything is a final filter.
-		if len(levels) == 0 || levels[lvl].left {
+		// Conditions with subqueries may reference any table; they run last.
+		if len(levels) == 0 || levels[lvl].left || containsSubquery(cj) {
 			final = append(final, f)
 			continue
 		}
@@ -683,6 +729,10 @@ func (x *execCtx) buildLevels(from []sql.TableRef, lefts []bool, ons []sql.Expr,
 		accessConds[lvl] = append(accessConds[lvl], cj)
 	}
 	for i, l := range levels {
+		if l.virtual != nil {
+			l.acc = &access{kind: accFull, desc: "SCAN SUBQUERY " + l.alias}
+			continue
+		}
 		acc, err := chooseAccess(sc, l, i, accessConds[i], c)
 		if err != nil {
 			return nil, nil, nil, err
@@ -711,7 +761,7 @@ func (x *execCtx) runJoin(levels []*level, final []evalFn, e *env, emit func() (
 		}
 		l := levels[li]
 		matched := false
-		err := x.scan(l.t, l.acc, e, func(rowid int64, row []any) (bool, error) {
+		err := x.scanLevel(l, e, func(rowid int64, row []any) (bool, error) {
 			copy(e.row[l.offset:], row)
 			e.row[l.rowidSlot()] = rowid
 			ok, err := passes(l.filters, e)

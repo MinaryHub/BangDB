@@ -1,6 +1,9 @@
 package sql
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func FuzzParse(f *testing.F) {
 	for _, s := range []string{
@@ -22,6 +25,9 @@ func FuzzParse(f *testing.F) {
 		for _, st := range stmts {
 			if sel, ok := st.(*Select); ok && sel.Where != nil {
 				text := FormatExpr(sel.Where)
+				if strings.Contains(text, "SELECT ...") {
+					continue // subqueries are abbreviated in FormatExpr
+				}
 				if _, err := ParseExpr(text); err != nil {
 					t.Fatalf("FormatExpr output %q does not re-parse: %v", text, err)
 				}

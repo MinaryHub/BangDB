@@ -49,6 +49,7 @@ var reserved = map[string]bool{
 	"VALUES": true, "UNION": true, "BY": true, "ASC": true, "DESC": true, "IS": true, "IN": true,
 	"LIKE": true, "BETWEEN": true, "NULL": true, "CASE": true, "WHEN": true, "THEN": true,
 	"ELSE": true, "END": true, "DISTINCT": true, "INTO": true, "RETURNING": true,
+	"INTERSECT": true, "EXCEPT": true, "EXISTS": true,
 }
 
 func (p *parser) peek() token { return p.toks[p.pos] }
@@ -549,6 +550,21 @@ func (p *parser) parseDelete() (Stmt, error) {
 func (p *parser) parseTableRef() (TableRef, error) {
 	var tr TableRef
 	var err error
+	if p.peek().kind == tOp && p.peek().text == "(" {
+		p.next()
+		if tr.Sub, err = p.parseSelect(); err != nil {
+			return tr, err
+		}
+		if err := p.expectOp(")"); err != nil {
+			return tr, err
+		}
+		p.acceptKw("AS")
+		if tr.Alias, err = p.ident(); err != nil {
+			return tr, p.errf("a subquery in FROM needs an alias")
+		}
+		tr.Name = tr.Alias
+		return tr, nil
+	}
 	if tr.Name, err = p.ident(); err != nil {
 		return tr, err
 	}
@@ -560,7 +576,40 @@ func (p *parser) parseTableRef() (TableRef, error) {
 	return tr, err
 }
 
+// parseSelect parses a full SELECT: one or more cores combined with set
+// operators, then ORDER BY / LIMIT / OFFSET.
 func (p *parser) parseSelect() (*Select, error) {
+	s, err := p.parseSelectCore()
+	if err != nil {
+		return nil, err
+	}
+	for {
+		var op string
+		switch {
+		case p.acceptKw("UNION", "ALL"):
+			op = "UNION ALL"
+		case p.acceptKw("UNION"):
+			op = "UNION"
+		case p.acceptKw("INTERSECT"):
+			op = "INTERSECT"
+		case p.acceptKw("EXCEPT"):
+			op = "EXCEPT"
+		}
+		if op == "" {
+			break
+		}
+		next, err := p.parseSelectCore()
+		if err != nil {
+			return nil, err
+		}
+		s.Compound = append(s.Compound, SetOp{op, next})
+	}
+	return s, p.parseOrderLimit(s)
+}
+
+// parseSelectCore parses SELECT ... [FROM ...] [WHERE ...] [GROUP BY ...]
+// [HAVING ...].
+func (p *parser) parseSelectCore() (*Select, error) {
 	if err := p.expectKw("SELECT"); err != nil {
 		return nil, err
 	}
@@ -620,11 +669,16 @@ func (p *parser) parseSelect() (*Select, error) {
 			return nil, err
 		}
 	}
+	return s, nil
+}
+
+func (p *parser) parseOrderLimit(s *Select) error {
+	var err error
 	if p.acceptKw("ORDER", "BY") {
 		for {
 			e, err := p.parseExpr()
 			if err != nil {
-				return nil, err
+				return err
 			}
 			oi := OrderItem{Expr: e}
 			if p.acceptKw("DESC") {
@@ -640,20 +694,20 @@ func (p *parser) parseSelect() (*Select, error) {
 	}
 	if p.acceptKw("LIMIT") {
 		if s.Limit, err = p.parseExpr(); err != nil {
-			return nil, err
+			return err
 		}
 		if p.acceptKw("OFFSET") {
 			if s.Offset, err = p.parseExpr(); err != nil {
-				return nil, err
+				return err
 			}
 		} else if p.acceptOp(",") { // LIMIT offset, count
 			s.Offset = s.Limit
 			if s.Limit, err = p.parseExpr(); err != nil {
-				return nil, err
+				return err
 			}
 		}
 	}
-	return s, nil
+	return nil
 }
 
 func (p *parser) parseExprList() ([]Expr, error) {
@@ -759,6 +813,17 @@ func (p *parser) parseComparison() (Expr, error) {
 			if err := p.expectOp("("); err != nil {
 				return nil, err
 			}
+			if p.isKw("SELECT") {
+				sub, err := p.parseSelect()
+				if err != nil {
+					return nil, err
+				}
+				if err := p.expectOp(")"); err != nil {
+					return nil, err
+				}
+				l = &In{X: l, Sub: sub, Not: not}
+				continue
+			}
 			list, err := p.parseExprList()
 			if err != nil {
 				return nil, err
@@ -766,7 +831,7 @@ func (p *parser) parseComparison() (Expr, error) {
 			if err := p.expectOp(")"); err != nil {
 				return nil, err
 			}
-			l = &In{l, list, not}
+			l = &In{X: l, List: list, Not: not}
 		case p.acceptKw("LIKE"):
 			r, err := p.parseAdditive()
 			if err != nil {
@@ -917,6 +982,13 @@ func (p *parser) parsePrimary() (Expr, error) {
 	case tOp:
 		if t.text == "(" {
 			p.next()
+			if p.isKw("SELECT") {
+				sub, err := p.parseSelect()
+				if err != nil {
+					return nil, err
+				}
+				return &Subquery{sub}, p.expectOp(")")
+			}
 			e, err := p.parseExpr()
 			if err != nil {
 				return nil, err
@@ -944,6 +1016,16 @@ func (p *parser) parsePrimary() (Expr, error) {
 		case "CASE":
 			p.next()
 			return p.parseCase()
+		case "EXISTS":
+			p.next()
+			if err := p.expectOp("("); err != nil {
+				return nil, err
+			}
+			sub, err := p.parseSelect()
+			if err != nil {
+				return nil, err
+			}
+			return &Exists{Select: sub}, p.expectOp(")")
 		case "CAST":
 			p.next()
 			if err := p.expectOp("("); err != nil {

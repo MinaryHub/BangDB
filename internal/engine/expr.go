@@ -28,9 +28,45 @@ type scopeCol struct {
 	hidden bool
 }
 
-// scope maps column references to positions in env.row.
+// scope maps column references to positions in env.row. outer links to
+// the enclosing query when this scope belongs to a subquery.
 type scope struct {
-	cols []scopeCol
+	cols  []scopeCol
+	outer *outerCtx
+}
+
+// outerCtx is the enclosing query of a subquery: its scope, and the row it
+// is currently evaluating (set each time the subquery runs).
+type outerCtx struct {
+	sc   *scope
+	cur  *env
+	used bool // the subquery references this scope (it is correlated)
+}
+
+// resolveOuter finds a column in the enclosing queries and returns an
+// evaluator reading it from the outer row being processed.
+func (s *scope) resolveOuter(tbl, name string) (evalFn, bool) {
+	var chain []*outerCtx
+	for o := s.outer; o != nil && o.sc != nil; o = o.sc.outer {
+		chain = append(chain, o)
+		if i, err := o.sc.resolve(tbl, name); err == nil {
+			for _, c := range chain {
+				c.used = true
+			}
+			return func(*env) (any, error) { return o.cur.row[i], nil }, true
+		}
+	}
+	return nil, false
+}
+
+// isOuter reports whether a column reference belongs to an enclosing query.
+func (s *scope) isOuter(tbl, name string) bool {
+	for o := s.outer; o != nil && o.sc != nil; o = o.sc.outer {
+		if _, err := o.sc.resolve(tbl, name); err == nil {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *scope) resolve(tbl, name string) (int, error) {
@@ -64,6 +100,7 @@ type aggSpec struct {
 }
 
 type compiler struct {
+	x        *execCtx // needed to plan subqueries; nil where they are not allowed
 	sc       *scope
 	allowAgg bool
 	aggs     *[]*aggSpec
@@ -155,6 +192,9 @@ func (c *compiler) compile(e sql.Expr) (evalFn, error) {
 				inner.aliases = nil
 				return inner.compile(alias)
 			}
+			if f, ok := c.sc.resolveOuter(x.Table, x.Name); ok {
+				return f, nil
+			}
 			return nil, err
 		}
 		return func(e *env) (any, error) { return e.row[i], nil }, nil
@@ -199,6 +239,9 @@ func (c *compiler) compile(e sql.Expr) (evalFn, error) {
 			return boolVal((v == nil) != not), nil
 		}, nil
 	case *sql.In:
+		if x.Sub != nil {
+			return c.compileInSubquery(x)
+		}
 		lhs, err := c.compile(x.X)
 		if err != nil {
 			return nil, err
@@ -232,6 +275,10 @@ func (c *compiler) compile(e sql.Expr) (evalFn, error) {
 		}, nil
 	case *sql.Between:
 		return c.compile(betweenAsAnd(x))
+	case *sql.Subquery:
+		return c.compileScalarSubquery(x.Select)
+	case *sql.Exists:
+		return c.compileExists(x)
 	case *sql.Like:
 		lhs, err := c.compile(x.X)
 		if err != nil {
@@ -577,7 +624,7 @@ func (c *compiler) compileFunc(f *sql.Func) (evalFn, error) {
 			if len(f.Args) == 0 {
 				return nil, fmt.Errorf("bangdb: %s() requires an argument", f.Name)
 			}
-			inner := &compiler{sc: c.sc}
+			inner := &compiler{x: c.x, sc: c.sc}
 			arg, err := inner.compile(f.Args[0])
 			if err != nil {
 				return nil, err
