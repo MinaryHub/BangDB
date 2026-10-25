@@ -185,3 +185,56 @@ func TestCheckpointRespectsReaders(t *testing.T) {
 		t.Fatalf("after recovery page = %d, want 8", got[0])
 	}
 }
+
+// TestCrashDuringCheckpoint kills a checkpoint halfway through writing pages
+// into the database file; recovery must still produce the latest state.
+// (Regression: the header used to be written first, so recovery skipped the
+// commits whose pages had not been written yet.)
+func TestCrashDuringCheckpoint(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "k.db")
+	p, _ := Open(path)
+	want := map[uint32]byte{}
+	for c := 0; c < 20; c++ {
+		v := p.NewView()
+		for i := 0; i < 10; i++ {
+			var no uint32
+			if c == 0 {
+				no, _ = v.Alloc()
+			} else {
+				no = uint32(1 + (c*7+i*3)%10)
+			}
+			b := byte(c*10 + i + 1)
+			v.Write(no, page(b))
+			want[no] = b
+		}
+		if err := p.Commit(v); err != nil {
+			t.Fatal(err)
+		}
+	}
+	p.failpoint = func(stage string) error {
+		if stage == "checkpoint-write" {
+			return errCrash
+		}
+		return nil
+	}
+	if err := p.Checkpoint(); err == nil {
+		t.Fatal("expected simulated crash")
+	}
+	p.closeFiles() // crash: no clean shutdown
+
+	p, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer p.Close()
+	v := p.NewView()
+	for no, b := range want {
+		got, err := v.Read(no)
+		if err != nil {
+			t.Fatalf("page %d after recovery: %v", no, err)
+		}
+		if !sameContent(got, b) {
+			t.Fatalf("page %d after recovery holds %d, want %d", no, got[0], b)
+		}
+	}
+}

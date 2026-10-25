@@ -281,7 +281,8 @@ func (p *Pager) recover() error {
 	if len(data) == 0 {
 		return nil
 	}
-	applied := false
+	// Collect the final image of every page over the applicable groups.
+	final := map[uint32][]byte{}
 	next := p.hdr.Seq + 1
 	for _, g := range parseWAL(data) {
 		if g.seq < next {
@@ -291,15 +292,14 @@ func (p *Pager) recover() error {
 			break
 		}
 		for _, fr := range g.frames {
-			if _, err := p.file.WriteAt(fr.data, int64(fr.pgno)*PageSize); err != nil {
-				return err
-			}
+			final[fr.pgno] = fr.data
 		}
-		applied = true
 		next++
 	}
-	if applied {
-		if err := p.file.Sync(); err != nil {
+	if len(final) > 0 {
+		// The header goes last: if we crash before it is durable, the next
+		// recovery replays the same groups again.
+		if err := p.writePagesHeaderLast(final); err != nil {
 			return err
 		}
 		if p.hdr, err = p.readFileHeader(); err != nil {
@@ -763,13 +763,11 @@ func (p *Pager) Checkpoint() error {
 
 	// No reader reads these pages from the file: each of them has a version
 	// <= target in the WAL, and every snapshot is >= target.
-	sort.Slice(items, func(i, j int) bool { return items[i].no < items[j].no })
+	pages := make(map[uint32][]byte, len(items))
 	for _, it := range items {
-		if _, err := p.file.WriteAt(it.data, int64(it.no)*PageSize); err != nil {
-			return err
-		}
+		pages[it.no] = it.data
 	}
-	if err := p.file.Sync(); err != nil {
+	if err := p.writePagesHeaderLast(pages); err != nil {
 		return err
 	}
 
@@ -790,6 +788,42 @@ func (p *Pager) Checkpoint() error {
 			return err
 		}
 		p.walSize, p.walPages, p.verBytes = 0, 0, 0
+	}
+	return nil
+}
+
+// writePagesHeaderLast writes pages to the database file so that a crash at
+// any point leaves a recoverable file: all pages except the header are
+// written and synced first, then the header (whose sequence number tells
+// recovery which WAL groups are already in the file).
+func (p *Pager) writePagesHeaderLast(pages map[uint32][]byte) error {
+	nos := make([]uint32, 0, len(pages))
+	for no := range pages {
+		if no != 0 {
+			nos = append(nos, no)
+		}
+	}
+	sort.Slice(nos, func(i, j int) bool { return nos[i] < nos[j] })
+	for i, no := range nos {
+		if _, err := p.file.WriteAt(pages[no], int64(no)*PageSize); err != nil {
+			return err
+		}
+		if i == len(nos)/2 && p.failpoint != nil {
+			if err := p.failpoint("checkpoint-write"); err != nil {
+				return err
+			}
+		}
+	}
+	if err := p.file.Sync(); err != nil {
+		return err
+	}
+	if hdr, ok := pages[0]; ok {
+		if _, err := p.file.WriteAt(hdr, 0); err != nil {
+			return err
+		}
+		if err := p.file.Sync(); err != nil {
+			return err
+		}
 	}
 	return nil
 }
