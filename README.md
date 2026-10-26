@@ -125,6 +125,20 @@ r.Promote()               // 장애 조치: 쓰기 가능한 primary로 승격
 
 자세한 내용: [docs/REPLICATION.md](docs/REPLICATION.md)
 
+### 관측성
+
+```go
+db, _ := bangdb.OpenWithOptions("app.db", &bangdb.Options{
+    SlowQueryThreshold: 200 * time.Millisecond,
+    OnSlowQuery: func(q bangdb.SlowQuery) { log.Printf("slow %s %v: %s", q.Duration, q.Args, q.SQL) },
+})
+s := db.Stats() // 문장·오류·슬로우 수, 커밋 수와 누적 시간, 쓰기 락 대기, WAL 크기, 체크포인트,
+                // 페이지/노드 캐시 적중, 열린 스냅샷과 그 지연(커밋 수), 열린 커서
+```
+
+- `EXPLAIN ANALYZE SELECT …`: 쿼리를 실제로 실행하고 조인 단계별 `loops`(스캔 횟수)·`scanned`(본 행)·`rows`(조건 통과 행)와 결과 행 수·실행 시간을 보여 줍니다 (SELECT만).
+- CLI에서는 `.stats`.
+
 ### CLI
 
 ```bash

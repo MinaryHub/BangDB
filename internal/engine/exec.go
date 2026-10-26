@@ -51,6 +51,9 @@ func (x *execCtx) exec(s sql.Stmt) (Result, error) {
 	case *sql.Select:
 		return x.execSelect(st)
 	case *sql.Explain:
+		if st.Analyze {
+			return x.explainAnalyze(st.Stmt)
+		}
 		return x.explain(st.Stmt)
 	}
 	if x.tx == nil {

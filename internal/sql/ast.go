@@ -185,7 +185,10 @@ type Commit struct{}
 type Rollback struct{}
 
 // Explain wraps a statement whose query plan should be shown.
-type Explain struct{ Stmt Stmt }
+type Explain struct {
+	Stmt    Stmt
+	Analyze bool // EXPLAIN ANALYZE: run the statement and report actual row counts
+}
 
 func (*CreateTable) stmt()            {}
 func (*DropTable) stmt()              {}

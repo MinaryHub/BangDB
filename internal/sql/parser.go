@@ -206,11 +206,12 @@ func (p *parser) parseOptions() (map[string]string, error) {
 func (p *parser) parseStmt() (Stmt, error) {
 	switch {
 	case p.acceptKw("EXPLAIN"):
+		analyze := p.acceptKw("ANALYZE")
 		s, err := p.parseStmt()
 		if err != nil {
 			return nil, err
 		}
-		return &Explain{Stmt: s}, nil
+		return &Explain{Stmt: s, Analyze: analyze}, nil
 	case p.isKw("SELECT"):
 		return p.parseSelect()
 	case p.acceptKw("INSERT"):

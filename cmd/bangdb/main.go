@@ -152,6 +152,7 @@ func (s *shell) command(cmd string) bool {
 .timer on|off      show execution time
 .backup FILE       write an online backup to FILE
 .check             verify checksums, structure and indexes
+.stats             show database statistics
 .repl              show replication status
 .promote           turn this replica into a writable primary
 .quit              exit
@@ -215,6 +216,26 @@ SQL statements end with ';'. BEGIN/COMMIT/ROLLBACK are supported.`)
 			s.replica = nil
 			fmt.Fprintln(s.out, "promoted: database is now writable")
 		}
+	case ".stats":
+		st := s.db.Stats()
+		hit := func(h, m uint64) string {
+			if h+m == 0 {
+				return "-"
+			}
+			return fmt.Sprintf("%.1f%%", 100*float64(h)/float64(h+m))
+		}
+		avg := func(d time.Duration, n uint64) time.Duration {
+			if n == 0 {
+				return 0
+			}
+			return d / time.Duration(n)
+		}
+		fmt.Fprintf(s.out, "statements  %d (queries %d, errors %d, slow %d)\n", st.Statements, st.Queries, st.Errors, st.SlowQueries)
+		fmt.Fprintf(s.out, "commits     %d (avg %s, rollbacks %d, WAL fsyncs %d)\n", st.TxCommits, avg(st.CommitTime, st.TxCommits), st.TxRollbacks, st.WALSyncs)
+		fmt.Fprintf(s.out, "lock waits  %d (total %s, busy errors %d)\n", st.LockWaits, st.LockWaitTime, st.BusyErrors)
+		fmt.Fprintf(s.out, "WAL         %d pages, %d bytes; checkpoints %d (%d pages, %s)\n", st.WALPages, st.WALBytes, st.Checkpoints, st.CheckpointPages, st.CheckpointTime)
+		fmt.Fprintf(s.out, "cache       pages %s (%d disk reads), nodes %s\n", hit(st.PageCacheHits, st.PageReads), st.PageReads, hit(st.NodeHits, st.NodeMisses))
+		fmt.Fprintf(s.out, "snapshots   %d open (lag %d commits), cursors %d; seq %d, %d pages\n", st.Snapshots, st.SnapshotLag, st.OpenCursors, st.Seq, st.PageCount)
 	case ".timer":
 		s.timer = len(fields) > 1 && fields[1] == "on"
 	default:

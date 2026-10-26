@@ -15,8 +15,9 @@ type objCache struct {
 }
 
 type objShard struct {
-	mu sync.Mutex
-	m  map[*byte]objEntry
+	mu           sync.Mutex
+	m            map[*byte]objEntry
+	hits, misses uint64
 }
 
 type objEntry struct {
@@ -42,8 +43,14 @@ func (c *objCache) get(b []byte, decode func([]byte) (any, error)) (any, error) 
 	s := &c.shards[(uintptr(unsafe.Pointer(key))>>12)%uintptr(len(c.shards))]
 	s.mu.Lock()
 	e, ok := s.m[key]
+	ok = ok && len(e.buf) == len(b)
+	if ok {
+		s.hits++
+	} else {
+		s.misses++
+	}
 	s.mu.Unlock()
-	if ok && len(e.buf) == len(b) {
+	if ok {
 		return e.obj, nil
 	}
 	obj, err := decode(b)
@@ -153,4 +160,16 @@ func (p *Pager) SetCacheSize(bytes int) {
 	}
 	p.mu.Unlock()
 	p.objs.setSize(pages)
+}
+
+// counts returns the cache's hit and miss counts.
+func (c *objCache) counts() (hits, misses uint64) {
+	for i := range c.shards {
+		s := &c.shards[i]
+		s.mu.Lock()
+		hits += s.hits
+		misses += s.misses
+		s.mu.Unlock()
+	}
+	return hits, misses
 }

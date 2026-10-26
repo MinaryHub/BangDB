@@ -7,6 +7,7 @@ import (
 	"math"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/knoxxr/bangdb/internal/sql"
 	"github.com/knoxxr/bangdb/internal/store"
@@ -1592,4 +1593,67 @@ func (p *selectPlan) useScanOrder(st *sql.Select) bool {
 		}
 	}
 	return false
+}
+
+// explainAnalyze runs a SELECT and reports its plan with the number of
+// scans, rows visited and rows passed at each level, and the run time.
+func (x *execCtx) explainAnalyze(s sql.Stmt) (Result, error) {
+	st, ok := s.(*sql.Select)
+	if !ok {
+		return Result{}, errors.New("bangdb: EXPLAIN ANALYZE supports only SELECT")
+	}
+	plans := x.plans
+	x.plans = nil // a private plan: the counters must not be shared
+	defer func() { x.plans = plans }()
+	r, err := x.prepareSelect(st)
+	if err != nil {
+		return Result{}, err
+	}
+	runs := []*selectRun{r}
+	if r.parts != nil {
+		runs = r.parts
+	}
+	for _, part := range runs {
+		for _, l := range part.p.levels {
+			l.stats = &levelStats{}
+		}
+	}
+	start := time.Now()
+	n := 0
+	if err := x.runSelect(r, func([]any) (bool, error) { n++; return true, nil }); err != nil {
+		return Result{}, err
+	}
+	elapsed := time.Since(start)
+
+	res := Result{Columns: []string{"plan"}}
+	add := func(line string) { res.Rows = append(res.Rows, []any{line}) }
+	for i, part := range runs {
+		if len(runs) > 1 {
+			if i > 0 {
+				add(r.ops[i-1])
+			}
+		}
+		p := part.p
+		if len(p.levels) == 0 {
+			add("CONSTANT ROW")
+		}
+		for d, l := range p.levels {
+			line := strings.Repeat("  ", d) + l.acc.desc
+			if l.left {
+				line += " (LEFT JOIN)"
+			}
+			add(fmt.Sprintf("%s (loops=%d scanned=%d rows=%d)", line, l.stats.loops, l.stats.scanned, l.stats.rows))
+		}
+		if p.agg {
+			add("AGGREGATE")
+		}
+		if len(p.wins) > 0 {
+			add("WINDOW")
+		}
+		if len(part.st.OrderBy) > 0 && !p.ordered {
+			add("SORT")
+		}
+	}
+	add(fmt.Sprintf("RESULT rows=%d time=%s", n, elapsed.Round(time.Microsecond)))
+	return res, nil
 }

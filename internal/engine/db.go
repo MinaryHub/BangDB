@@ -42,6 +42,13 @@ type Options struct {
 	// CacheSize is the memory for cached file pages and decoded B+tree
 	// nodes. Default: 32 MiB.
 	CacheSize int
+	// SlowQueryThreshold, if positive, reports every call (Exec, Query,
+	// ...) that takes at least this long to OnSlowQuery, or to the standard
+	// logger when OnSlowQuery is nil.
+	SlowQueryThreshold time.Duration
+	// OnSlowQuery receives slow calls. It runs on the calling goroutine and
+	// must not use the database.
+	OnSlowQuery func(SlowQuery)
 }
 
 // DefaultCacheSize is the default Options.CacheSize.
@@ -86,6 +93,10 @@ type DB struct {
 	cursors  cursorSet
 	repl     *replLog
 
+	counters      dbCounters
+	slowThreshold time.Duration
+	onSlow        func(SlowQuery)
+
 	closeOnce sync.Once
 	closed    chan struct{}
 }
@@ -123,6 +134,7 @@ func Open(path string, opts *Options) (*DB, error) {
 	p.SetCacheSize(db.cacheSize)
 	if opts != nil {
 		db.queryTimeout = opts.QueryTimeout
+		db.slowThreshold, db.onSlow = opts.SlowQueryThreshold, opts.OnSlowQuery
 		db.spill.dir = opts.TempDir
 		if opts.SortMemory != 0 {
 			db.spill.limit = opts.SortMemory
@@ -178,12 +190,16 @@ func (db *DB) lockWrite(ctx context.Context) error {
 		return nil
 	default:
 	}
+	start := time.Now()
+	db.counters.lockWaits.Add(1)
+	defer func() { db.counters.lockWaitNanos.Add(int64(time.Since(start))) }()
 	t := time.NewTimer(db.busyTimeout)
 	defer t.Stop()
 	select {
 	case db.writeSem <- struct{}{}:
 		return nil
 	case <-t.C:
+		db.counters.busy.Add(1)
 		return ErrBusy
 	case <-ctx.Done():
 		return interrupted(ctx.Err())
@@ -447,6 +463,13 @@ func (tx *Tx) ExecContext(ctx context.Context, src string, args ...any) (Result,
 	if tx.done {
 		return Result{}, ErrTxDone
 	}
+	start := time.Now()
+	res, err := tx.execScript(ctx, src, args)
+	tx.db.finishCall(src, args, start, err)
+	return res, err
+}
+
+func (tx *Tx) execScript(ctx context.Context, src string, args []any) (Result, error) {
 	pr, err := tx.db.parse(src)
 	if err != nil {
 		return Result{}, err
@@ -463,7 +486,9 @@ func (tx *Tx) ExecContext(ctx context.Context, src string, args ...any) (Result,
 		case *sql.Vacuum:
 			return res, errors.New("bangdb: cannot VACUUM from within a transaction")
 		}
-		if res, err = tx.execStmt(ctx, s, nargs); err != nil {
+		res, err = tx.execStmt(ctx, s, nargs)
+		tx.db.countStmt(isReadOnly(s), err)
+		if err != nil {
 			return res, err
 		}
 	}
@@ -505,6 +530,9 @@ func (tx *Tx) Commit() error {
 		return ErrTxDone
 	}
 	tx.done = true
+	start := time.Now()
+	defer func() { tx.db.counters.commitNanos.Add(int64(time.Since(start))) }()
+	tx.db.counters.commits.Add(1)
 	p := tx.db.p // stays valid after unlocking (VACUUM may swap db.p)
 	c, err := p.PrepareCommit(tx.v, tx.cat)
 	if err != nil || c == nil {
@@ -528,6 +556,7 @@ func (tx *Tx) Rollback() error {
 		return ErrTxDone
 	}
 	tx.done = true
+	tx.db.counters.rollbacks.Add(1)
 	tx.db.unlockWrite()
 	return nil
 }
@@ -562,6 +591,13 @@ func (c *Conn) Exec(src string, args ...any) (Result, error) {
 
 // ExecContext is Exec with cancellation of the running statement.
 func (c *Conn) ExecContext(ctx context.Context, src string, args ...any) (Result, error) {
+	start := time.Now()
+	res, err := c.execScript(ctx, src, args)
+	c.db.finishCall(src, args, start, err)
+	return res, err
+}
+
+func (c *Conn) execScript(ctx context.Context, src string, args []any) (Result, error) {
 	pr, err := c.db.parse(src)
 	if err != nil {
 		return Result{}, err
@@ -572,7 +608,11 @@ func (c *Conn) ExecContext(ctx context.Context, src string, args ...any) (Result
 	}
 	var res Result
 	for _, s := range pr.stmts {
-		if res, err = c.execStmt(ctx, s, nargs); err != nil {
+		res, err = c.execStmt(ctx, s, nargs)
+		if !isTxControl(s) {
+			c.db.countStmt(isReadOnly(s), err)
+		}
+		if err != nil {
 			return res, err
 		}
 	}
@@ -629,6 +669,14 @@ func (c *Conn) execStmt(ctx context.Context, s sql.Stmt, args []any) (Result, er
 		return Result{}, err
 	}
 	return res, tx.Commit()
+}
+
+func isTxControl(s sql.Stmt) bool {
+	switch s.(type) {
+	case *sql.Begin, *sql.Commit, *sql.Rollback:
+		return true
+	}
+	return false
 }
 
 func isReadOnly(s sql.Stmt) bool {

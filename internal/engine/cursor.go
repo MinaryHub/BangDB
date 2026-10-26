@@ -4,6 +4,7 @@ import (
 	"context"
 	"runtime"
 	"sync"
+	"time"
 
 	"github.com/knoxxr/bangdb/internal/pager"
 	"github.com/knoxxr/bangdb/internal/sql"
@@ -168,7 +169,7 @@ func (c *Conn) query(ctx context.Context, src string, args []any, maxRows int) (
 	if err != nil {
 		return nil, err
 	}
-	return c.db.stream(ctx, sel, nargs, maxRows)
+	return c.db.stream(ctx, sel, nargs, maxRows, src, args)
 }
 
 // QueryRows is Conn.QueryRows on a fresh session.
@@ -184,10 +185,18 @@ func (db *DB) QueryFirst(ctx context.Context, src string, args ...any) (*Rows, e
 // stream runs sel on a snapshot. Queries with a small, bounded result (and
 // all of them when maxRows > 0, which stops after that many rows) run
 // synchronously; others produce rows from a goroutine as they are read.
-func (db *DB) stream(ctx context.Context, sel *sql.Select, args []any, maxRows int) (*Rows, error) {
+func (db *DB) stream(ctx context.Context, sel *sql.Select, args []any, maxRows int, src string, rawArgs []any) (rows *Rows, err error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	start := time.Now()
+	streamed := false
+	defer func() {
+		if !streamed {
+			db.countStmt(true, err)
+			db.finishCall(src, rawArgs, start, err)
+		}
+	}()
 	ctx, stopTimeout := db.stmtContext(ctx)
 
 	db.swapMu.RLock()
@@ -238,6 +247,7 @@ func (db *DB) stream(ctx context.Context, sel *sql.Select, args []any, maxRows i
 	done := make(chan struct{})
 	r := &Rows{cols: run.p.cols, types: run.p.types, ch: ch, errc: errc, cancel: cancelAll, done: done}
 	r.unreg = db.cursors.add(cancelAll)
+	streamed = true
 	go func() {
 		defer close(done)
 		defer release()
@@ -249,6 +259,8 @@ func (db *DB) stream(ctx context.Context, sel *sql.Select, args []any, maxRows i
 				return false, interrupted(ctx.Err())
 			}
 		})
+		db.countStmt(true, err)
+		db.finishCall(src, rawArgs, start, err)
 		errc <- err
 		close(ch)
 		cancelAll()

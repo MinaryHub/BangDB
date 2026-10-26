@@ -69,6 +69,14 @@ type level struct {
 	acc     *access
 	filters []evalFn // conditions checked once this level's row is bound
 	virtual [][]any  // rows of a derived table (FROM (SELECT ...))
+	stats   *levelStats // set by EXPLAIN ANALYZE
+}
+
+// levelStats counts what a join level did.
+type levelStats struct {
+	loops   int64 // scans started
+	scanned int64 // rows visited
+	rows    int64 // rows that passed the level's conditions
 }
 
 func (l *level) rowidSlot() int { return l.offset + len(l.t.Columns) }
@@ -1072,12 +1080,22 @@ func (j *joiner) run(li int) error {
 	}
 	l := j.levels[li]
 	matched := false
+	st := l.stats
+	if st != nil {
+		st.loops++
+	}
 	err := j.x.scanLevel(l, e, func(rowid int64, row []any) (bool, error) {
 		copy(e.row[l.offset:], row)
 		e.row[l.rowidSlot()] = rowid
+		if st != nil {
+			st.scanned++
+		}
 		ok, err := passes(l.filters, e)
 		if err != nil || !ok {
 			return err == nil, err
+		}
+		if st != nil {
+			st.rows++
 		}
 		matched = true
 		if err := j.run(li + 1); err != nil {
@@ -1089,6 +1107,9 @@ func (j *joiner) run(li int) error {
 		return err
 	}
 	if !matched && l.left {
+		if st != nil {
+			st.rows++
+		}
 		for i := l.offset; i <= l.rowidSlot(); i++ {
 			e.row[i] = nil
 		}

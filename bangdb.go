@@ -28,6 +28,12 @@ import (
 // Options configures a database. See engine.Options.
 type Options = engine.Options
 
+// Stats describes database activity; see DB.Stats.
+type Stats = engine.Stats
+
+// SlowQuery is passed to Options.OnSlowQuery.
+type SlowQuery = engine.SlowQuery
+
 // NamedArg binds a value to a named placeholder; see Named.
 type NamedArg = engine.NamedArg
 
@@ -173,6 +179,11 @@ func (db *DB) Vacuum(ctx context.Context) error { return db.e.Vacuum(ctx) }
 // index/table consistency on a snapshot, without blocking other work. It
 // returns the problems found; an empty slice means the database is sound.
 func (db *DB) IntegrityCheck() ([]string, error) { return db.e.IntegrityCheck(context.Background()) }
+
+// Stats returns counters and gauges of the database: statements, errors,
+// slow calls, commits and their total time, write lock waits, WAL size,
+// checkpoints, cache hits and misses, and open snapshots and cursors.
+func (db *DB) Stats() Stats { return db.e.Stats() }
 
 // Seq returns the sequence number of the last committed transaction. It
 // increases by one per commit and is shared with replicas.

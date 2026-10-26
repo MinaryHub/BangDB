@@ -31,6 +31,7 @@ import (
 	"path/filepath"
 	"sort"
 	"sync"
+	"time"
 )
 
 // PageSize is the size of every page in bytes.
@@ -182,6 +183,8 @@ type Pager struct {
 
 	err    error // sticky error after a failed commit
 	closed bool
+
+	counters pagerCounters // guarded by mu
 
 	// failpoint, when set by tests, is called at commit stages to simulate
 	// crashes.
@@ -447,11 +450,14 @@ func (p *Pager) readAt(pgno uint32, seq uint64) ([]byte, error) {
 		if !ok {
 			return nil, fmt.Errorf("%w (missing page %d)", ErrCorrupt, pgno)
 		}
+		p.counters.pageCacheHits++
 		return b, nil
 	}
 	if b, ok := p.cache[pgno]; ok {
+		p.counters.pageCacheHits++
 		return b, nil
 	}
+	p.counters.pageReads++
 	b := make([]byte, PageSize)
 	if _, err := p.file.ReadAt(b, int64(pgno)*PageSize); err != nil {
 		return nil, fmt.Errorf("bangdb: read page %d: %w", pgno, err)
@@ -466,8 +472,10 @@ func (p *Pager) readAt(pgno uint32, seq uint64) ([]byte, error) {
 // versionData must be called with p.mu held.
 func (p *Pager) versionData(no uint32, v version) ([]byte, error) {
 	if v.data != nil {
+		p.counters.pageCacheHits++
 		return v.data, nil
 	}
+	p.counters.pageReads++
 	b := make([]byte, PageSize)
 	if _, err := p.wal.ReadAt(b, v.off); err != nil {
 		return nil, fmt.Errorf("bangdb: read WAL: %w", err)
@@ -771,6 +779,10 @@ func (p *Pager) flushLocked() error {
 	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	if p.file != nil {
+		p.counters.walSyncs++
+	}
+	p.counters.commits += uint64(len(batch))
 	for _, c := range batch {
 		p.hdr = c.hdr
 		if c.Meta != nil {
@@ -830,6 +842,7 @@ func (p *Pager) WALPages() int {
 // base), up to the oldest active snapshot. Writer-side: must not run
 // concurrently with commits.
 func (p *Pager) Checkpoint() error {
+	start := time.Now()
 	p.mu.Lock()
 	if err := p.usable(); err != nil {
 		p.mu.Unlock()
@@ -864,6 +877,7 @@ func (p *Pager) Checkpoint() error {
 			p.base[it.no] = vs[k-1].data
 			p.prune(it.no, it.seq)
 		}
+		p.countCheckpoint(len(items), start)
 		p.mu.Unlock()
 		return nil
 	}
@@ -891,6 +905,7 @@ func (p *Pager) Checkpoint() error {
 
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	p.countCheckpoint(len(items), start)
 	for _, it := range items {
 		p.prune(it.no, it.seq)
 		if _, ok := p.cache[it.no]; ok || len(p.cache) < p.cacheMax {
@@ -908,6 +923,13 @@ func (p *Pager) Checkpoint() error {
 		p.walSize, p.walPages, p.verBytes = 0, 0, 0
 	}
 	return nil
+}
+
+// countCheckpoint must be called with p.mu held.
+func (p *Pager) countCheckpoint(pages int, start time.Time) {
+	p.counters.checkpoints++
+	p.counters.checkpointPages += uint64(pages)
+	p.counters.checkpointTime += time.Since(start)
 }
 
 // writePagesHeaderLast writes pages to the database file so that a crash at
