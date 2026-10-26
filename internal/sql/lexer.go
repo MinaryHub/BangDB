@@ -121,8 +121,13 @@ func lex(src string) ([]token, error) {
 			if i+1 < len(src) {
 				two = src[i : i+2]
 			}
+			if strings.HasPrefix(src[i:], "->>") {
+				toks = append(toks, token{tOp, "->>", i})
+				i += 3
+				continue
+			}
 			switch two {
-			case "<=", ">=", "!=", "<>", "||", "==":
+			case "<=", ">=", "!=", "<>", "||", "==", "->":
 				if two == "<>" {
 					two = "!="
 				}

@@ -256,7 +256,7 @@
 | P2-3 | 복제 고도화 | 반동기 복제(커밋 시 N개 replica ack 대기), PITR(Frame 스트림 아카이빙 + 특정 시점 복구), replica 지연 메트릭, fencing 토큰 | M |
 | P2-4 | 서버 모드 | 여러 프로세스/서비스가 접속해야 하는 경우: 네트워크 프로토콜 + 인증 + 커넥션 관리. (임베디드만 쓴다면 불필요) | L |
 | P2-5 | 저장 데이터 암호화 | 페이지 단위 AES-GCM (P0-5 체크섬 영역 재사용) | M |
-| P2-6 | 윈도우 함수, JSON 함수 | `ROW_NUMBER/LAG/...`, `json_extract` | M |
+| P2-6 ✅ | 윈도우 함수, JSON 함수 | `ROW_NUMBER/LAG/...`, `json_extract` | M |
 
 ## 4. 통합 개발 계획
 

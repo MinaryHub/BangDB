@@ -1129,14 +1129,24 @@ func (p *parser) parseConcat() (Expr, error) {
 	if err != nil {
 		return nil, err
 	}
-	for p.acceptOp("||") {
+	for {
+		var op string
+		switch {
+		case p.acceptOp("||"):
+			op = "||"
+		case p.acceptOp("->"):
+			op = "->"
+		case p.acceptOp("->>"):
+			op = "->>"
+		default:
+			return l, nil
+		}
 		r, err := p.parseUnary()
 		if err != nil {
 			return nil, err
 		}
-		l = &Binary{"||", l, r}
+		l = &Binary{op, l, r}
 	}
-	return l, nil
 }
 
 func (p *parser) parseUnary() (Expr, error) {

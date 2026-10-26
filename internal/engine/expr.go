@@ -124,7 +124,8 @@ type compiler struct {
 	aliases  map[string]sql.Expr // SELECT aliases usable in HAVING / ORDER BY
 }
 
-var aggregateFuncs = map[string]bool{"COUNT": true, "SUM": true, "AVG": true, "MIN": true, "MAX": true, "TOTAL": true, "GROUP_CONCAT": true}
+var aggregateFuncs = map[string]bool{"COUNT": true, "SUM": true, "AVG": true, "MIN": true, "MAX": true, "TOTAL": true, "GROUP_CONCAT": true,
+	"JSON_GROUP_ARRAY": true, "JSON_GROUP_OBJECT": true}
 
 func isAggregateCall(f *sql.Func) bool {
 	if !aggregateFuncs[f.Name] || f.Over != nil {
@@ -436,6 +437,19 @@ func (c *compiler) compileBinary(x *sql.Binary) (evalFn, error) {
 			}
 			return boolVal(b), nil
 		}, nil
+	case "->", "->>":
+		asJSON := op == "->"
+		return func(e *env) (any, error) {
+			lv, err := l(e)
+			if err != nil {
+				return nil, err
+			}
+			rv, err := r(e)
+			if err != nil {
+				return nil, err
+			}
+			return jsonArrow(lv, rv, asJSON)
+		}, nil
 	case "||":
 		return func(e *env) (any, error) {
 			lv, err := l(e)
@@ -729,7 +743,11 @@ func (c *compiler) compileFunc(f *sql.Func) (evalFn, error) {
 		}
 		spec := &aggSpec{name: f.Name, distinct: f.Distinct}
 		if !f.Star {
-			if len(f.Args) != 1 && f.Name != "GROUP_CONCAT" {
+			if f.Name == "JSON_GROUP_OBJECT" {
+				if len(f.Args) != 2 {
+					return nil, fmt.Errorf("bangdb: %s() takes exactly two arguments", f.Name)
+				}
+			} else if len(f.Args) != 1 && f.Name != "GROUP_CONCAT" {
 				return nil, fmt.Errorf("bangdb: %s() takes exactly one argument", f.Name)
 			}
 			if len(f.Args) == 0 {
@@ -739,6 +757,27 @@ func (c *compiler) compileFunc(f *sql.Func) (evalFn, error) {
 			arg, err := inner.compile(f.Args[0])
 			if err != nil {
 				return nil, err
+			}
+			if jsonValueArg(f.Name, 0) && jsonProducing(f.Args[0]) {
+				arg = asJSONText(arg)
+			}
+			if f.Name == "JSON_GROUP_OBJECT" {
+				val, err := inner.compile(f.Args[1])
+				if err != nil {
+					return nil, err
+				}
+				if jsonProducing(f.Args[1]) {
+					val = asJSONText(val)
+				}
+				key := arg
+				arg = func(e *env) (any, error) {
+					k, err := key(e)
+					if err != nil {
+						return nil, err
+					}
+					v, err := val(e)
+					return jsonPair{k, v}, err
+				}
 			}
 			spec.arg = arg
 		} else if f.Name != "COUNT" {
@@ -751,6 +790,11 @@ func (c *compiler) compileFunc(f *sql.Func) (evalFn, error) {
 	args, err := c.compileList(f.Args)
 	if err != nil {
 		return nil, err
+	}
+	for i, a := range f.Args {
+		if jsonValueArg(f.Name, i) && jsonProducing(a) {
+			args[i] = asJSONText(args[i])
+		}
 	}
 	impl, ok := scalarFuncs[f.Name]
 	if !ok {
@@ -1011,6 +1055,8 @@ type aggState struct {
 	best  any
 	parts []string
 	seen  map[string]bool
+	items []any    // JSON_GROUP_ARRAY
+	obj   *jsonObj // JSON_GROUP_OBJECT
 }
 
 func newAggState(s *aggSpec) *aggState {
@@ -1027,7 +1073,7 @@ func (st *aggState) step(e *env) error {
 		return nil
 	}
 	v, err := st.spec.arg(e)
-	if err != nil || v == nil {
+	if err != nil || v == nil && st.spec.name != "JSON_GROUP_ARRAY" {
 		return err
 	}
 	if st.seen != nil {
@@ -1069,6 +1115,8 @@ func (st *aggState) step(e *env) error {
 		}
 	case "GROUP_CONCAT":
 		st.parts = append(st.parts, value.Format(v))
+	case "JSON_GROUP_ARRAY", "JSON_GROUP_OBJECT":
+		return st.stepJSON(v)
 	}
 	return nil
 }
@@ -1102,6 +1150,8 @@ func (st *aggState) result() (any, error) {
 			return nil, nil
 		}
 		return strings.Join(st.parts, ","), nil
+	case "JSON_GROUP_ARRAY", "JSON_GROUP_OBJECT":
+		return st.resultJSON(), nil
 	}
 	return nil, nil
 }

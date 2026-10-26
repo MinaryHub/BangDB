@@ -40,6 +40,8 @@ func FuzzExec(f *testing.F) {
 		"CREATE TABLE s (ts INTEGER NOT NULL, v REAL, tag TEXT) USING timeseries WITH (time_column = ts, block_rows = 16, retention = 50); INSERT INTO s SELECT id * 7, n, name FROM t; UPDATE s SET ts = ts + 3 WHERE v > 1; DELETE FROM s WHERE ts BETWEEN 5 AND 20; SELECT time_bucket(10, ts) b, count(*), avg(v) FROM s WHERE ts >= 0 GROUP BY b ORDER BY b DESC",
 		"CREATE TABLE m (id INTEGER PRIMARY KEY, k TEXT UNIQUE, v REAL) USING memory; CREATE INDEX m_v ON m (v); INSERT INTO m (k, v) SELECT name, n FROM t; UPDATE m SET v = v * 2 WHERE k > 'a'; DELETE FROM m WHERE id % 2 = 0; SELECT * FROM m ORDER BY v DESC LIMIT 3",
 		"CREATE VIEW v (a, b) AS SELECT name, COUNT(*) FROM t GROUP BY name; SELECT * FROM v JOIN t ON t.name = v.a WHERE b > 0; DROP VIEW v",
+		"SELECT name, n, rank() OVER (PARTITION BY n % 2 ORDER BY name DESC), sum(n) OVER (ORDER BY id ROWS BETWEEN 1 PRECEDING AND 2 FOLLOWING), lag(name, 2, 'z') OVER (ORDER BY n), ntile(2) OVER () FROM t ORDER BY 3",
+		"SELECT json_set(json_object('a', name, 'n', json_array(n, id)), '$.n[#]', 1, '$.x.y', 2) -> 'n' ->> 1, json_group_array(json_extract('{\"k\":[1,2]}', '$.k[#-1]')) FROM t GROUP BY n",
 	} {
 		f.Add(s)
 	}
