@@ -11,6 +11,7 @@ import (
 )
 
 func TestStats(t *testing.T) {
+	durableOnly(t)
 	db, err := OpenWithOptions(filepath.Join(t.TempDir(), "s.db"), nil)
 	if err != nil {
 		t.Fatal(err)

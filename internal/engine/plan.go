@@ -49,6 +49,9 @@ type access struct {
 	desc     string
 
 	reverse bool // visit rows in descending key order (for ORDER BY ... DESC)
+	// covering: the query uses only columns stored in the index key, so
+	// rows are built from index entries without reading the table.
+	covering bool
 
 	subs    []*access // accUnion
 	hashCol int       // accHash: hashed column (-1 = rowid)
@@ -604,7 +607,26 @@ func (x *execCtx) scan(t *Table, acc *access, e *env, visit func(rowid int64, ro
 		}
 		return nil
 	case accIndex:
-		return x.scanIndex(acc, e, emit)
+		if !acc.covering {
+			return x.scanIndex(acc, e, emit)
+		}
+		row := make([]any, len(t.Columns))
+		return x.scanIndex(acc, e, func(rowid int64) (bool, error) {
+			vals, ok := value.DecodeKey(x.keyPart, len(acc.ix.cols))
+			if x.keyPart == nil || !ok {
+				return emit(rowid) // a long key stored cut: read the row
+			}
+			if err := x.tick(); err != nil {
+				return false, err
+			}
+			for i, c := range acc.ix.cols {
+				row[c] = vals[i]
+			}
+			if t.RowidCol >= 0 {
+				row[t.RowidCol] = rowid
+			}
+			return visit(rowid, row)
+		})
 	case accTimeRange:
 		var lo, hi any
 		for _, b := range []struct {
@@ -1207,7 +1229,10 @@ func (o *keyOrder) push(key []byte) (bool, error) {
 		o.group = append(o.group, id)
 		return true, nil
 	}
-	return o.emit(id)
+	o.x.keyPart = part
+	cont, err := o.emit(id)
+	o.x.keyPart = nil
+	return cont, err
 }
 
 func (o *keyOrder) flush() (bool, error) {

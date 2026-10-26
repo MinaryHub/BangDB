@@ -32,6 +32,8 @@ type execCtx struct {
 	// and LIMIT may use the first table's order is planned.
 	keepJoinOrder bool
 
+	keyPart []byte // key part of the index entry being visited (covering scans)
+
 	lastTable *Table // cache of rows()
 	lastRoot  uint32
 	lastRows  store.TableStore

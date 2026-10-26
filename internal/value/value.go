@@ -427,3 +427,67 @@ func EncodeRowID(id int64) []byte {
 func DecodeRowID(b []byte) int64 {
 	return int64(binary.BigEndian.Uint64(b) ^ (1 << 63))
 }
+
+// DecodeKey decodes n values encoded by AppendKey from the start of b. ok
+// is false if b does not hold n complete values.
+func DecodeKey(b []byte, n int) (vals []any, ok bool) {
+	vals = make([]any, 0, n)
+	for len(vals) < n {
+		if len(b) == 0 {
+			return nil, false
+		}
+		tag := b[0]
+		b = b[1:]
+		switch tag {
+		case keyNull:
+			vals = append(vals, nil)
+		case keyInt:
+			if len(b) < 8 {
+				return nil, false
+			}
+			vals = append(vals, int64(binary.BigEndian.Uint64(b)^(1<<63)))
+			b = b[8:]
+		case keyFloat:
+			if len(b) < 8 {
+				return nil, false
+			}
+			bits := binary.BigEndian.Uint64(b)
+			if bits&(1<<63) != 0 {
+				bits &^= 1 << 63
+			} else {
+				bits = ^bits
+			}
+			vals = append(vals, math.Float64frombits(bits))
+			b = b[8:]
+		case keyText, keyBlob:
+			var data []byte
+			end := false
+			for i := 0; i+1 < len(b); i++ {
+				if b[i] != 0 {
+					data = append(data, b[i])
+					continue
+				}
+				if b[i+1] == 1 {
+					b, end = b[i+2:], true
+					break
+				}
+				data = append(data, 0) // 00 FF
+				i++
+			}
+			if !end {
+				return nil, false
+			}
+			if tag == keyText {
+				vals = append(vals, string(data))
+			} else {
+				if data == nil {
+					data = []byte{}
+				}
+				vals = append(vals, data)
+			}
+		default:
+			return nil, false
+		}
+	}
+	return vals, true
+}

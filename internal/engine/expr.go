@@ -49,6 +49,7 @@ type scopeCol struct {
 type scope struct {
 	cols  []scopeCol
 	outer *outerCtx
+	used  []bool // columns referenced by the query (see coveringIndexes)
 }
 
 // outerCtx is the enclosing query of a subquery: its scope, and the row it
@@ -105,6 +106,10 @@ func (s *scope) resolve(tbl, name string) (int, error) {
 		}
 		return 0, fmt.Errorf("bangdb: no such column: %s", name)
 	}
+	if len(s.used) != len(s.cols) {
+		s.used = make([]bool, len(s.cols))
+	}
+	s.used[found] = true
 	return found, nil
 }
 

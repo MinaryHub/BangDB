@@ -33,7 +33,7 @@ func TestJoinReordering(t *testing.T) {
 	setupJoinTables(t, db)
 	// The selective table goes first even though it is written last.
 	plan := query(t, db, "EXPLAIN SELECT big.id FROM big JOIN small ON big.sid = small.id WHERE small.name = 's7'")
-	if !strings.HasPrefix(plan, "SCAN small;  SEARCH big USING INDEX big_sid") {
+	if !strings.HasPrefix(plan, "SCAN small;  SEARCH big USING COVERING INDEX big_sid") {
 		t.Errorf("plan: %s", plan)
 	}
 	expect(t, db, "SELECT count(*) FROM big JOIN small ON big.sid = small.id WHERE small.name = 's7'", "100")
@@ -53,12 +53,13 @@ func TestJoinReordering(t *testing.T) {
 	}
 	// A good written order is kept.
 	plan = query(t, db, "EXPLAIN SELECT big.id FROM small JOIN big ON big.sid = small.id WHERE small.kind = 1")
-	if !strings.HasPrefix(plan, "SCAN small;  SEARCH big USING INDEX big_sid") {
+	if !strings.HasPrefix(plan, "SCAN small;  SEARCH big USING COVERING INDEX big_sid") {
 		t.Errorf("kept plan: %s", plan)
 	}
 }
 
 func TestAnalyze(t *testing.T) {
+	durableOnly(t)
 	path := filepath.Join(t.TempDir(), "a.db")
 	db, err := Open(path)
 	if err != nil {

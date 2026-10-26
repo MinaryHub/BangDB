@@ -14,6 +14,7 @@ import (
 var testKey = []byte("0123456789abcdef0123456789abcdef")
 
 func TestEncryption(t *testing.T) {
+	durableOnly(t)
 	dir := t.TempDir()
 	path := filepath.Join(dir, "enc.db")
 	db, err := OpenWithOptions(path, &Options{EncryptionKey: testKey})

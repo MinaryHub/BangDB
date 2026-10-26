@@ -156,6 +156,7 @@ func (x *execCtx) planSelect(st *sql.Select) (*selectPlan, error) {
 	if !p.agg && !st.Distinct && len(st.OrderBy) > 0 && len(p.levels) > 0 && len(p.wins) == 0 {
 		p.ordered = p.useScanOrder(st)
 	}
+	defer p.coveringIndexes() // once every expression is compiled
 	if p.agg {
 		gc := &compiler{x: x, sc: p.sc, aliases: c.aliases} // GROUP BY may name a select alias
 		for _, g := range st.GroupBy {

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"math"
 	"sort"
+	"strings"
 
 	"github.com/knoxxr/bangdb/internal/sql"
 )
@@ -329,3 +330,37 @@ func (x *execCtx) reorderJoin(sc *scope, levels []*level, lefts []bool, ons []sq
 
 // Index returns the index with the given name, or nil.
 func (c *Catalog) Index(name string) *Index { return c.index(name) }
+
+// coveringIndexes marks index access paths that can be served from the
+// index entries alone: every column the query references at that level
+// is an indexed column (stored in the key with its own value, so not
+// under a collation) or the rowid.
+func (p *selectPlan) coveringIndexes() {
+	for _, l := range p.levels {
+		acc := l.acc
+		if l.virtual != nil || acc == nil || acc.kind != accIndex || acc.covering {
+			continue
+		}
+		ok := true
+		for col := range l.t.Columns {
+			slot := l.offset + col
+			if slot >= len(p.sc.used) || !p.sc.used[slot] || col == l.t.RowidCol {
+				continue
+			}
+			found := false
+			for i, c := range acc.ix.cols {
+				if c == col && acc.ix.colls[i] == "" {
+					found = true
+				}
+			}
+			if !found {
+				ok = false
+				break
+			}
+		}
+		if ok {
+			acc.covering = true
+			acc.desc = strings.Replace(acc.desc, "USING INDEX", "USING COVERING INDEX", 1)
+		}
+	}
+}
