@@ -71,6 +71,9 @@ type Index struct {
 	Unique  bool     `json:"unique,omitempty"`
 	Auto    bool     `json:"auto,omitempty"` // created for UNIQUE / PRIMARY KEY
 	Root    uint32   `json:"root"`
+	// Stats (from ANALYZE): Stats[k] is the average number of entries
+	// sharing the values of the first k+1 indexed columns.
+	Stats []float64 `json:"stats,omitempty"`
 
 	cols  []int
 	colls []string   // collation per column: keys of collated text are folded

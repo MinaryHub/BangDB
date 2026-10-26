@@ -318,7 +318,7 @@ INSERT INTO emp (dept_id, email, salary) VALUES (1, 'kim@example.com', 100)
 
 - 트리거, 식(expression) 인덱스, 이름 있는 윈도(`WINDOW w AS`), `json_each` 같은 테이블 값 함수 미지원
 - 윈도우 함수가 있는 조회는 결과 행을 메모리에 모은 뒤 계산
-- 조인 순서는 FROM에 쓴 순서를 따름 (통계 기반 재배치·covering index 없음) → `EXPLAIN`으로 확인
+- 조인 순서는 비용 추정(테이블 크기, `ANALYZE` 통계)으로 정하되 `LEFT JOIN`과 `ORDER BY … LIMIT` 질의는 쓴 순서를 따름 → `EXPLAIN`으로 확인. 통계는 평균값이라 값 분포가 치우친 컬럼은 잘못 추정할 수 있음
 - 외래 키는 항상 적용되며 즉시 검사 (지연 제약·`SET DEFAULT` 없음). 부모 테이블을 먼저 만들어야 함
 - 뷰는 읽기 전용이며 조회할 때마다 실행됨
 - 집합 연산(`UNION` 등)과 해시 조인의 빌드 측은 메모리에서 처리

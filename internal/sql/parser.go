@@ -234,6 +234,12 @@ func (p *parser) parseStmt() (Stmt, error) {
 		return &Commit{}, nil
 	case p.acceptKw("VACUUM"):
 		return &Vacuum{}, nil
+	case p.acceptKw("ANALYZE"):
+		st := &Analyze{}
+		if t := p.peek(); t.kind == tIdent || t.kind == tQuotedIdent {
+			st.Table = p.next().text
+		}
+		return st, nil
 	case p.acceptKw("ROLLBACK"):
 		p.acceptKw("TRANSACTION")
 		return &Rollback{}, nil

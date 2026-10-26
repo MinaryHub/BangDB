@@ -28,6 +28,10 @@ type execCtx struct {
 	fkDepth int          // nesting of foreign key actions and views
 	spill   *spillConfig // nil: defaults
 
+	// keepJoinOrder disables join reordering while a SELECT whose ORDER BY
+	// and LIMIT may use the first table's order is planned.
+	keepJoinOrder bool
+
 	lastTable *Table // cache of rows()
 	lastRoot  uint32
 	lastRows  store.TableStore
@@ -86,6 +90,8 @@ func (x *execCtx) exec(s sql.Stmt) (Result, error) {
 		return Result{}, x.createView(st)
 	case *sql.DropView:
 		return Result{}, x.dropView(st)
+	case *sql.Analyze:
+		return Result{}, x.analyze(st)
 	}
 	return Result{}, fmt.Errorf("bangdb: unsupported statement %T", s)
 }

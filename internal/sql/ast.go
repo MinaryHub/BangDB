@@ -181,6 +181,10 @@ type Begin struct{}
 
 // Vacuum rebuilds the database file compactly.
 type Vacuum struct{}
+
+// Analyze collects index statistics for the query planner (all tables,
+// or one).
+type Analyze struct{ Table string }
 type Commit struct{}
 type Rollback struct{}
 
@@ -206,6 +210,7 @@ func (*Update) stmt()                 {}
 func (*Delete) stmt()                 {}
 func (*Begin) stmt()                  {}
 func (*Vacuum) stmt()                 {}
+func (*Analyze) stmt()                {}
 func (*Commit) stmt()                 {}
 func (*Rollback) stmt()               {}
 func (*Explain) stmt()                {}

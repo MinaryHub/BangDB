@@ -60,7 +60,10 @@ func (x *execCtx) planSelect(st *sql.Select) (*selectPlan, error) {
 		}
 	}
 	var err error
+	keep := x.keepJoinOrder
+	x.keepJoinOrder = len(st.OrderBy) > 0 && st.Limit != nil
 	p.sc, p.levels, p.final, err = x.buildLevels(from, lefts, ons, st.Where)
+	x.keepJoinOrder = keep
 	if err != nil {
 		return nil, err
 	}

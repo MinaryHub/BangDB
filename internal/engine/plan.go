@@ -280,7 +280,7 @@ func chooseAccess(sc *scope, l *level, li int, conds []sql.Expr, c *compiler) (*
 		default:
 			continue
 		}
-		if best == nil || p.score > best.score {
+		if best == nil || p.score > best.score || p.score == best.score && indexBetter(p.ix, p.eqN, best.ix, best.eqN) {
 			best = p
 		}
 	}
@@ -352,6 +352,27 @@ func chooseAccess(sc *scope, l *level, li int, conds []sql.Expr, c *compiler) (*
 	}
 	a.desc = fmt.Sprintf("SEARCH %s USING INDEX %s%s (%s)", name, ix.Name, kind, strings.Join(parts, " AND "))
 	return a, nil
+}
+
+// indexBetter breaks a tie between two indexes that the conditions use
+// equally: the one whose looked-up prefix is more selective according to
+// ANALYZE statistics wins, then the one with the smaller name (so plans do
+// not depend on map order).
+func indexBetter(a *Index, aN int, b *Index, bN int) bool {
+	sa, sb := prefixRows(a, aN), prefixRows(b, bN)
+	if sa != sb {
+		return sa < sb
+	}
+	return a.Name < b.Name
+}
+
+// prefixRows is the average number of entries per value of the first n
+// columns of ix (ANALYZE), or +Inf if unknown.
+func prefixRows(ix *Index, n int) float64 {
+	if n > 0 && n <= len(ix.Stats) {
+		return ix.Stats[n-1]
+	}
+	return math.Inf(1)
 }
 
 // setRange fills a's bounds from the range candidates of one column.
@@ -987,6 +1008,30 @@ func (x *execCtx) buildLevels(from []sql.TableRef, lefts []bool, ons []sql.Expr,
 		levels = append(levels, l)
 	}
 	c := &compiler{x: x, sc: sc}
+	if order := x.reorderJoin(sc, levels, lefts, ons, where, c); order != nil {
+		// Inner joins only: ON conditions are WHERE conditions, placed by
+		// the tables they use.
+		pos := make([]int, len(order))
+		reordered := make([]*level, len(order))
+		for k, li := range order {
+			pos[li] = k
+			reordered[k] = levels[li]
+		}
+		for i := range sc.cols {
+			sc.cols[i].level = pos[sc.cols[i].level]
+		}
+		levels = reordered
+		for i, on := range ons {
+			if on != nil {
+				if where == nil {
+					where = on
+				} else {
+					where = &sql.Binary{Op: "AND", L: where, R: on}
+				}
+				ons[i] = nil
+			}
+		}
+	}
 	accessConds := make([][]sql.Expr, len(levels))
 	var final []evalFn
 	// ON conditions belong to their join level.
