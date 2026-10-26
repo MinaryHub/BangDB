@@ -97,7 +97,7 @@ func TestTimeSeriesRules(t *testing.T) {
 	mustFail(t, db, `CREATE TABLE a (ts INTEGER, v REAL) USING timeseries WITH (time_column = ts, time_unit = 'ns')`, "time_unit")
 	mustFail(t, db, `CREATE TABLE a (ts INTEGER, v REAL UNIQUE) USING timeseries WITH (time_column = ts)`, "do not support indexes")
 	mustFail(t, db, `CREATE TABLE a (id INTEGER PRIMARY KEY, ts INTEGER) USING timeseries WITH (time_column = ts)`, "do not support indexes")
-	mustFail(t, db, `CREATE TABLE a (ts INTEGER) USING memory WITH (x = 1)`, "takes no options")
+	mustFail(t, db, `CREATE TABLE a (ts INTEGER) USING memory WITH (x = 1)`, "takes only the option persist")
 	exec(t, db, `CREATE TABLE a (ts INTEGER NOT NULL, v REAL) USING timeseries WITH (time_column = ts, time_unit = ms, retention = '1 hour')`)
 	mustFail(t, db, `CREATE INDEX a_v ON a (v)`, "do not support indexes")
 	mustFail(t, db, `INSERT INTO a VALUES (NULL, 1)`, "NOT NULL")

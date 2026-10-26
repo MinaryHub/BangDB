@@ -169,6 +169,9 @@ func (t *Table) configure() error {
 	t.storeCfg, t.timeCol = nil, -1
 	ck, ok := t.kind.(store.ConfigurableKind)
 	if !ok {
+		if t.kind.Volatile() {
+			return checkVolatileOptions(t)
+		}
 		if len(t.StoreOptions) > 0 {
 			return fmt.Errorf("bangdb: storage kind %s takes no options", kindName(t.Store))
 		}

@@ -109,3 +109,7 @@ func (p *Pager) SetObjects(m map[uint32]any) {
 	p.slots, p.prepSlots = m, m
 	p.mu.Unlock()
 }
+
+// ChangedObjects returns the view's object slots with its changes applied,
+// or nil if it changed none.
+func (v *View) ChangedObjects() map[uint32]any { return v.mergedObjs() }

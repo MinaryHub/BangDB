@@ -102,6 +102,7 @@ type DB struct {
 
 	key           []byte // encryption key of the file (nil: plaintext)
 	commitWaiter  atomic.Pointer[func(seq uint64)]
+	noMemSave     bool // Close must not write the memory table snapshot
 	counters      dbCounters
 	slowThreshold time.Duration
 	onSlow        func(SlowQuery)
@@ -161,6 +162,11 @@ func Open(path string, opts *Options) (*DB, error) {
 	}
 	db.cat = cat
 	p.SetMeta(cat)
+	if err := db.loadMemoryTables(); err != nil {
+		db.noMemSave = true // keep the file that could not be loaded
+		db.Close()
+		return nil, err
+	}
 	return db, nil
 }
 
@@ -173,10 +179,14 @@ func (db *DB) Close() error {
 			err = fmt.Errorf("bangdb: close: %w", lerr)
 			return
 		}
+		var merr error
+		if !db.noMemSave {
+			merr = db.saveMemoryTables()
+		}
 		close(db.closed)
 		db.cursors.cancelAll() // open cursors release their snapshots
 		db.swapMu.Lock()
-		err = db.p.Close()
+		err = errors.Join(merr, db.p.Close())
 		db.swapMu.Unlock()
 		db.repl.mu.Lock()
 		db.repl.disabled = true
