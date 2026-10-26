@@ -38,8 +38,9 @@ func init() { Register(TimeSeriesKind{}) }
 //
 // New rows after the last block are kept as single rows; once block_rows
 // of them have accumulated they are sealed into a block. Blocks never
-// overlap. Changes to sealed rows are written as singles, so blocks are
-// never rewritten except by DeleteRange. Rows older than retention
+// overlap. Changes to sealed rows are written as singles; once a block has
+// collected a quarter of block_rows of them it is compacted: re-encoded
+// with the changes applied (see compact). Rows older than retention
 // (relative to the newest row) are dropped whole blocks at a time when a
 // block is sealed.
 type TimeSeriesKind struct{}
@@ -385,6 +386,11 @@ func (s *tsStore) Put(rowid int64, row []any) error {
 	if !m.hasMax || rowid > m.max {
 		m.hasMax, m.max = true, rowid
 	}
+	if inBlocks {
+		if err := s.compact(rowid); err != nil {
+			return err
+		}
+	}
 	if m.tail >= s.cfg.blockRows {
 		if err := s.seal(&m); err != nil {
 			return err
@@ -410,7 +416,9 @@ func (s *tsStore) Delete(rowid int64) (bool, error) {
 	}
 	switch {
 	case inBlock: // hide the sealed row
-		err = s.t.Put(key(tsSingleKey, rowid), []byte{singleTomb})
+		if err = s.t.Put(key(tsSingleKey, rowid), []byte{singleTomb}); err == nil {
+			err = s.compact(rowid)
+		}
 	case found:
 		_, err = s.t.Delete(key(tsSingleKey, rowid))
 		if !m.hasBlock || rowid > m.blockLast {
@@ -424,6 +432,91 @@ func (s *tsStore) Delete(rowid int64) (bool, error) {
 	}
 	m.live--
 	return true, s.setMeta(m)
+}
+
+// compact rewrites the block containing rowid with the single rows in its
+// range (overrides, tombstones and late rows) merged in, once there are
+// enough of them, so that reads do not have to merge many entries and
+// space is reclaimed.
+func (s *tsStore) compact(rowid int64) error {
+	b, ok, err := s.covering(rowid)
+	if err != nil || !ok {
+		return err
+	}
+	threshold := max(s.cfg.blockRows/4, 1)
+	n := 0
+	c := s.t.Seek(key(tsSingleKey, b.first))
+	end := key(tsSingleKey, b.last)
+	for ; c.Valid() && bytes.Compare(c.Key(), end) <= 0 && n < threshold; c.Next() {
+		n++
+	}
+	if err := c.Err(); err != nil || n < threshold {
+		return err
+	}
+	ids, rows, err := decodeBlock(b.data)
+	if err != nil {
+		return err
+	}
+	merged := make(map[int64][]any, len(ids))
+	for i, id := range ids {
+		merged[id] = rows[i]
+	}
+	var singles []int64
+	c = s.t.Seek(key(tsSingleKey, b.first))
+	for ; c.Valid() && bytes.Compare(c.Key(), end) <= 0; c.Next() {
+		id := value.DecodeRowID(c.Key()[1:])
+		singles = append(singles, id)
+		v, err := c.Value()
+		if err != nil {
+			return err
+		}
+		if len(v) == 0 || v[0] == singleTomb {
+			delete(merged, id)
+			continue
+		}
+		row, err := value.DecodeRow(v[1:])
+		if err != nil {
+			return err
+		}
+		merged[id] = row
+	}
+	if err := c.Err(); err != nil {
+		return err
+	}
+	for _, id := range singles {
+		if _, err := s.t.Delete(key(tsSingleKey, id)); err != nil {
+			return err
+		}
+	}
+	if _, err := s.t.Delete(key(tsBlockKey, b.first)); err != nil {
+		return err
+	}
+	s.dropCache()
+	if len(merged) == 0 {
+		return nil
+	}
+	ids = ids[:0]
+	for id := range merged {
+		ids = append(ids, id)
+	}
+	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+	rows = rows[:0]
+	for _, id := range ids {
+		rows = append(rows, merged[id])
+	}
+	// Rows added in the block's range can make it grow: split it into
+	// blocks of block_rows. The last one keeps the old block's end.
+	for i := 0; i < len(ids); i += s.cfg.blockRows {
+		j := min(i+s.cfg.blockRows, len(ids))
+		last := ids[j-1]
+		if j == len(ids) {
+			last = b.last
+		}
+		if err := s.t.Put(key(tsBlockKey, ids[i]), blockValue(last, j-i, encodeBlock(ids[i:j], rows[i:j]))); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // seal turns the single rows after the last block into a block, then

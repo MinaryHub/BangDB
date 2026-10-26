@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/knoxxr/bangdb/internal/pager"
+	"github.com/knoxxr/bangdb/internal/value"
 )
 
 func openTS(t *testing.T, v *pager.View, opts map[string]string) (*tsStore, uint32) {
@@ -163,6 +164,21 @@ func TestTimeSeriesModel(t *testing.T) {
 		blocks++
 	}
 	t.Logf("%d rows in %d blocks, %d tail singles", m.live, blocks, m.tail)
+	// Compaction keeps the changes inside each block below the threshold.
+	for c := s.t.Seek([]byte{tsBlockKey}); c.Valid() && c.Key()[0] == tsBlockKey; c.Next() {
+		v, _ := c.Value()
+		b, err := parseBlock(c.Key(), v)
+		if err != nil {
+			t.Fatal(err)
+		}
+		n := 0
+		for sc := s.t.Seek(key(tsSingleKey, b.first)); sc.Valid() && sc.Key()[0] == tsSingleKey && value.DecodeRowID(sc.Key()[1:]) <= b.last; sc.Next() {
+			n++
+		}
+		if n >= s.cfg.blockRows/4 || b.count > s.cfg.blockRows {
+			t.Fatalf("block %d..%d: %d rows, %d pending changes", b.first, b.last, b.count, n)
+		}
+	}
 	if blocks < 10 {
 		t.Fatal("too few blocks: sealing did not happen")
 	}
