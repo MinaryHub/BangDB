@@ -26,7 +26,7 @@ func TestCoveringIndex(t *testing.T) {
 		{"SELECT f, typeof(b) FROM t WHERE f < 0", "COVERING INDEX t_f", "-0.25|blob"},
 		{"SELECT k, pad FROM t WHERE k = 'a' ORDER BY pad", "USING INDEX t_k", "a|p1;a|p2"},
 		{"SELECT ci FROM t WHERE ci = 'ABC'", "USING INDEX t_ci", "Abc"}, // folded key: not covering
-		{"SELECT id FROM t WHERE ci = 'ABC'", "USING INDEX t_ci", "1"}, // the filter rechecks ci
+		{"SELECT id FROM t WHERE ci = 'ABC'", "USING INDEX t_ci", "1"},   // the filter rechecks ci
 		{"SELECT k, (SELECT pad FROM t t2 WHERE t2.id = t.id) FROM t WHERE k = 'b'", "COVERING INDEX t_k", "b|p3"},
 		{"SELECT k FROM t WHERE k = 'b' AND EXISTS (SELECT 1 WHERE t.pad = 'p3')", "USING INDEX t_k", "b"},
 	} {

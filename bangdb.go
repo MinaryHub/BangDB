@@ -155,7 +155,9 @@ func (s *Stmt) ExecContext(ctx context.Context, args ...any) (Result, error) {
 }
 
 // Query runs the statement as a query.
-func (s *Stmt) Query(args ...any) (*Rows, error) { return s.QueryContext(context.Background(), args...) }
+func (s *Stmt) Query(args ...any) (*Rows, error) {
+	return s.QueryContext(context.Background(), args...)
+}
 
 // QueryContext is Query with cancellation.
 func (s *Stmt) QueryContext(ctx context.Context, args ...any) (*Rows, error) {
