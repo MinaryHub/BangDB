@@ -166,6 +166,9 @@ type Pager struct {
 	cacheMax int
 	objs     objCache // decoded page images
 
+	slots     map[uint32]any // object slots of the published commit
+	prepSlots map[uint32]any // object slots of the latest prepared commit
+
 	versions map[uint32][]version // uncheckpointed versions, ascending seq
 	walPages int                  // number of versions
 	walSize  int64                // bytes used in the WAL file
@@ -497,6 +500,7 @@ type Snapshot struct {
 	seq      uint64
 	hdr      Header
 	meta     any
+	slots    map[uint32]any
 	released bool
 }
 
@@ -517,7 +521,7 @@ func (p *Pager) SnapshotWith(fn func(seq uint64) error) (*Snapshot, error) {
 		}
 	}
 	p.readers[p.hdr.Seq]++
-	return &Snapshot{p: p, seq: p.hdr.Seq, hdr: p.hdr, meta: p.meta}, nil
+	return &Snapshot{p: p, seq: p.hdr.Seq, hdr: p.hdr, meta: p.meta, slots: p.slots}, nil
 }
 
 // Meta returns the caller data published with the snapshot's commit.
@@ -539,7 +543,7 @@ func (s *Snapshot) Header() Header { return s.hdr }
 
 // View returns a read view of the snapshot.
 func (s *Snapshot) View() *View {
-	return &View{p: s.p, dirty: map[uint32][]byte{}, hdr: s.hdr, seq: s.seq}
+	return &View{p: s.p, hdr: s.hdr, seq: s.seq, baseObjs: s.slots} // dirty: created on first write
 }
 
 // Release unpins the snapshot so that checkpoints can proceed past it.
@@ -562,7 +566,7 @@ func (s *Snapshot) Release() {
 func (p *Pager) NewView() *View {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	return &View{p: p, dirty: map[uint32][]byte{}, hdr: p.prepHdr, seq: p.prepHdr.Seq}
+	return &View{p: p, dirty: map[uint32][]byte{}, hdr: p.prepHdr, seq: p.prepHdr.Seq, baseObjs: p.prepSlots}
 }
 
 // PreparedHeader returns the header of the latest prepared commit.
@@ -579,6 +583,7 @@ func (p *Pager) PreparedHeader() Header {
 type Prepared struct {
 	pages map[uint32][]byte
 	hdr   Header
+	slots map[uint32]any // object slots after this commit; nil = unchanged
 	// Meta is published together with the commit (Snapshot.Meta). It is
 	// read under the pager lock; see PrepareCommit and SetPreparedMeta.
 	Meta any
@@ -599,14 +604,17 @@ func (p *Pager) PrepareCommit(v *View, meta any) (*Prepared, error) {
 	if err != nil {
 		return nil, err
 	}
-	if len(v.dirty) == 0 && v.hdr == cur {
+	slots := v.mergedObjs()
+	if len(v.dirty) == 0 && v.hdr == cur && slots == nil {
 		return nil, nil
 	}
 	v.hdr.Seq = cur.Seq + 1
-	v.dirty[0] = v.hdr.encode()
+	v.put(0, v.hdr.encode())
 	pages := v.dirty
 	v.dirty = map[uint32][]byte{}
-	return p.prepare(pages, v.hdr, meta)
+	v.dirtyObjs = nil
+	p.publishOwned(v, pages)
+	return p.prepare(pages, v.hdr, meta, slots)
 }
 
 // PrepareRaw prepares a page set received from a primary. It must contain
@@ -622,7 +630,7 @@ func (p *Pager) PrepareRaw(pages map[uint32][]byte) (*Prepared, error) {
 	if err != nil {
 		return nil, err
 	}
-	return p.prepare(pages, hdr, nil)
+	return p.prepare(pages, hdr, nil, nil)
 }
 
 // SetPreparedMeta sets the meta published with c, which must not have been
@@ -640,13 +648,13 @@ func (p *Pager) usable() error {
 	return p.err
 }
 
-func (p *Pager) prepare(pages map[uint32][]byte, hdr Header, meta any) (*Prepared, error) {
+func (p *Pager) prepare(pages map[uint32][]byte, hdr Header, meta any, slots map[uint32]any) (*Prepared, error) {
 	for _, b := range pages {
 		seal(b) // the pages are owned by the commit and not yet visible
 	}
 	// Meta is set before the commit is queued: a concurrent Flush may
 	// publish it at any time after that.
-	c := &Prepared{pages: pages, hdr: hdr, Meta: meta}
+	c := &Prepared{pages: pages, hdr: hdr, Meta: meta, slots: slots}
 	var offs map[uint32]int64
 	end := p.walSize
 	if p.file != nil {
@@ -701,6 +709,9 @@ func (p *Pager) prepare(pages map[uint32][]byte, hdr Header, meta any) (*Prepare
 	}
 	p.walSize = end
 	p.prepHdr = hdr
+	if slots != nil {
+		p.prepSlots = slots
+	}
 	p.pending = append(p.pending, c)
 	return c, nil
 }
@@ -763,6 +774,9 @@ func (p *Pager) flushLocked() error {
 		p.hdr = c.hdr
 		if c.Meta != nil {
 			p.meta = c.Meta
+		}
+		if c.slots != nil {
+			p.slots = c.slots
 		}
 		if p.onCommit != nil {
 			p.onCommit(c.hdr.Seq, c.pages)
@@ -1017,6 +1031,13 @@ type View struct {
 	undo     []undoEntry
 	undoSeen map[uint32]struct{}
 
+	// Object slots (objects.go).
+	baseObjs  map[uint32]any // slots of the commit the view reads; immutable
+	dirtyObjs map[uint32]any // the view's changes (nil value = emptied)
+	objUndo   []objUndo
+	objSeen   map[uint32]struct{}
+	token     *Token
+
 	owned map[uint32]ownedObj // see SetOwned
 }
 
@@ -1029,6 +1050,14 @@ type undoEntry struct {
 	pg   uint32
 	prev []byte
 	had  bool
+}
+
+// put sets a dirty page, creating the map of read views on first use.
+func (v *View) put(pg uint32, b []byte) {
+	if v.dirty == nil {
+		v.dirty = map[uint32][]byte{}
+	}
+	v.dirty[pg] = b
 }
 
 func (v *View) track(pg uint32) {
@@ -1064,7 +1093,7 @@ func (v *View) Write(pgno uint32, data []byte) {
 		panic("pager: page 0 is reserved for the header")
 	}
 	v.track(pgno)
-	v.dirty[pgno] = data
+	v.put(pgno, data)
 }
 
 // Alloc returns a fresh zeroed page number, reusing the free list first.
@@ -1077,13 +1106,13 @@ func (v *View) Alloc() (uint32, error) {
 		}
 		v.hdr.FreeHead = binary.BigEndian.Uint32(b[0:4])
 		v.track(pg)
-		v.dirty[pg] = make([]byte, PageSize)
+		v.put(pg, make([]byte, PageSize))
 		return pg, nil
 	}
 	pg := v.hdr.PageCount
 	v.hdr.PageCount++
 	v.track(pg)
-	v.dirty[pg] = make([]byte, PageSize)
+	v.put(pg, make([]byte, PageSize))
 	return pg, nil
 }
 
@@ -1092,7 +1121,7 @@ func (v *View) Free(pgno uint32) {
 	b := make([]byte, PageSize)
 	binary.BigEndian.PutUint32(b[0:4], v.hdr.FreeHead)
 	v.track(pgno)
-	v.dirty[pgno] = b
+	v.put(pgno, b)
 	v.hdr.FreeHead = pgno
 }
 
@@ -1138,6 +1167,7 @@ func (v *View) Savepoint() Savepoint {
 	} else {
 		clear(v.undoSeen)
 	}
+	v.objSavepoint()
 	return Savepoint{hdr: v.hdr, gen: v.spGen}
 }
 
@@ -1149,12 +1179,13 @@ func (v *View) Restore(sp Savepoint) {
 	for i := len(v.undo) - 1; i >= 0; i-- {
 		u := v.undo[i]
 		if u.had {
-			v.dirty[u.pg] = u.prev
+			v.put(u.pg, u.prev)
 		} else {
 			delete(v.dirty, u.pg)
 		}
 	}
 	v.undo = v.undo[:0]
 	clear(v.undoSeen)
+	v.objRestore()
 	v.hdr = sp.hdr
 }

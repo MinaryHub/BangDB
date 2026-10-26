@@ -2,15 +2,16 @@
 // so that storage structures other than the B+tree (an in-memory row store,
 // time-series chunks) can be added without changing the executor.
 //
-// A store kind creates, opens and drops stores whose state lives in pager
-// pages reachable from one root page, recorded in the catalog. Everything
-// therefore shares the pager's transactions, snapshots, WAL, checkpoints,
-// backups and physical replication.
+// A store kind creates, opens and drops the stores of a table and of its
+// indexes, each identified by a root page number recorded in the catalog.
+// A durable kind keeps the data in pager pages, so it shares the pager's
+// transactions, snapshots, WAL, checkpoints, backups and physical
+// replication; the integrity check and VACUUM read those pages as B+trees.
+// A volatile kind keeps the data in pager object slots keyed by the root
+// page (see pager.View.Obj): it follows the same transactions, snapshots and
+// savepoints, but lives only as long as the open database.
 //
-// The executor only uses these interfaces for row and index access. Two
-// physical maintenance tasks still look at pages directly and require every
-// kind to keep its pages in B+trees: the integrity check (structure and
-// page accounting) and VACUUM (which rebuilds the trees).
+// The executor only uses these interfaces for row and index access.
 package store
 
 import (
@@ -80,6 +81,13 @@ type Kind interface {
 	Open(v *pager.View, root uint32) TableStore
 	// Drop frees every page of the store.
 	Drop(v *pager.View, root uint32) error
+	// CreateIndex, OpenIndex and DropIndex do the same for the indexes of
+	// tables of this kind.
+	CreateIndex(v *pager.View) (uint32, error)
+	OpenIndex(v *pager.View, root uint32) IndexStore
+	DropIndex(v *pager.View, root uint32) error
+	// Volatile reports whether the data lives outside the pages.
+	Volatile() bool
 }
 
 var (

@@ -216,6 +216,24 @@ func (t *Tree) load(pg uint32) (*node, error) {
 
 func decodeAny(b []byte) (any, error) { return decode(b) }
 
+// loadDescend returns the node at pg for a writer walking down the tree:
+// the view's own copy if it has one (the writer may change it next), else
+// the shared decoded node. The caller must not modify it; use loadMut.
+func (t *Tree) loadDescend(pg uint32) (*node, error) {
+	b, err := t.v.Read(pg)
+	if err != nil {
+		return nil, err
+	}
+	if obj, ok := t.v.PeekOwned(pg, b); ok {
+		return obj.(*node), nil
+	}
+	obj, err := t.v.Decoded(b, decodeAny)
+	if err != nil {
+		return nil, fmt.Errorf("%w (page %d)", err, pg)
+	}
+	return obj.(*node), nil
+}
+
 // loadMut returns a private copy of the node at pg for modification. It
 // does not populate the decoded-page cache: the page is about to change.
 func (t *Tree) loadMut(pg uint32) (*node, error) {
@@ -395,11 +413,16 @@ func (t *Tree) Put(key, val []byte) error {
 }
 
 func (t *Tree) insert(pg uint32, key []byte, v value) (*split, error) {
-	n, err := t.loadMut(pg)
+	// Internal nodes are descended through the shared (read-only) decoded
+	// node; a private copy is made only when a child split changes them.
+	n, err := t.loadDescend(pg)
 	if err != nil {
 		return nil, err
 	}
 	if n.leaf {
+		if n, err = t.loadMut(pg); err != nil {
+			return nil, err
+		}
 		i, found := leafIndex(n, key)
 		if found {
 			if err := t.freeValue(n.vals[i]); err != nil {
@@ -423,6 +446,9 @@ func (t *Tree) insert(pg uint32, key []byte, v value) (*split, error) {
 	ci := childIndex(n, key)
 	s, err := t.insert(n.children[ci], key, v)
 	if err != nil || s == nil {
+		return nil, err
+	}
+	if n, err = t.loadMut(pg); err != nil {
 		return nil, err
 	}
 	n.keys = append(n.keys, nil)
@@ -524,11 +550,14 @@ func (t *Tree) Delete(key []byte) (bool, error) {
 // del removes key from the subtree at pg. under reports that the node at pg
 // is now below minFill.
 func (t *Tree) del(pg uint32, key []byte) (found, under bool, err error) {
-	n, err := t.loadMut(pg)
+	n, err := t.loadDescend(pg) // read-only until something changes (see insert)
 	if err != nil {
 		return false, false, err
 	}
 	if n.leaf {
+		if n, err = t.loadMut(pg); err != nil {
+			return false, false, err
+		}
 		i, ok := leafIndex(n, key)
 		if !ok {
 			return false, false, nil
@@ -545,6 +574,9 @@ func (t *Tree) del(pg uint32, key []byte) (found, under bool, err error) {
 	found, under, err = t.del(n.children[ci], key)
 	if err != nil || !found || !under {
 		return found, false, err
+	}
+	if n, err = t.loadMut(pg); err != nil {
+		return true, false, err
 	}
 	changed, err := t.rebalance(n, ci)
 	if err != nil || !changed {

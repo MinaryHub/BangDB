@@ -22,6 +22,7 @@ import (
 //
 // BANGDB_TORTURE=n runs n kill cycles (default 15; use -short to skip).
 func TestCrashTorture(t *testing.T) {
+	durableOnly(t)
 	if os.Getenv("BANGDB_TORTURE_CHILD") != "" {
 		tortureChild(os.Getenv("BANGDB_TORTURE_CHILD"))
 		return

@@ -374,6 +374,7 @@ func TestTransactions(t *testing.T) {
 }
 
 func TestPersistenceAndLargeValues(t *testing.T) {
+	durableOnly(t)
 	path := filepath.Join(t.TempDir(), "p.db")
 	db, err := Open(path)
 	if err != nil {

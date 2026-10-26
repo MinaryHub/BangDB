@@ -51,6 +51,15 @@ func (s reversedStore) Scan(lo, hi int64, desc bool, fn func(int64, []any) (bool
 
 func init() { store.Register(reversedKind{}) }
 
+// durableOnly skips a test that reopens a database and expects its rows,
+// when the suite runs with a volatile default kind (BANGDB_TEST_STORE).
+func durableOnly(t *testing.T) {
+	t.Helper()
+	if k, err := store.Lookup(os.Getenv("BANGDB_TEST_STORE")); err == nil && k.Volatile() {
+		t.Skip("needs durable tables")
+	}
+}
+
 func TestMain(m *testing.M) {
 	if k := os.Getenv("BANGDB_TEST_STORE"); k != "" {
 		engine.SetDefaultStore(k)

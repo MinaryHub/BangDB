@@ -18,6 +18,19 @@ type env struct {
 	row  []any // combined row of all tables in scope
 	aggs []any // aggregate results for the current group
 	args []any // bound parameters
+	buf  [8]any
+}
+
+// newEnv returns an env with a row of n slots (allocated together with it
+// when small).
+func newEnv(n int, args []any) *env {
+	e := &env{args: args}
+	if n <= len(e.buf) {
+		e.row = e.buf[:n:n]
+	} else {
+		e.row = make([]any, n)
+	}
+	return e
 }
 
 type evalFn func(e *env) (any, error)

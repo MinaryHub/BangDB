@@ -349,8 +349,10 @@ func (x *execCtx) runSelect(r *selectRun, sink func(vals []any) (bool, error)) e
 		return x.runCompound(r, sink)
 	}
 	p, st, limit, offset := r.p, r.st, r.limit, r.offset
+	if !p.agg && (len(p.orderBy) == 0 || p.ordered) && !st.Distinct {
+		return x.runStreaming(r, sink)
+	}
 	e := &env{row: make([]any, len(p.sc.cols)), args: x.args}
-	streaming := !p.agg && (len(p.orderBy) == 0 || p.ordered) && !st.Distinct
 	keyLess := func(a, b []any) bool {
 		for k, o := range p.orderBy {
 			if c := value.Compare(a[k], b[k]); c != 0 {
@@ -391,7 +393,7 @@ func (x *execCtx) runSelect(r *selectRun, sink func(vals []any) (bool, error)) e
 		return err
 	}
 	var orderSort *extSorter
-	if topK < 0 && len(p.orderBy) > 0 && !streaming {
+	if topK < 0 && len(p.orderBy) > 0 {
 		orderSort = newSorter(cfg, keyLess)
 		defer orderSort.Close()
 	}
@@ -448,12 +450,6 @@ func (x *execCtx) runSelect(r *selectRun, sink func(vals []any) (bool, error)) e
 			}
 			vals[i] = v
 		}
-		if streaming {
-			cont, err := sink(vals)
-			emitted++
-			stopped = stopped || !cont
-			return err
-		}
 		row := outRow{vals: vals}
 		if len(p.orderBy) > 0 {
 			row.keys = make([]any, len(p.orderBy))
@@ -474,17 +470,10 @@ func (x *execCtx) runSelect(r *selectRun, sink func(vals []any) (bool, error)) e
 
 	if !p.agg {
 		emit := func() (bool, error) {
-			if streaming && skipped < offset {
-				skipped++
-				return true, nil
-			}
-			if streaming && limit >= 0 && emitted >= limit {
-				return false, nil
-			}
 			if err := project(); err != nil {
 				return false, err
 			}
-			return !stopped && !(streaming && limit >= 0 && emitted >= limit), nil
+			return !stopped, nil
 		}
 		if len(p.levels) == 0 {
 			if ok, err := passes(p.final, e); err != nil {
@@ -494,16 +483,13 @@ func (x *execCtx) runSelect(r *selectRun, sink func(vals []any) (bool, error)) e
 					return err
 				}
 			}
-		} else if limit != 0 || !streaming {
+		} else {
 			if err := x.runJoin(p.levels, p.final, e, emit); err != nil {
 				return err
 			}
 		}
 	} else if err := x.runGrouped(p, e, project); err != nil {
 		return err
-	}
-	if streaming {
-		return nil
 	}
 	if distinctSort != nil {
 		it, err := distinctSort.Finish()
@@ -554,6 +540,55 @@ func (x *execCtx) runSelect(r *selectRun, sink func(vals []any) (bool, error)) e
 		}
 	}
 	return nil
+}
+
+// runStreaming is runSelect for queries whose rows come out in scan order
+// (no grouping, DISTINCT or sorting): each row is projected and passed on
+// as it is found, honouring OFFSET and LIMIT. It keeps per-run state small,
+// as it serves the common short queries.
+func (x *execCtx) runStreaming(r *selectRun, sink func(vals []any) (bool, error)) error {
+	p := r.p
+	if r.limit == 0 {
+		return nil
+	}
+	s := streamState{x: x, p: p, sink: sink, limit: r.limit, offset: r.offset,
+		e: newEnv(len(p.sc.cols), x.args)}
+	if len(p.levels) == 0 {
+		ok, err := passes(p.final, s.e)
+		if err != nil || !ok {
+			return err
+		}
+		_, err = s.emit()
+		return err
+	}
+	return x.runJoin(p.levels, p.final, s.e, s.emit)
+}
+
+type streamState struct {
+	x                *execCtx
+	p                *selectPlan
+	e                *env
+	sink             func(vals []any) (bool, error)
+	limit, offset    int64
+	emitted, skipped int64
+}
+
+func (s *streamState) emit() (bool, error) {
+	if s.skipped < s.offset {
+		s.skipped++
+		return true, nil
+	}
+	vals := make([]any, len(s.p.items))
+	for i, f := range s.p.items {
+		v, err := f(s.e)
+		if err != nil {
+			return false, err
+		}
+		vals[i] = v
+	}
+	cont, err := s.sink(vals)
+	s.emitted++
+	return cont && err == nil && (s.limit < 0 || s.emitted < s.limit), err
 }
 
 type group struct {

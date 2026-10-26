@@ -87,13 +87,25 @@ func (db *DB) rebuild(ctx context.Context, np *pager.Pager) error {
 		names = append(names, k)
 	}
 	sort.Strings(names)
+	// A volatile store's data is a committed (immutable) object: it moves
+	// to a new root page and the new database shares it.
+	copyStore := func(t *Table, root uint32) (uint32, error) {
+		if !t.kind.Volatile() {
+			return copyTree(root)
+		}
+		nr, err := nv.Alloc()
+		if err == nil {
+			nv.SetObj(nr, ov.Obj(root))
+		}
+		return nr, err
+	}
 	for _, k := range names {
 		t := cat.tables[k]
-		if t.Root, err = copyTree(t.Root); err != nil {
+		if t.Root, err = copyStore(t, t.Root); err != nil {
 			return err
 		}
 		for _, ix := range t.indexes {
-			if ix.Root, err = copyTree(ix.Root); err != nil {
+			if ix.Root, err = copyStore(t, ix.Root); err != nil {
 				return err
 			}
 		}

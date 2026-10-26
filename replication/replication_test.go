@@ -386,3 +386,27 @@ func TestReplicaResyncsAfterVacuum(t *testing.T) {
 	}
 	checkConsistent(t, replicaDB)
 }
+
+// Memory tables are not replicated: the replica has the table (schema is
+// in pages) but no rows, and durable tables are unaffected.
+func TestMemoryTablesAreNotReplicated(t *testing.T) {
+	primary := openDB(t, ":memory:")
+	setup(t, primary)
+	mustExec(t, primary, `CREATE TABLE cache (k TEXT PRIMARY KEY, v TEXT) USING memory`)
+	mustExec(t, primary, `INSERT INTO cache VALUES ('a', '1'), ('b', '2')`)
+	_, addr := startPrimary(t, primary, PrimaryOptions{})
+	replicaDB := openDB(t, filepath.Join(t.TempDir(), "r.db"))
+	r := StartReplica(replicaDB, addr, ReplicaOptions{})
+	defer r.Stop()
+	waitSynced(t, r, primary)
+	mustExec(t, primary, `INSERT INTO cache VALUES ('c', '3'); INSERT INTO a (v) VALUES (99); INSERT INTO b (v) VALUES (99)`)
+	waitSynced(t, r, primary)
+	var n int
+	if err := replicaDB.QueryRow(`SELECT count(*) FROM cache`).Scan(&n); err != nil || n != 0 {
+		t.Fatalf("replica memory table: %d rows, %v", n, err)
+	}
+	if err := replicaDB.QueryRow(`SELECT count(*) FROM b WHERE v = 99`).Scan(&n); err != nil || n != 1 {
+		t.Fatalf("durable table not replicated: %d %v", n, err)
+	}
+	checkConsistent(t, replicaDB)
+}

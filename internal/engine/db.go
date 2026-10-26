@@ -246,7 +246,35 @@ type NamedArg struct {
 // normalizeArgs binds args to the argument slots of a statement: positional
 // arguments fill the slots in order, named ones (NamedArg or database/sql's
 // sql.NamedArg) go to the slot of their placeholder.
+// positionalOnly reports whether every parameter is positional and no
+// argument is named (the common case, handled without bookkeeping).
+func positionalOnly(args []any, names []string) bool {
+	for _, n := range names {
+		if n != "" {
+			return false
+		}
+	}
+	for _, a := range args {
+		switch a.(type) {
+		case NamedArg, dbsql.NamedArg:
+			return false
+		}
+	}
+	return true
+}
+
 func normalizeArgs(args []any, names []string) ([]any, error) {
+	if len(args) == len(names) && positionalOnly(args, names) {
+		out := make([]any, len(args))
+		for i, a := range args {
+			v, err := value.Normalize(a)
+			if err != nil {
+				return nil, err
+			}
+			out[i] = v
+		}
+		return out, nil
+	}
 	out := make([]any, len(names))
 	set := make([]bool, len(names))
 	pos := 0

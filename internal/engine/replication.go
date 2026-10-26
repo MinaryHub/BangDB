@@ -457,6 +457,7 @@ func (db *DB) installLocked(w *SnapshotWriter) error {
 		db.p.Close()
 		db.p = w.p
 	} else {
+		slots := w.p.Objects() // volatile stores carried by a VACUUM rebuild
 		if err := w.p.Close(); err != nil {
 			return err
 		}
@@ -475,6 +476,7 @@ func (db *DB) installLocked(w *SnapshotWriter) error {
 		if err != nil {
 			return err // db.p stays closed: later calls fail with ErrClosed
 		}
+		p.SetObjects(slots)
 		db.p = p
 	}
 	db.p.SetOnCommit(db.repl.onCommit)

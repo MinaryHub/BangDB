@@ -513,22 +513,23 @@ func rangeBound(v any, t value.Type, lower bool, inc bool) (any, bool, bool) {
 
 // scan feeds every row located by acc to fn. fn returns false to stop.
 func (x *execCtx) scan(t *Table, acc *access, e *env, visit func(rowid int64, row []any) (bool, error)) error {
-	fn := func(rowid int64, row []any) (bool, error) {
+	// emit visits the row with the given rowid, if it exists.
+	emit := func(rowid int64) (bool, error) {
 		if err := x.tick(); err != nil {
 			return false, err
 		}
-		return visit(rowid, row)
-	}
-	emit := func(rowid int64) (bool, error) {
 		row, ok, err := x.getRow(t, rowid)
 		if err != nil || !ok {
 			return err == nil, err
 		}
-		return fn(rowid, row)
+		return visit(rowid, row)
 	}
 	switch acc.kind {
 	case accRowidEq, accRowidIn:
-		seen := map[int64]bool{}
+		var seen map[int64]bool // IN lists may repeat values
+		if len(acc.eq) > 1 {
+			seen = map[int64]bool{}
+		}
 		for _, f := range acc.eq {
 			v, err := f(e)
 			if err != nil {
@@ -538,7 +539,9 @@ func (x *execCtx) scan(t *Table, acc *access, e *env, visit func(rowid int64, ro
 			if !ok || seen[k.(int64)] {
 				continue // NULL or incomparable type: cannot be equal
 			}
-			seen[k.(int64)] = true
+			if seen != nil {
+				seen[k.(int64)] = true
+			}
 			if cont, err := emit(k.(int64)); err != nil || !cont {
 				return err
 			}
@@ -994,47 +997,57 @@ func (x *execCtx) buildLevels(from []sql.TableRef, lefts []bool, ons []sql.Expr,
 // runJoin enumerates all combined rows of levels (nested loop join) and calls
 // emit for each one passing all filters. emit returns false to stop.
 func (x *execCtx) runJoin(levels []*level, final []evalFn, e *env, emit func() (bool, error)) error {
-	stopped := false
-	var run func(li int) error
-	run = func(li int) error {
-		if li == len(levels) {
-			ok, err := passes(final, e)
-			if err != nil || !ok {
-				return err
-			}
-			cont, err := emit()
-			if !cont {
-				stopped = true
-			}
+	j := joiner{x: x, levels: levels, final: final, e: e, emit: emit}
+	return j.run(0)
+}
+
+type joiner struct {
+	x       *execCtx
+	levels  []*level
+	final   []evalFn
+	e       *env
+	emit    func() (bool, error)
+	stopped bool
+}
+
+func (j *joiner) run(li int) error {
+	e := j.e
+	if li == len(j.levels) {
+		ok, err := passes(j.final, e)
+		if err != nil || !ok {
 			return err
 		}
-		l := levels[li]
-		matched := false
-		err := x.scanLevel(l, e, func(rowid int64, row []any) (bool, error) {
-			copy(e.row[l.offset:], row)
-			e.row[l.rowidSlot()] = rowid
-			ok, err := passes(l.filters, e)
-			if err != nil || !ok {
-				return err == nil, err
-			}
-			matched = true
-			if err := run(li + 1); err != nil {
-				return false, err
-			}
-			return !stopped, nil
-		})
-		if err != nil || stopped {
-			return err
+		cont, err := j.emit()
+		if !cont {
+			j.stopped = true
 		}
-		if !matched && l.left {
-			for i := l.offset; i <= l.rowidSlot(); i++ {
-				e.row[i] = nil
-			}
-			return run(li + 1)
-		}
-		return nil
+		return err
 	}
-	return run(0)
+	l := j.levels[li]
+	matched := false
+	err := j.x.scanLevel(l, e, func(rowid int64, row []any) (bool, error) {
+		copy(e.row[l.offset:], row)
+		e.row[l.rowidSlot()] = rowid
+		ok, err := passes(l.filters, e)
+		if err != nil || !ok {
+			return err == nil, err
+		}
+		matched = true
+		if err := j.run(li + 1); err != nil {
+			return false, err
+		}
+		return !j.stopped, nil
+	})
+	if err != nil || j.stopped {
+		return err
+	}
+	if !matched && l.left {
+		for i := l.offset; i <= l.rowidSlot(); i++ {
+			e.row[i] = nil
+		}
+		return j.run(li + 1)
+	}
+	return nil
 }
 
 func passes(filters []evalFn, e *env) (bool, error) {

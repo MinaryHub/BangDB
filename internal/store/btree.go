@@ -85,17 +85,17 @@ func (s *rowStore) Last() (int64, bool, error) {
 
 func (s *rowStore) EstimateRows() (int64, error) { return s.t.Estimate() }
 
-// Index stores are always B+trees (the executor relies on byte-ordered
-// prefix scans).
+func (RowKind) Volatile() bool { return false }
 
-// CreateIndex allocates an empty index store.
-func CreateIndex(v *pager.View) (uint32, error) { return btree.Create(v) }
+// Indexes of B+tree tables are B+trees of keys without values.
 
-// OpenIndex returns the index store rooted at root.
-func OpenIndex(v *pager.View, root uint32) IndexStore { return &indexStore{btree.Open(v, root)} }
+func (RowKind) CreateIndex(v *pager.View) (uint32, error) { return btree.Create(v) }
 
-// DropIndex frees an index store.
-func DropIndex(v *pager.View, root uint32) error { return btree.Drop(v, root) }
+func (RowKind) OpenIndex(v *pager.View, root uint32) IndexStore {
+	return &indexStore{btree.Open(v, root)}
+}
+
+func (RowKind) DropIndex(v *pager.View, root uint32) error { return btree.Drop(v, root) }
 
 type indexStore struct{ t *btree.Tree }
 

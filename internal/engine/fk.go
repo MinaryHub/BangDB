@@ -111,6 +111,10 @@ func (x *execCtx) buildForeignKeys(t *Table, st *sql.CreateTable) error {
 				return fmt.Errorf("bangdb: foreign key references unknown table %s", d.RefTable)
 			}
 		}
+		if p.kind.Volatile() && !t.kind.Volatile() {
+			// After a restart the parent rows would be gone.
+			return fmt.Errorf("bangdb: table %s cannot reference %s: a durable table cannot reference a memory table", t.Name, p.Name)
+		}
 		fk.RefTable = p.Name
 		refs := d.RefColumns
 		if len(refs) == 0 {

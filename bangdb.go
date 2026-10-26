@@ -120,7 +120,7 @@ func (db *DB) QueryRowContext(ctx context.Context, query string, args ...any) *R
 	if err != nil {
 		return &Row{err: err}
 	}
-	return &Row{rows: &Rows{r: r}}
+	return &Row{rows: Rows{r: r}}
 }
 
 // Begin starts a write transaction. Only one write transaction can be active
@@ -224,7 +224,10 @@ func (tx *Tx) QueryContext(ctx context.Context, query string, args ...any) (*Row
 // QueryRow runs a query expected to return at most one row.
 func (tx *Tx) QueryRow(query string, args ...any) *Row {
 	rows, err := tx.Query(query, args...)
-	return &Row{rows: rows, err: err}
+	if err != nil {
+		return &Row{err: err}
+	}
+	return &Row{rows: *rows}
 }
 
 // Commit makes the changes durable.
@@ -283,7 +286,7 @@ func (r *Rows) Scan(dest ...any) error {
 
 // Row is the result of QueryRow.
 type Row struct {
-	rows *Rows
+	rows Rows // held by value: one allocation per QueryRow
 	err  error
 }
 

@@ -189,19 +189,17 @@ func (db *DB) stream(ctx context.Context, sel *sql.Select, args []any, maxRows i
 		ctx = context.Background()
 	}
 	ctx, stopTimeout := db.stmtContext(ctx)
-	ctx, cancel := context.WithCancel(ctx)
-	cancelAll := func() { cancel(); stopTimeout() }
 
 	db.swapMu.RLock()
 	if db.isClosed() {
 		db.swapMu.RUnlock()
-		cancelAll()
+		stopTimeout()
 		return nil, pager.ErrClosed
 	}
 	snap, err := db.p.Snapshot()
 	if err != nil {
 		db.swapMu.RUnlock()
-		cancelAll()
+		stopTimeout()
 		return nil, err
 	}
 	release := func() {
@@ -212,7 +210,7 @@ func (db *DB) stream(ctx context.Context, sel *sql.Select, args []any, maxRows i
 	run, err := x.prepareSelect(sel)
 	if err != nil {
 		release()
-		cancelAll()
+		stopTimeout()
 		return nil, err
 	}
 
@@ -223,12 +221,17 @@ func (db *DB) stream(ctx context.Context, sel *sql.Select, args []any, maxRows i
 			return maxRows <= 0 || len(rows) < maxRows, nil
 		})
 		release()
-		cancelAll()
+		stopTimeout()
 		if err != nil {
 			return nil, err
 		}
 		return &Rows{cols: run.p.cols, types: run.p.types, static: rows}, nil
 	}
+
+	// Streamed from a goroutine: Close and DB.Close must be able to stop it.
+	ctx, cancel := context.WithCancel(ctx)
+	cancelAll := func() { cancel(); stopTimeout() }
+	x.ctx = ctx
 
 	ch := make(chan []any, 64)
 	errc := make(chan error, 1)

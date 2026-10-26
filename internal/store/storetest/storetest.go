@@ -230,3 +230,76 @@ func drop(t *testing.T, kind store.Kind) {
 		t.Fatalf("pages leaked by Drop: %d allocations grew the file from %d to %d", grown-before, grown, v.PageCount())
 	}
 }
+
+// TestIndexStore runs the index conformance checks against kind.
+func TestIndexStore(t *testing.T, kind store.Kind) {
+	p := pager.OpenMemory()
+	v := p.NewView()
+	root, err := kind.CreateIndex(v)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ix := kind.OpenIndex(v, root)
+	rng := rand.New(rand.NewSource(3))
+	ref := map[string]bool{}
+	for i := 0; i < 20000; i++ {
+		k := []byte(fmt.Sprintf("k%04d", rng.Intn(3000)))
+		if rng.Intn(3) == 0 {
+			ok, err := ix.Delete(k)
+			if err != nil || ok != ref[string(k)] {
+				t.Fatalf("Delete(%s) = %v %v", k, ok, err)
+			}
+			delete(ref, string(k))
+		} else {
+			if err := ix.Put(k); err != nil {
+				t.Fatal(err)
+			}
+			ref[string(k)] = true
+		}
+	}
+	var want []string
+	for k := range ref {
+		want = append(want, k)
+	}
+	sort.Strings(want)
+	read := func(it store.Iter) (out []string) {
+		for ; it.Valid(); it.Next() {
+			out = append(out, string(it.Key()))
+		}
+		if it.Err() != nil {
+			t.Fatal(it.Err())
+		}
+		return
+	}
+	if got := read(ix.Seek(nil)); !reflect.DeepEqual(got, want) {
+		t.Fatalf("Seek(nil): %d keys, want %d", len(got), len(want))
+	}
+	rev := read(ix.SeekReverse(nil))
+	if len(rev) != len(want) || len(want) > 0 && rev[0] != want[len(want)-1] {
+		t.Fatal("SeekReverse(nil)")
+	}
+	for _, probe := range []string{"k0000", "k1500", "k15005", "k2999", "k9", "a"} {
+		i := sort.SearchStrings(want, probe)
+		if got := read(ix.Seek([]byte(probe))); !reflect.DeepEqual(got, want[i:]) && !(len(got) == 0 && i == len(want)) {
+			t.Fatalf("Seek(%s)", probe)
+		}
+		j := sort.Search(len(want), func(i int) bool { return want[i] > probe })
+		got := read(ix.SeekReverse([]byte(probe)))
+		if len(got) != j || j > 0 && got[0] != want[j-1] {
+			t.Fatalf("SeekReverse(%s): %d keys, want %d", probe, len(got), j)
+		}
+	}
+	if n, err := ix.EstimateRows(); err != nil || n < int64(len(want))/3 || n > int64(len(want))*3 {
+		t.Fatalf("EstimateRows = %d, actual %d", n, len(want))
+	}
+	// The iterator's keys are the index's: a caller's buffer is not kept.
+	buf := []byte("zzz1")
+	ix.Put(buf)
+	buf[3] = '2'
+	if got := read(ix.Seek([]byte("zzz"))); len(got) != 1 || got[0] != "zzz1" {
+		t.Fatalf("index kept the caller's key buffer: %v", got)
+	}
+	if err := kind.DropIndex(v, root); err != nil {
+		t.Fatal(err)
+	}
+}

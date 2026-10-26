@@ -26,6 +26,7 @@ func fileSize(t *testing.T, path string) int64 {
 }
 
 func TestVacuum(t *testing.T) {
+	durableOnly(t)
 	path := filepath.Join(t.TempDir(), "v.db")
 	db, err := Open(path)
 	if err != nil {
@@ -101,6 +102,7 @@ func TestVacuum(t *testing.T) {
 }
 
 func TestVacuumMemoryAndConcurrency(t *testing.T) {
+	durableOnly(t)
 	db := open(t)
 	exec(t, db, `CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)`)
 	for i := 0; i < 14; i++ {

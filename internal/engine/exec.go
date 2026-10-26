@@ -132,7 +132,7 @@ func (x *execCtx) rows(t *Table) store.TableStore {
 }
 
 // index returns the store holding ix's entries.
-func (x *execCtx) index(ix *Index) store.IndexStore { return store.OpenIndex(x.v, ix.Root) }
+func (x *execCtx) index(ix *Index) store.IndexStore { return ix.kind.OpenIndex(x.v, ix.Root) }
 
 // padRow completes a stored row: rows written before ALTER TABLE ADD COLUMN
 // are shorter.
@@ -600,7 +600,7 @@ func (x *execCtx) dropTable(st *sql.DropTable) error {
 	x.mutableCatalog()
 	t = x.cat.table(st.Name)
 	for _, ix := range t.indexes {
-		if err := store.DropIndex(x.v, ix.Root); err != nil {
+		if err := ix.kind.DropIndex(x.v, ix.Root); err != nil {
 			return err
 		}
 		if err := deleteEntry(x.v, indexKey(ix.Name)); err != nil {
@@ -660,7 +660,7 @@ func (x *execCtx) createIndex(st *sql.CreateIndex) error {
 func (x *execCtx) addIndex(ix *Index) error {
 	t := x.cat.table(ix.Table)
 	ix.resolve(t)
-	root, err := store.CreateIndex(x.v)
+	root, err := t.kind.CreateIndex(x.v)
 	if err != nil {
 		return err
 	}
@@ -695,7 +695,7 @@ func (x *execCtx) dropIndex(st *sql.DropIndex) error {
 		return fmt.Errorf("bangdb: index %s is associated with a UNIQUE or PRIMARY KEY constraint and cannot be dropped", ix.Name)
 	}
 	x.mutableCatalog()
-	if err := store.DropIndex(x.v, ix.Root); err != nil {
+	if err := ix.kind.DropIndex(x.v, ix.Root); err != nil {
 		return err
 	}
 	delete(x.cat.indexes, strings.ToLower(ix.Name))

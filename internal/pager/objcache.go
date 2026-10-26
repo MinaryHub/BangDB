@@ -50,6 +50,17 @@ func (c *objCache) get(b []byte, decode func([]byte) (any, error)) (any, error) 
 	if err != nil {
 		return nil, err
 	}
+	c.put(b, obj)
+	return obj, nil
+}
+
+// put caches obj as the decoded form of image b.
+func (c *objCache) put(b []byte, obj any) {
+	if c.max <= 0 || len(b) == 0 {
+		return
+	}
+	key := unsafe.SliceData(b)
+	s := &c.shards[(uintptr(unsafe.Pointer(key))>>12)%uintptr(len(c.shards))]
 	s.mu.Lock()
 	if len(s.m) >= c.max {
 		n := len(s.m) / 8 // evict an arbitrary eighth
@@ -62,7 +73,6 @@ func (c *objCache) get(b []byte, decode func([]byte) (any, error)) (any, error) 
 	}
 	s.m[key] = objEntry{b, obj}
 	s.mu.Unlock()
-	return obj, nil
 }
 
 // lookup returns the cached object for b, if any.
@@ -89,6 +99,18 @@ func (v *View) Decoded(b []byte, decode func([]byte) (any, error)) (any, error) 
 	return v.p.objs.get(b, decode)
 }
 
+// publishOwned hands the decoded forms of the pages a view is committing to
+// the shared cache: the view is finished, so they will not change again,
+// and the next transaction or reader of those pages skips decoding them.
+func (p *Pager) publishOwned(v *View, pages map[uint32][]byte) {
+	for pg, o := range v.owned {
+		if b, ok := pages[pg]; ok && len(b) == len(o.buf) && unsafe.SliceData(b) == unsafe.SliceData(o.buf) {
+			p.objs.put(b, o.obj)
+		}
+	}
+	v.owned = nil
+}
+
 // SetOwned records that obj is a private decoded form of the image b just
 // written to page pg by this view, so a later TakeOwned can skip decoding.
 func (v *View) SetOwned(pg uint32, b []byte, obj any) {
@@ -96,6 +118,15 @@ func (v *View) SetOwned(pg uint32, b []byte, obj any) {
 		v.owned = map[uint32]ownedObj{}
 	}
 	v.owned[pg] = ownedObj{b, obj}
+}
+
+// PeekOwned is TakeOwned without forgetting the object.
+func (v *View) PeekOwned(pg uint32, b []byte) (any, bool) {
+	o, ok := v.owned[pg]
+	if !ok || len(o.buf) != len(b) || len(b) == 0 || unsafe.SliceData(o.buf) != unsafe.SliceData(b) {
+		return nil, false
+	}
+	return o.obj, true
 }
 
 // TakeOwned returns (and forgets) the object recorded by SetOwned if b is

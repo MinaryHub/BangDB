@@ -67,7 +67,8 @@ type Index struct {
 	Root    uint32   `json:"root"`
 
 	cols  []int
-	colls []string // collation per column: keys of collated text are folded
+	colls []string   // collation per column: keys of collated text are folded
+	kind  store.Kind // the table's storage kind, which also stores its indexes
 }
 
 // key returns the index key part for row (without the rowid), truncated if
@@ -286,6 +287,7 @@ func (ix *Index) resolve(t *Table) {
 	if len(ix.Columns) == 0 && ix.Column != "" {
 		ix.Columns, ix.Column = []string{ix.Column}, ""
 	}
+	ix.kind = t.kind
 	ix.cols, ix.colls = ix.cols[:0], ix.colls[:0]
 	for _, c := range ix.Columns {
 		i := t.ColIndex(c)

@@ -110,6 +110,7 @@ func TestForeignKeys(t *testing.T) {
 }
 
 func TestForeignKeyCascadeChainAndPersistence(t *testing.T) {
+	durableOnly(t)
 	path := filepath.Join(t.TempDir(), "fk.db")
 	db, err := Open(path)
 	if err != nil {
@@ -143,6 +144,7 @@ func TestForeignKeyCascadeChainAndPersistence(t *testing.T) {
 }
 
 func TestViews(t *testing.T) {
+	durableOnly(t)
 	path := filepath.Join(t.TempDir(), "v.db")
 	db, err := Open(path)
 	if err != nil {

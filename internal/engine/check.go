@@ -80,14 +80,21 @@ func (x *execCtx) integrityCheck() []string {
 			return problems
 		}
 		t := x.cat.table(name)
-		res := checkTree("table "+t.Name, t.Root)
-		if len(res.Problems) > 0 {
+		// A volatile kind's data is not in pages: only its root page
+		// (the store's identity) is accounted for.
+		structure := func(what string, root uint32) bool {
+			if t.kind.Volatile() {
+				markFor(what)(root)
+				return true
+			}
+			return len(checkTree(what, root).Problems) == 0
+		}
+		if !structure("table "+t.Name, t.Root) {
 			continue // row and index checks would only repeat the damage
 		}
 		rows := x.checkRows(t, add)
 		for _, ix := range t.indexes {
-			ires := checkTree("index "+ix.Name, ix.Root)
-			if len(ires.Problems) == 0 {
+			if structure("index "+ix.Name, ix.Root) {
 				x.checkIndex(t, ix, rows, add)
 			}
 		}
@@ -184,7 +191,7 @@ func (x *execCtx) checkRows(t *Table, add func(string, ...any)) int {
 func (x *execCtx) checkIndex(t *Table, ix *Index, rows int, add func(string, ...any)) {
 	entries := 0
 	var prevVal []byte
-	c := btree.Open(x.v, ix.Root).Seek(nil)
+	c := x.index(ix).Seek(nil)
 	for ; c.Valid(); c.Next() {
 		entries++
 		key := c.Key()
