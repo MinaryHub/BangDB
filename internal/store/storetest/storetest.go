@@ -23,6 +23,27 @@ func TestTableStore(t *testing.T, kind store.Kind) {
 	t.Run("Drop", func(t *testing.T) { drop(t, kind) })
 }
 
+// Spec is the table definition used for configurable kinds: an INTEGER
+// time column first, small blocks so that sealing happens often.
+var Spec = store.TableSpec{
+	Columns:     []store.ColumnSpec{{Name: "ts", Type: "INTEGER"}, {Name: "a"}, {Name: "b"}, {Name: "c"}, {Name: "d"}},
+	RowidColumn: -1,
+	Options:     map[string]string{"time_column": "ts", "block_rows": "16"},
+}
+
+// Open opens a store of kind, configuring it with Spec if needed.
+func Open(t *testing.T, kind store.Kind, v *pager.View, root uint32) store.TableStore {
+	t.Helper()
+	if ck, ok := kind.(store.ConfigurableKind); ok {
+		cfg, err := ck.Configure(Spec)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return ck.OpenConfigured(v, root, cfg)
+	}
+	return kind.Open(v, root)
+}
+
 func newStore(t *testing.T, kind store.Kind) (*pager.Pager, *pager.View, store.TableStore) {
 	p := pager.OpenMemory()
 	v := p.NewView()
@@ -30,7 +51,7 @@ func newStore(t *testing.T, kind store.Kind) (*pager.Pager, *pager.View, store.T
 	if err != nil {
 		t.Fatal(err)
 	}
-	return p, v, kind.Open(v, root)
+	return p, v, Open(t, kind, v, root)
 }
 
 func randomRow(rng *rand.Rand, id int64) []any {
@@ -170,7 +191,7 @@ func transactions(t *testing.T, kind store.Kind) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	s := kind.Open(v, root)
+	s := Open(t, kind, v, root)
 	for i := int64(1); i <= 500; i++ {
 		s.Put(i, []any{i, "committed"})
 	}
@@ -184,7 +205,7 @@ func transactions(t *testing.T, kind store.Kind) {
 	defer snap.Release()
 
 	v2 := p.NewView()
-	s2 := kind.Open(v2, root)
+	s2 := Open(t, kind, v2, root)
 	for i := int64(1); i <= 500; i += 2 {
 		s2.Delete(i)
 	}
@@ -192,11 +213,11 @@ func transactions(t *testing.T, kind store.Kind) {
 	if err := p.Commit(v2); err != nil {
 		t.Fatal(err)
 	}
-	old, _ := collect(t, kind.Open(snap.View(), root), store.MinRowid, store.MaxRowid, false)
+	old, _ := collect(t, Open(t, kind, snap.View(), root), store.MinRowid, store.MaxRowid, false)
 	if len(old) != 500 {
 		t.Fatalf("snapshot sees %d rows, want 500", len(old))
 	}
-	cur, _ := collect(t, kind.Open(p.NewView(), root), store.MinRowid, store.MaxRowid, false)
+	cur, _ := collect(t, Open(t, kind, p.NewView(), root), store.MinRowid, store.MaxRowid, false)
 	if len(cur) != 251 || cur[len(cur)-1] != 1000 {
 		t.Fatalf("latest state has %d rows", len(cur))
 	}
@@ -210,7 +231,7 @@ func drop(t *testing.T, kind store.Kind) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	s := kind.Open(v, root)
+	s := Open(t, kind, v, root)
 	rng := rand.New(rand.NewSource(2))
 	for i := int64(0); i < 3000; i++ {
 		s.Put(i, randomRow(rng, i))

@@ -220,6 +220,9 @@ func decodeAny(b []byte) (any, error) { return decode(b) }
 // the view's own copy if it has one (the writer may change it next), else
 // the shared decoded node. The caller must not modify it; use loadMut.
 func (t *Tree) loadDescend(pg uint32) (*node, error) {
+	if l, ok := t.v.PeekLazy(pg); ok {
+		return l.(*node), nil
+	}
 	b, err := t.v.Read(pg)
 	if err != nil {
 		return nil, err
@@ -237,6 +240,9 @@ func (t *Tree) loadDescend(pg uint32) (*node, error) {
 // loadMut returns a private copy of the node at pg for modification. It
 // does not populate the decoded-page cache: the page is about to change.
 func (t *Tree) loadMut(pg uint32) (*node, error) {
+	if l, ok := t.v.TakeLazy(pg); ok {
+		return l.(*node), nil // the view's own: changed in place
+	}
 	b, err := t.v.Read(pg)
 	if err != nil {
 		return nil, err
@@ -263,10 +269,25 @@ func (t *Tree) loadMut(pg uint32) (*node, error) {
 	return &c, nil
 }
 
-func (t *Tree) store(pg uint32, n *node) {
-	b := n.encode()
-	t.v.Write(pg, b)
-	t.v.SetOwned(pg, b, n)
+// store writes n to page pg. The page stays in decoded form in the view
+// (pager.Lazy) and is encoded at commit or when its bytes are read.
+func (t *Tree) store(pg uint32, n *node) { t.v.WriteLazy(pg, n) }
+
+// Encode implements pager.Lazy.
+func (n *node) Encode() []byte { return n.encode() }
+
+// Clone implements pager.Lazy.
+func (n *node) Clone() pager.Lazy {
+	c := *n
+	c.keys = append([][]byte(nil), n.keys...)
+	c.vals = append([]value(nil), n.vals...)
+	c.children = append([]uint32(nil), n.children...)
+	if n.leaf {
+		c.children = nil
+	} else {
+		c.vals = nil
+	}
+	return &c
 }
 
 // childIndex: children[i] holds keys < keys[i]; children[i+1] holds keys >= keys[i].
@@ -279,10 +300,13 @@ func leafIndex(n *node, key []byte) (int, bool) {
 	return i, i < len(n.keys) && bytes.Equal(n.keys[i], key)
 }
 
+// findLeaf serves point lookups (Get, Has): they hold no node after
+// returning, so the view's own nodes can be used (loadDescend), which
+// spares decoding pages the writer has just changed.
 func (t *Tree) findLeaf(key []byte) (uint32, *node, error) {
 	pg := t.root
 	for {
-		n, err := t.load(pg)
+		n, err := t.loadDescend(pg)
 		if err != nil {
 			return 0, nil, err
 		}
@@ -598,11 +622,11 @@ func (t *Tree) rebalance(n *node, ci int) (bool, error) {
 		li = 0
 	}
 	lpg, rpg := n.children[li], n.children[li+1]
-	left, err := t.load(lpg)
+	left, err := t.loadDescend(lpg) // read only: the result is built anew
 	if err != nil {
 		return false, err
 	}
-	right, err := t.load(rpg)
+	right, err := t.loadDescend(rpg)
 	if err != nil {
 		return false, err
 	}

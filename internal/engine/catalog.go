@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"hash/fnv"
+	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/knoxxr/bangdb/internal/btree"
@@ -39,8 +41,10 @@ type Table struct {
 	Root    uint32   `json:"root"`
 	// Store names the storage kind of the rows ("" = the B+tree row
 	// store; see package store).
-	Store    string `json:"store,omitempty"`
-	RowidCol int    `json:"rowidCol"` // INTEGER PRIMARY KEY column, or -1
+	Store string `json:"store,omitempty"`
+	// StoreOptions are the kind's options (USING kind WITH (...)).
+	StoreOptions map[string]string `json:"storeOptions,omitempty"`
+	RowidCol     int               `json:"rowidCol"` // INTEGER PRIMARY KEY column, or -1
 	// PrimaryKey lists the primary key columns when the key is composite
 	// (single-column keys are flagged on the column).
 	PrimaryKey []string `json:"primaryKey,omitempty"`
@@ -49,6 +53,8 @@ type Table struct {
 	ForeignKeys []ForeignKey `json:"foreignKeys,omitempty"`
 
 	kind         store.Kind // resolved Store
+	storeCfg     any        // configuration of a store.ConfigurableKind
+	timeCol      int        // time column of a time-keyed kind, or -1
 	indexes      []*Index
 	checkFns     []evalFn // compiled Checks
 	referencedBy []fkRef  // foreign keys of other tables pointing here
@@ -136,6 +142,45 @@ func (ix *Index) hasNull(row []any) bool {
 }
 
 func (ix *Index) columnList() string { return strings.Join(ix.Columns, ", ") }
+
+// spec describes t to its storage kind.
+func (t *Table) spec() store.TableSpec {
+	s := store.TableSpec{RowidColumn: t.RowidCol, Options: t.StoreOptions}
+	for _, c := range t.Columns {
+		s.Columns = append(s.Columns, store.ColumnSpec{Name: c.Name, Type: string(c.Type), NotNull: c.NotNull})
+	}
+	return s
+}
+
+// configure validates t for its storage kind (after it was created or its
+// columns changed) and keeps the kind's configuration.
+func (t *Table) configure() error {
+	t.storeCfg, t.timeCol = nil, -1
+	ck, ok := t.kind.(store.ConfigurableKind)
+	if !ok {
+		if len(t.StoreOptions) > 0 {
+			return fmt.Errorf("bangdb: storage kind %s takes no options", kindName(t.Store))
+		}
+		return nil
+	}
+	cfg, err := ck.Configure(t.spec())
+	if err != nil {
+		return err
+	}
+	t.storeCfg = cfg
+	// The time column is part of the configuration: no view is needed.
+	if tk, ok := ck.OpenConfigured(nil, 0, cfg).(store.TimeKeyer); ok {
+		t.timeCol = tk.TimeColumn()
+	}
+	return nil
+}
+
+func kindName(s string) string {
+	if s == "" {
+		return "btree"
+	}
+	return s
+}
 
 // ColIndex returns the column position by name (case-insensitive), or -1.
 func (t *Table) ColIndex(name string) int {
@@ -229,6 +274,12 @@ func (c *Catalog) clone() *Catalog {
 		nt := *t
 		nt.Columns = append([]Column(nil), t.Columns...)
 		nt.PrimaryKey = append([]string(nil), t.PrimaryKey...)
+		if t.StoreOptions != nil {
+			nt.StoreOptions = map[string]string{}
+			for k, v := range t.StoreOptions {
+				nt.StoreOptions[k] = v
+			}
+		}
 		nt.Checks = append([]string(nil), t.Checks...)
 		nt.ForeignKeys = nil
 		for _, fk := range t.ForeignKeys {
@@ -333,6 +384,9 @@ func loadCatalog(v *pager.View) (*Catalog, error) {
 				return nil, fmt.Errorf("table %s: %w", t.Name, err)
 			}
 			t.kind = kind
+			if err := t.configure(); err != nil {
+				return nil, fmt.Errorf("table %s: %w", t.Name, err)
+			}
 			c.tables[strings.ToLower(t.Name)] = t
 		case 'i':
 			ix := &Index{}
@@ -496,6 +550,17 @@ func (c *Catalog) Describe(name string) string {
 	if t.Store != "" {
 		sb.WriteString(" USING " + t.Store)
 	}
+	if len(t.StoreOptions) > 0 {
+		var opts []string
+		for k, v := range t.StoreOptions {
+			if _, err := strconv.ParseFloat(v, 64); err != nil && !isIdent(v) {
+				v = "'" + strings.ReplaceAll(v, "'", "''") + "'"
+			}
+			opts = append(opts, k+" = "+v)
+		}
+		sort.Strings(opts)
+		sb.WriteString(" WITH (" + strings.Join(opts, ", ") + ")")
+	}
 	sb.WriteString(";")
 	for _, ix := range t.indexes {
 		if ix.Auto {
@@ -508,4 +573,13 @@ func (c *Catalog) Describe(name string) string {
 		fmt.Fprintf(&sb, "\nCREATE %sINDEX %s ON %s (%s);", u, ix.Name, t.Name, ix.columnList())
 	}
 	return sb.String()
+}
+
+func isIdent(s string) bool {
+	for i, r := range s {
+		if !(r == '_' || r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || i > 0 && r >= '0' && r <= '9') {
+			return false
+		}
+	}
+	return s != ""
 }

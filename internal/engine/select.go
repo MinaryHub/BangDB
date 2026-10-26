@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	"github.com/knoxxr/bangdb/internal/sql"
+	"github.com/knoxxr/bangdb/internal/store"
 	"github.com/knoxxr/bangdb/internal/value"
 )
 
@@ -1143,6 +1144,11 @@ func (x *execCtx) execDelete(st *sql.Delete) (Result, error) {
 	if err != nil {
 		return Result{}, err
 	}
+	if ret == nil {
+		if n, done, err := x.deleteByTime(t, st.Where); done || err != nil {
+			return Result{RowsAffected: n}, err
+		}
+	}
 	_, targets, err := x.collect(t, st.Where)
 	if err != nil {
 		return Result{}, err
@@ -1251,6 +1257,13 @@ func (x *execCtx) updateRow(t *Table, oldID int64, old, newRow []any) (int64, er
 			return 0, constraintErr("NOT NULL constraint failed: %s.%s", t.Name, t.Columns[t.RowidCol].Name)
 		}
 		newID = newRow[t.RowidCol].(int64)
+	}
+	if tc := t.timeColumn(); tc >= 0 && !bytes.Equal(value.AppendKey(nil, old[tc]), value.AppendKey(nil, newRow[tc])) {
+		// The row's time is its position: it moves.
+		var err error
+		if newID, err = x.rows(t).(store.RowidAssigner).AssignRowid(newRow); err != nil {
+			return 0, err
+		}
 	}
 	if newID != oldID {
 		if _, exists, err := x.getRow(t, newID); err != nil {
@@ -1458,8 +1471,8 @@ func (p *selectPlan) useScanOrder(st *sql.Select) bool {
 			return false
 		}
 		col := idx - l.offset
-		if col == len(l.t.Columns) || col == l.t.RowidCol {
-			col = -1
+		if col == len(l.t.Columns) || col == l.t.RowidCol || col == l.t.timeColumn() {
+			col = -1 // rowid order (a time-series table's time is its rowid order)
 		} else if l.t.Columns[col].Type == value.Any {
 			return false // mixed types: index order differs from value order
 		}
@@ -1486,9 +1499,13 @@ func (p *selectPlan) useScanOrder(st *sql.Select) bool {
 	if len(cols) == 1 && cols[0] == -1 {
 		desc := dirs[0]
 		switch acc.kind {
-		case accFull, accRowidRange:
+		case accFull, accRowidRange, accTimeRange:
 			acc.reverse = desc
-			acc.desc += " (ordered by rowid)"
+			if l.t.timeColumn() >= 0 {
+				acc.desc += " (ordered by time)"
+			} else {
+				acc.desc += " (ordered by rowid)"
+			}
 			return true
 		case accRowidEq:
 			return true

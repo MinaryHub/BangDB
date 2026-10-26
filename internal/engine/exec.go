@@ -126,13 +126,28 @@ func SetDefaultStore(name string) { defaultStore = name }
 // last one is kept, as row fetches by rowid come in long runs.
 func (x *execCtx) rows(t *Table) store.TableStore {
 	if x.lastTable != t || x.lastRoot != t.Root {
-		x.lastTable, x.lastRoot, x.lastRows = t, t.Root, t.kind.Open(x.v, t.Root)
+		var s store.TableStore
+		if t.storeCfg != nil {
+			s = t.kind.(store.ConfigurableKind).OpenConfigured(x.v, t.Root, t.storeCfg)
+		} else {
+			s = t.kind.Open(x.v, t.Root)
+		}
+		x.lastTable, x.lastRoot, x.lastRows = t, t.Root, s
 	}
 	return x.lastRows
 }
 
 // index returns the store holding ix's entries.
 func (x *execCtx) index(ix *Index) store.IndexStore { return ix.kind.OpenIndex(x.v, ix.Root) }
+
+// timeColumn returns the column whose order is t's rowid order (a
+// time-series table's time column), or -1.
+func (t *Table) timeColumn() int {
+	if t.storeCfg == nil {
+		return -1
+	}
+	return t.timeCol
+}
 
 // padRow completes a stored row: rows written before ALTER TABLE ADD COLUMN
 // are shorter.
@@ -320,7 +335,12 @@ func prepareRow(t *Table, row []any) error {
 func (x *execCtx) insertRow(t *Table, row []any) (int64, error) {
 	var rowid int64
 	rows := x.rows(t)
-	if t.RowidCol >= 0 && row[t.RowidCol] != nil {
+	if a, ok := rows.(store.RowidAssigner); ok {
+		var err error
+		if rowid, err = a.AssignRowid(row); err != nil {
+			return 0, err
+		}
+	} else if t.RowidCol >= 0 && row[t.RowidCol] != nil {
 		rowid = row[t.RowidCol].(int64)
 		_, exists, err := rows.Get(rowid)
 		if err != nil {
@@ -513,6 +533,10 @@ func (x *execCtx) createTable(st *sql.CreateTable) error {
 		return err
 	}
 	t.kind = kind
+	t.StoreOptions = st.UsingOptions
+	if err := t.configure(); err != nil {
+		return err
+	}
 	root, err := kind.Create(x.v)
 	if err != nil {
 		return err
@@ -732,6 +756,9 @@ func (x *execCtx) addColumn(st *sql.AlterTableAddColumn) error {
 	x.mutableCatalog()
 	t = x.cat.table(st.Table)
 	t.Columns = append(t.Columns, col)
+	if err := t.configure(); err != nil {
+		return err
+	}
 	x.cat.link()
 	return saveEntry(x.v, tableKey(t.Name), t)
 }
@@ -843,6 +870,14 @@ func (x *execCtx) renameColumn(st *sql.AlterTableRenameColumn) error {
 		renameIn(t.ForeignKeys[k].Columns, old, st.New)
 	}
 	renameInChecks(t, old, st.New)
+	for k, v := range t.StoreOptions { // e.g. a time-series table's time_column
+		if strings.EqualFold(v, old) {
+			t.StoreOptions[k] = st.New
+		}
+	}
+	if err := t.configure(); err != nil {
+		return err
+	}
 	for _, ref := range t.referencedBy {
 		renameIn(ref.fk.RefColumns, old, st.New)
 		if ref.child != t {
@@ -872,6 +907,13 @@ func (x *execCtx) dropColumn(st *sql.AlterTableDropColumn) error {
 	}
 	if why := columnInUse(t, i); why != "" {
 		return fmt.Errorf("bangdb: cannot drop column %s: %s", t.Columns[i].Name, why)
+	}
+	if t.storeCfg != nil { // the storage kind must accept the new columns
+		tmp := *t
+		tmp.Columns = append(t.Columns[:i:i], t.Columns[i+1:]...)
+		if err := tmp.configure(); err != nil {
+			return fmt.Errorf("bangdb: cannot drop column %s: %w", t.Columns[i].Name, err)
+		}
 	}
 	for _, ix := range t.indexes {
 		for _, c := range ix.cols {
@@ -907,6 +949,9 @@ func (x *execCtx) dropColumn(st *sql.AlterTableDropColumn) error {
 	t.Columns = append(t.Columns[:i:i], t.Columns[i+1:]...)
 	if t.RowidCol > i {
 		t.RowidCol--
+	}
+	if err := t.configure(); err != nil { // the time column may have moved
+		return err
 	}
 	x.cat.link()
 	return x.saveTable(t)

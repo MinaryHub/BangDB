@@ -130,3 +130,52 @@ func Kinds() []string {
 	sort.Strings(out)
 	return out
 }
+
+// ---- optional capabilities ----
+
+// TableSpec describes a table to a ConfigurableKind.
+type TableSpec struct {
+	Columns []ColumnSpec
+	// RowidColumn is the INTEGER PRIMARY KEY column, or -1.
+	RowidColumn int
+	Options     map[string]string // CREATE TABLE ... USING kind WITH (...)
+}
+
+// ColumnSpec describes a column: Type is INTEGER, REAL, TEXT, BLOB or ANY.
+type ColumnSpec struct {
+	Name    string
+	Type    string
+	NotNull bool
+}
+
+// ConfigurableKind is a kind whose stores depend on the table definition
+// and options. Configure validates them (at CREATE TABLE, on schema changes
+// and when the catalog is loaded) and returns the configuration passed to
+// OpenConfigured.
+type ConfigurableKind interface {
+	Kind
+	Configure(spec TableSpec) (any, error)
+	OpenConfigured(v *pager.View, root uint32, cfg any) TableStore
+}
+
+// RowidAssigner is a table store that chooses the rowid of new rows (from
+// their values) instead of taking the next free one.
+type RowidAssigner interface {
+	AssignRowid(row []any) (int64, error)
+}
+
+// TimeKeyer is a table store whose rowid order is the order of a time
+// column, so that conditions on that column become rowid ranges.
+type TimeKeyer interface {
+	// TimeColumn returns the time column's position.
+	TimeColumn() int
+	// RowidRange converts bounds on the time column (nil = unbounded) to an
+	// inclusive rowid range. ok is false if a bound cannot be converted
+	// (then the caller scans everything and filters).
+	RowidRange(lo any, loInc bool, hi any, hiInc bool) (from, to int64, ok bool)
+}
+
+// RangeDeleter is a table store that can delete a rowid range at once.
+type RangeDeleter interface {
+	DeleteRange(lo, hi int64) (int64, error)
+}

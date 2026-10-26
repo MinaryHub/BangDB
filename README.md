@@ -12,7 +12,7 @@ Go로 작성된 **경량 임베디드 관계형 데이터베이스**입니다. �
   - 파라미터: `?`, `?N`, `:name`, `@name`, `$name`
 - B+트리 기반 테이블/인덱스(삭제 시 병합, 긴 키 지원), 비용 기반 접근 경로 선택: rowid·인덱스 동등/범위/IN, OR → 인덱스 합집합, 인덱스 순서로 ORDER BY 생략, 해시 조인
 - 디코드된 노드 캐시·플랜 캐시, 메모리 한도를 넘는 정렬·그룹핑은 임시 파일로 처리
-- 교체 가능한 저장 방식 인터페이스(`internal/store`, `CREATE TABLE … USING <kind>`) — 기본은 B+트리, **`USING memory`** 인메모리 테이블
+- 교체 가능한 저장 방식 인터페이스(`internal/store`, `CREATE TABLE … USING <kind>`) — 기본은 B+트리, **`USING memory`** 인메모리 테이블, **`USING timeseries`** 시계열 테이블
 - 트랜잭션: `BEGIN/COMMIT/ROLLBACK`, 문장 단위 원자성, **스냅샷 읽기** — 읽기와 쓰기가 서로를 기다리지 않음
 - 스트리밍 결과 커서, `context` 기반 쿼리 취소·타임아웃, 그룹 커밋
 - **온라인 백업**(서비스 중단 없이 일관된 백업 파일 생성)과 **primary → replica 미러링**(읽기 스케일 아웃, 자동 재접속, 장애 조치 승격)
@@ -156,6 +156,26 @@ CREATE TABLE sessions (token TEXT PRIMARY KEY, user_id INT, hits INT) USING memo
 - 일반 테이블이 메모리 테이블을 외래 키로 참조할 수는 없습니다(반대는 가능).
 - 보존이 필요하면 `INSERT INTO 일반테이블 SELECT * FROM 메모리테이블`로 저장하세요. `:memory:` DB 전체는 `db.Backup(path)`로 파일에 저장할 수 있습니다(메모리 테이블 제외).
 
+## 시계열 테이블
+
+```sql
+CREATE TABLE cpu (ts INTEGER NOT NULL, host TEXT, usage REAL)
+  USING timeseries WITH (time_column = ts, time_unit = 's', retention = '30 days');
+
+INSERT INTO cpu VALUES (unixepoch('now'), 'web-1', 42.5);
+
+SELECT time_bucket('5 minutes', ts) AS t, host, avg(usage)
+FROM cpu WHERE ts >= unixepoch('now', '-1 hour')
+GROUP BY t, host ORDER BY t;
+```
+
+- 행이 시간 순으로 저장되어 시간 조건과 `ORDER BY ts`가 범위 스캔으로 처리됩니다(`EXPLAIN`: `USING TIME RANGE`).
+- 오래된 행은 열 단위로 압축된 블록으로 저장됩니다(일반 테이블 대비 약 1/5 크기).
+- `retention`을 주면 가장 최근 데이터 시각 기준으로 보존 기간이 지난 블록이 자동 삭제됩니다. 시간 조건만 있는 `DELETE`도 블록 단위로 빠르게 처리됩니다.
+- 옵션: `time_column`(필수, INTEGER epoch), `time_unit`(`s`·`ms`·`us`), `retention`(`'30 days'` 등), `block_rows`(기본 1024).
+- 제약: 보조 인덱스·PRIMARY KEY·UNIQUE를 둘 수 없습니다. 태그(호스트 등) 조건은 시간 범위 안에서 거릅니다.
+- 일반 테이블과 똑같이 트랜잭션·조인·백업·복제가 됩니다.
+
 ## 데이터 타입
 
 | 선언 타입 (예)                                  | 저장 타입 |
@@ -175,7 +195,7 @@ CREATE TABLE sessions (token TEXT PRIMARY KEY, user_id INT, hits INT) USING memo
 
 - 집계: `COUNT(*)`, `COUNT([DISTINCT] x)`, `SUM`, `AVG`, `MIN`, `MAX`, `TOTAL`, `GROUP_CONCAT`
 - 스칼라: `LOWER`, `UPPER`, `LENGTH`, `SUBSTR`, `TRIM/LTRIM/RTRIM`, `REPLACE`, `INSTR`, `ABS`, `ROUND`, `COALESCE`, `IFNULL`, `NULLIF`, `MIN/MAX(a, b, ...)`, `TYPEOF`, `CAST(x AS type)`
-- 날짜: `date`, `time`, `datetime`, `strftime`, `julianday`, `unixepoch`(수식어 `'+1 day'`, `'start of month'`, `'weekday N'`, `'unixepoch'`, `'localtime'` 등), `CURRENT_TIMESTAMP`, `CURRENT_DATE`, `CURRENT_TIME`, `NOW()`
+- 날짜: `date`, `time`, `datetime`, `strftime`, `julianday`, `unixepoch`, `time_bucket`(수식어 `'+1 day'`, `'start of month'`, `'weekday N'`, `'unixepoch'`, `'localtime'` 등), `CURRENT_TIMESTAMP`, `CURRENT_DATE`, `CURRENT_TIME`, `NOW()`
 - 비교 규칙: `COLLATE NOCASE`(유니코드 대소문자 무시), `RTRIM`, `BINARY` — 컬럼에 지정하면 인덱스도 같은 규칙을 따름
 
 ## 스키마 예

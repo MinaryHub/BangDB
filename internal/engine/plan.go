@@ -23,6 +23,9 @@ const (
 	accIndex
 	accUnion // OR of indexable conditions: union of several access paths
 	accHash  // equi-join without index: hash the table once, probe per row
+	// Conditions on a time-series table's time column: a rowid range
+	// computed by the store (lo/hi, with "=" as lo = hi).
+	accTimeRange
 )
 
 // access is the chosen access path for one table.
@@ -201,6 +204,30 @@ func chooseAccess(sc *scope, l *level, li int, conds []sql.Expr, c *compiler) (*
 		}
 		return &access{kind: accRowidEq, eq: fns, colTyp: value.Integer,
 			desc: fmt.Sprintf("SEARCH %s USING ROWID (rowid=?)", name)}, nil
+	}
+
+	// A time-series table is located by time: its rowid order is time
+	// order (and it has no indexes).
+	if tc := l.t.timeColumn(); tc >= 0 && len(byCol[tc]) > 0 {
+		a := &access{kind: accTimeRange, colTyp: value.Integer}
+		tcName := l.t.Columns[tc].Name
+		if cd := find(tc, "="); cd != nil {
+			f, err := c.compile(cd.other)
+			if err != nil {
+				return nil, err
+			}
+			a.lo, a.hi, a.loInc, a.hiInc = f, f, true, true
+			a.desc = fmt.Sprintf("SEARCH %s USING TIME RANGE (%s=?)", name, tcName)
+			return a, nil
+		}
+		parts, err := setRange(a, byCol[tc], tcName, c)
+		if err != nil {
+			return nil, err
+		}
+		if len(parts) > 0 {
+			a.desc = fmt.Sprintf("SEARCH %s USING TIME RANGE (%s)", name, strings.Join(parts, " AND "))
+			return a, nil
+		}
 	}
 
 	// Score every index by how much of its key the conditions pin down.
@@ -549,6 +576,26 @@ func (x *execCtx) scan(t *Table, acc *access, e *env, visit func(rowid int64, ro
 		return nil
 	case accIndex:
 		return x.scanIndex(acc, e, emit)
+	case accTimeRange:
+		var lo, hi any
+		for _, b := range []struct {
+			f evalFn
+			v *any
+		}{{acc.lo, &lo}, {acc.hi, &hi}} {
+			if b.f == nil {
+				continue
+			}
+			v, err := b.f(e)
+			if err != nil || v == nil {
+				return err // a comparison with NULL matches nothing
+			}
+			*b.v = v
+		}
+		from, to, ok := x.rows(t).(store.TimeKeyer).RowidRange(lo, acc.loInc, hi, acc.hiInc)
+		if !ok {
+			from, to = store.MinRowid, store.MaxRowid // not a number: filters decide
+		}
+		return x.scanRows(t, from, to, acc.reverse, visit)
 	case accUnion:
 		return x.scanUnion(t, acc, e, visit)
 	case accRowidRange:

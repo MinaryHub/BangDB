@@ -39,6 +39,8 @@ type CreateTable struct {
 	Checks      []Expr     // table constraints CHECK (...)
 	ForeignKeys []ForeignKey
 	Using       string // storage kind (CREATE TABLE ... USING kind); "" = default
+	// UsingOptions are the kind's options: USING kind WITH (name = value).
+	UsingOptions map[string]string
 }
 
 type CreateView struct {

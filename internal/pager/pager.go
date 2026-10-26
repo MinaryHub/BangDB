@@ -610,6 +610,7 @@ func (p *Pager) PrepareCommit(v *View, meta any) (*Prepared, error) {
 	}
 	v.hdr.Seq = cur.Seq + 1
 	v.put(0, v.hdr.encode())
+	v.materialize()
 	pages := v.dirty
 	v.dirty = map[uint32][]byte{}
 	v.dirtyObjs = nil
@@ -1031,6 +1032,8 @@ type View struct {
 	undo     []undoEntry
 	undoSeen map[uint32]struct{}
 
+	lazy map[uint32]Lazy // pages held in decoded form (lazy.go)
+
 	// Object slots (objects.go).
 	baseObjs  map[uint32]any // slots of the commit the view reads; immutable
 	dirtyObjs map[uint32]any // the view's changes (nil value = emptied)
@@ -1050,6 +1053,7 @@ type undoEntry struct {
 	pg   uint32
 	prev []byte
 	had  bool
+	lazy Lazy // the page was lazy: a copy of its state
 }
 
 // put sets a dirty page, creating the map of read views on first use.
@@ -1058,6 +1062,7 @@ func (v *View) put(pg uint32, b []byte) {
 		v.dirty = map[uint32][]byte{}
 	}
 	v.dirty[pg] = b
+	delete(v.lazy, pg)
 }
 
 func (v *View) track(pg uint32) {
@@ -1069,12 +1074,22 @@ func (v *View) track(pg uint32) {
 	}
 	v.undoSeen[pg] = struct{}{}
 	prev, had := v.dirty[pg]
-	v.undo = append(v.undo, undoEntry{pg, prev, had})
+	u := undoEntry{pg: pg, prev: prev, had: had}
+	if l, ok := v.lazy[pg]; ok {
+		u.lazy = l.Clone()
+	}
+	v.undo = append(v.undo, u)
 }
 
 // Read returns the page content as seen by this view. The returned slice
 // must not be modified; use Write with a fresh buffer instead.
 func (v *View) Read(pgno uint32) ([]byte, error) {
+	if l, ok := v.lazy[pgno]; ok {
+		b := l.Encode()
+		v.put(pgno, b)
+		v.SetOwned(pgno, b, l) // still the decoded form of the page
+		return b, nil
+	}
 	if b, ok := v.dirty[pgno]; ok {
 		return b, nil
 	}
@@ -1178,10 +1193,14 @@ func (v *View) Restore(sp Savepoint) {
 	}
 	for i := len(v.undo) - 1; i >= 0; i-- {
 		u := v.undo[i]
-		if u.had {
+		switch {
+		case u.lazy != nil:
+			v.WriteLazyNoTrack(u.pg, u.lazy)
+		case u.had:
 			v.put(u.pg, u.prev)
-		} else {
+		default:
 			delete(v.dirty, u.pg)
+			delete(v.lazy, u.pg)
 		}
 	}
 	v.undo = v.undo[:0]

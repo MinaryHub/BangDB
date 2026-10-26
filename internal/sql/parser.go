@@ -173,6 +173,36 @@ func (p *parser) ident() (string, error) {
 	return "", p.errf("expected identifier")
 }
 
+// parseOptions parses "(name = value, ...)": values are identifiers,
+// strings or numbers.
+func (p *parser) parseOptions() (map[string]string, error) {
+	if err := p.expectOp("("); err != nil {
+		return nil, err
+	}
+	opts := map[string]string{}
+	for {
+		name, err := p.ident()
+		if err != nil {
+			return nil, err
+		}
+		if err := p.expectOp("="); err != nil {
+			return nil, err
+		}
+		t := p.peek()
+		switch t.kind {
+		case tIdent, tQuotedIdent, tString, tNumber:
+			p.pos++
+		default:
+			return nil, p.errf("expected an option value")
+		}
+		opts[strings.ToLower(name)] = t.text
+		if !p.acceptOp(",") {
+			break
+		}
+	}
+	return opts, p.expectOp(")")
+}
+
 func (p *parser) parseStmt() (Stmt, error) {
 	switch {
 	case p.acceptKw("EXPLAIN"):
@@ -280,6 +310,11 @@ func (p *parser) parseCreate() (Stmt, error) {
 		if p.acceptKw("USING") {
 			if ct.Using, err = p.ident(); err != nil {
 				return nil, err
+			}
+			if p.acceptKw("WITH") {
+				if ct.UsingOptions, err = p.parseOptions(); err != nil {
+					return nil, err
+				}
 			}
 		}
 		return ct, nil

@@ -8,13 +8,15 @@ import (
 )
 
 func TestKinds(t *testing.T) {
-	for _, name := range []string{"", "memory"} {
+	for _, name := range []string{"", "memory", "timeseries"} {
 		k, err := store.Lookup(name)
 		if err != nil {
 			t.Fatal(err)
 		}
 		t.Run("table/"+name, func(t *testing.T) { storetest.TestTableStore(t, k) })
-		t.Run("index/"+name, func(t *testing.T) { storetest.TestIndexStore(t, k) })
+		if name != "timeseries" { // no indexes
+			t.Run("index/"+name, func(t *testing.T) { storetest.TestIndexStore(t, k) })
+		}
 	}
 }
 

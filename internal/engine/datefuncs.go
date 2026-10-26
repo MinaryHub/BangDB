@@ -7,6 +7,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/knoxxr/bangdb/internal/store"
 	"github.com/knoxxr/bangdb/internal/value"
 )
 
@@ -42,6 +43,84 @@ func init() {
 		}
 		scalarFuncs[name] = scalarFunc{minArgs: min, maxArgs: -1, fn: f}
 	}
+	scalarFuncs["TIME_BUCKET"] = scalarFunc{minArgs: 2, maxArgs: 3, fn: fnTimeBucket}
+}
+
+// fnTimeBucket implements time_bucket(width, t [, unit]): the start of the
+// bucket of the given width containing t. For an epoch number t, width is a
+// number of the same unit or an interval such as '5 minutes' (unit: 's',
+// 'ms' or 'us'; default 's'). For a date/time text t, width is an interval
+// and the result is a datetime text.
+func fnTimeBucket(a []any) (any, error) {
+	if a[0] == nil || a[1] == nil {
+		return nil, nil
+	}
+	unit := "s"
+	if len(a) == 3 {
+		u, ok := a[2].(string)
+		if !ok {
+			return nil, fmt.Errorf("bangdb: time_bucket unit must be 's', 'ms' or 'us'")
+		}
+		unit = strings.ToLower(u)
+	}
+	width := func(unit string) (int64, error) {
+		var w int64
+		var err error
+		switch x := a[0].(type) {
+		case int64:
+			w = x
+		case float64:
+			if x != math.Trunc(x) {
+				return 0, fmt.Errorf("bangdb: time_bucket width must be a whole number")
+			}
+			w = int64(x)
+		case string:
+			w, err = store.ParseInterval(x, unit)
+		default:
+			err = fmt.Errorf("bangdb: invalid time_bucket width")
+		}
+		if err == nil && w <= 0 {
+			err = fmt.Errorf("bangdb: time_bucket width must be positive")
+		}
+		return w, err
+	}
+	floor := func(t, w int64) int64 {
+		b := t - t%w
+		if t%w < 0 {
+			b -= w
+		}
+		return b
+	}
+	switch t := a[1].(type) {
+	case int64:
+		w, err := width(unit)
+		if err != nil {
+			return nil, err
+		}
+		return floor(t, w), nil
+	case float64:
+		w, err := width(unit)
+		if err != nil {
+			return nil, err
+		}
+		return math.Floor(t/float64(w)) * float64(w), nil
+	case string:
+		tm, ok := parseTime(t)
+		if !ok {
+			return nil, nil
+		}
+		w, err := width("us")
+		if err != nil {
+			return nil, err
+		}
+		us := floor(tm.UnixMicro(), w)
+		out := time.UnixMicro(us).UTC()
+		if us%1e6 == 0 {
+			return out.Format("2006-01-02 15:04:05"), nil
+		}
+		return strings.TrimRight(out.Format("2006-01-02 15:04:05.000000"), "0"), nil
+	}
+	return nil, nil
 }
 
 func dateFn(a []any, layout string) (any, error) {
