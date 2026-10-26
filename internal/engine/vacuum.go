@@ -31,7 +31,7 @@ func (db *DB) Vacuum(ctx context.Context) error {
 	if err := db.p.FlushAll(); err != nil {
 		return err
 	}
-	w, err := NewSnapshotWriter(db.path)
+	w, err := db.NewSnapshotWriter(db.path)
 	if err != nil {
 		return err
 	}

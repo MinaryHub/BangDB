@@ -49,6 +49,13 @@ type Options struct {
 	// OnSlowQuery receives slow calls. It runs on the calling goroutine and
 	// must not use the database.
 	OnSlowQuery func(SlowQuery)
+	// EncryptionKey encrypts the database file and its WAL (AES-256-XTS
+	// per page; see package pager). Use 32 random bytes, kept outside the
+	// database. A new file is created encrypted; an existing file must
+	// have been created with the same key. Backups and VACUUM keep the
+	// key; BackupWithKey makes a copy with another key or none. Ignored
+	// for in-memory databases.
+	EncryptionKey []byte
 }
 
 // DefaultCacheSize is the default Options.CacheSize.
@@ -93,6 +100,7 @@ type DB struct {
 	cursors  cursorSet
 	repl     *replLog
 
+	key           []byte // encryption key of the file (nil: plaintext)
 	counters      dbCounters
 	slowThreshold time.Duration
 	onSlow        func(SlowQuery)
@@ -110,17 +118,22 @@ type parsed struct {
 // in-memory database.
 func Open(path string, opts *Options) (*DB, error) {
 	var p *pager.Pager
+	var key []byte
 	if path == "" || path == ":memory:" {
 		path = ""
 		p = pager.OpenMemory()
 	} else {
+		if opts != nil && len(opts.EncryptionKey) > 0 {
+			key = append([]byte(nil), opts.EncryptionKey...)
+		}
 		var err error
-		if p, err = pager.Open(path); err != nil {
+		if p, err = pager.OpenEncrypted(path, key); err != nil {
 			return nil, err
 		}
+
 	}
 	db := &DB{p: p, writeSem: make(chan struct{}, 1), busyTimeout: 5 * time.Second,
-		stmtCache: map[string]parsed{}, closed: make(chan struct{}), path: path}
+		stmtCache: map[string]parsed{}, closed: make(chan struct{}), path: path, key: key}
 	db.repl = newReplLog(p.Header().Seq)
 	p.SetOnCommit(db.repl.onCommit)
 	if opts != nil && opts.BusyTimeout > 0 {

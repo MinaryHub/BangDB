@@ -78,11 +78,19 @@ type Header struct {
 	Meta      [MetaSlots]uint32
 	Seq       uint64   // commit sequence number, +1 per commit
 	DBID      [16]byte // random identity assigned at creation; replicas share it
+	// KeyCheck is derived from the encryption key of an encrypted file
+	// (format version 4); zero for a plaintext file. It belongs to the
+	// file, not to the data: copies and replicas record their own.
+	KeyCheck [16]byte
 }
 
 const (
-	offSeq  = 20 + MetaSlots*4
-	offDBID = offSeq + 8
+	offSeq      = 20 + MetaSlots*4
+	offDBID     = offSeq + 8
+	offKeyCheck = offDBID + 16
+
+	// formatEncrypted is the format version of encrypted files.
+	formatEncrypted = 4
 )
 
 func newHeader() Header {
@@ -97,6 +105,10 @@ func (h *Header) encode() []byte {
 	b := make([]byte, PageSize)
 	copy(b, magicPrefix)
 	b[len(magicPrefix)] = FormatVersion
+	if h.KeyCheck != ([16]byte{}) {
+		b[len(magicPrefix)] = formatEncrypted
+		copy(b[offKeyCheck:], h.KeyCheck[:])
+	}
 	binary.BigEndian.PutUint32(b[8:], PageSize)
 	binary.BigEndian.PutUint32(b[12:], h.PageCount)
 	binary.BigEndian.PutUint32(b[16:], h.FreeHead)
@@ -127,7 +139,7 @@ func decodeHeader(b []byte) (Header, error) {
 	if len(b) < PageSize || string(b[:len(magicPrefix)]) != magicPrefix {
 		return h, ErrCorrupt
 	}
-	if v := b[len(magicPrefix)]; v != FormatVersion {
+	if v := b[len(magicPrefix)]; v != FormatVersion && v != formatEncrypted {
 		if v < FormatVersion {
 			return h, fmt.Errorf("bangdb: database format version %d was written by a pre-release build and is not supported; recreate the database", v)
 		}
@@ -146,6 +158,12 @@ func decodeHeader(b []byte) (Header, error) {
 	}
 	h.Seq = binary.BigEndian.Uint64(b[offSeq:])
 	copy(h.DBID[:], b[offDBID:])
+	if b[len(magicPrefix)] == formatEncrypted {
+		copy(h.KeyCheck[:], b[offKeyCheck:])
+		if h.KeyCheck == ([16]byte{}) {
+			return h, ErrCorrupt
+		}
+	}
 	return h, nil
 }
 
@@ -185,6 +203,7 @@ type Pager struct {
 	closed bool
 
 	counters pagerCounters // guarded by mu
+	crypt    *pageCipher   // nil: pages are stored in plaintext
 
 	// failpoint, when set by tests, is called at commit stages to simulate
 	// crashes.
@@ -212,7 +231,18 @@ func OpenMemory() *Pager {
 
 // Open opens (creating if necessary) the database file at path. A sibling
 // file path+"-wal" is used as the write-ahead log.
-func Open(path string) (*Pager, error) {
+func Open(path string) (*Pager, error) { return OpenEncrypted(path, nil) }
+
+// OpenEncrypted opens a database file whose pages are encrypted with key
+// (nil: a plaintext file). A new file is created encrypted when key is set.
+func OpenEncrypted(path string, key []byte) (*Pager, error) {
+	var pc *pageCipher
+	if key != nil {
+		var err error
+		if pc, err = newPageCipher(key); err != nil {
+			return nil, err
+		}
+	}
 	_, statErr := os.Stat(path)
 	created := os.IsNotExist(statErr)
 	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE, 0o644)
@@ -232,6 +262,7 @@ func Open(path string) (*Pager, error) {
 	}
 	p := newPager()
 	p.file, p.wal, p.unlock = f, wal, unlock
+	p.crypt = pc
 	p.cache, p.cacheMax = map[uint32][]byte{}, defaultCache
 	fail := func(err error) (*Pager, error) {
 		p.closeFiles()
@@ -243,6 +274,7 @@ func Open(path string) (*Pager, error) {
 	}
 	if st.Size() == 0 {
 		p.hdr = newHeader()
+		p.adopt(&p.hdr)
 		if _, err := f.WriteAt(p.hdr.encode(), 0); err != nil {
 			return fail(err)
 		}
@@ -256,6 +288,15 @@ func Open(path string) (*Pager, error) {
 		}
 	} else if p.hdr, err = p.readFileHeader(); err != nil {
 		return fail(err)
+	} else {
+		switch {
+		case p.hdr.KeyCheck != ([16]byte{}) && pc == nil:
+			return fail(ErrEncrypted)
+		case p.hdr.KeyCheck == ([16]byte{}) && pc != nil:
+			return fail(ErrNotEncrypted)
+		case pc != nil && p.hdr.KeyCheck != pc.check:
+			return fail(ErrWrongKey)
+		}
 	}
 	if err := p.recover(); err != nil {
 		return fail(err)
@@ -307,6 +348,7 @@ func (p *Pager) recover() error {
 			break
 		}
 		for _, fr := range g.frames {
+			p.decrypt(fr.pgno, fr.data)
 			final[fr.pgno] = fr.data
 		}
 		next++
@@ -462,6 +504,7 @@ func (p *Pager) readAt(pgno uint32, seq uint64) ([]byte, error) {
 	if _, err := p.file.ReadAt(b, int64(pgno)*PageSize); err != nil {
 		return nil, fmt.Errorf("bangdb: read page %d: %w", pgno, err)
 	}
+	p.decrypt(pgno, b)
 	if err := verify(pgno, b); err != nil {
 		return nil, err
 	}
@@ -480,6 +523,7 @@ func (p *Pager) versionData(no uint32, v version) ([]byte, error) {
 	if _, err := p.wal.ReadAt(b, v.off); err != nil {
 		return nil, fmt.Errorf("bangdb: read WAL: %w", err)
 	}
+	p.decrypt(no, b)
 	if err := verify(no, b); err != nil {
 		return nil, err
 	}
@@ -639,6 +683,10 @@ func (p *Pager) PrepareRaw(pages map[uint32][]byte) (*Prepared, error) {
 	if err != nil {
 		return nil, err
 	}
+	kc := hdr.KeyCheck
+	if p.adopt(&hdr); hdr.KeyCheck != kc {
+		pages[0] = hdr.encode() // the primary's header carries its own key check
+	}
 	return p.prepare(pages, hdr, nil, nil)
 }
 
@@ -684,7 +732,7 @@ func (p *Pager) prepare(pages map[uint32][]byte, hdr Header, meta any, slots map
 			frameStart := len(buf)
 			buf = binary.BigEndian.AppendUint32(buf, no)
 			offs[no] = start + int64(len(buf))
-			buf = append(buf, pages[no]...)
+			buf = append(buf, p.encrypt(no, pages[no])...)
 			crc.Write(buf[frameStart:])
 		}
 		buf = binary.BigEndian.AppendUint32(buf, commitMarker)
@@ -944,8 +992,17 @@ func (p *Pager) writePagesHeaderLast(pages map[uint32][]byte) error {
 		}
 	}
 	sort.Slice(nos, func(i, j int) bool { return nos[i] < nos[j] })
+	var buf []byte
+	if p.crypt != nil {
+		buf = make([]byte, PageSize)
+	}
 	for i, no := range nos {
-		if _, err := p.file.WriteAt(pages[no], int64(no)*PageSize); err != nil {
+		data := pages[no]
+		if p.crypt != nil {
+			xts(p.crypt.data, p.crypt.tweak, buf, data, uint64(no), true)
+			data = buf
+		}
+		if _, err := p.file.WriteAt(data, int64(no)*PageSize); err != nil {
 			return err
 		}
 		if i == len(nos)/2 && p.failpoint != nil {
@@ -1000,7 +1057,7 @@ func (p *Pager) PutRaw(pgno uint32, data []byte) error {
 		return nil
 	}
 	delete(p.cache, pgno)
-	_, err := p.file.WriteAt(data, int64(pgno)*PageSize)
+	_, err := p.file.WriteAt(p.encrypt(pgno, data), int64(pgno)*PageSize)
 	return err
 }
 
@@ -1023,6 +1080,7 @@ func (p *Pager) FinishRaw(seq uint64) error {
 		return err
 	}
 	hdr.Seq = seq
+	p.adopt(&hdr) // page 0 was copied from another database
 	enc := hdr.encode()
 	if p.file == nil {
 		p.base[0] = enc

@@ -23,6 +23,7 @@ import (
 	"time"
 
 	"github.com/knoxxr/bangdb/internal/engine"
+	"github.com/knoxxr/bangdb/internal/pager"
 	"github.com/knoxxr/bangdb/internal/value"
 )
 
@@ -222,6 +223,19 @@ func (db *DB) Seq() uint64 { return db.e.Seq() }
 
 // ErrReadOnly is returned for writes on a replica.
 var ErrReadOnly = engine.ErrReadOnly
+
+// Errors of encrypted databases (Options.EncryptionKey).
+var (
+	ErrEncrypted    = pager.ErrEncrypted    // the file is encrypted and no key was given
+	ErrWrongKey     = pager.ErrWrongKey     // the key does not match the file
+	ErrNotEncrypted = pager.ErrNotEncrypted // a key was given for a plaintext file
+)
+
+// BackupWithKey writes a backup like Backup, encrypted with key (nil: a
+// plaintext copy). Use it to encrypt, decrypt or re-key a database.
+func (db *DB) BackupWithKey(ctx context.Context, path string, key []byte) error {
+	return db.e.BackupWithKey(ctx, path, key)
+}
 
 // Tables returns the names of all tables.
 func (db *DB) Tables() []string { return db.e.Catalog().TableNames() }

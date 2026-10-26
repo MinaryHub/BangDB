@@ -378,13 +378,22 @@ type SnapshotWriter struct {
 
 // NewSnapshotWriter creates an empty copy at path ("" or ":memory:" = memory).
 // The file is written to path+".snapshot" until it is installed.
-func NewSnapshotWriter(path string) (*SnapshotWriter, error) {
+func NewSnapshotWriter(path string) (*SnapshotWriter, error) { return newSnapshotWriter(path, nil) }
+
+// NewSnapshotWriter is the package function NewSnapshotWriter for a copy
+// that replaces this database (a replica's resynchronization): the copy is
+// encrypted with the database's key.
+func (db *DB) NewSnapshotWriter(path string) (*SnapshotWriter, error) {
+	return newSnapshotWriter(path, db.key)
+}
+
+func newSnapshotWriter(path string, key []byte) (*SnapshotWriter, error) {
 	if path == "" || path == ":memory:" {
 		return &SnapshotWriter{p: pager.OpenMemory()}, nil
 	}
 	tmp := path + ".snapshot"
 	removeDBFiles(tmp)
-	p, err := pager.Open(tmp)
+	p, err := pager.OpenEncrypted(tmp, key)
 	if err != nil {
 		return nil, err
 	}
@@ -472,7 +481,7 @@ func (db *DB) installLocked(w *SnapshotWriter) error {
 		if err := pager.SyncDir(db.path); err != nil {
 			return err
 		}
-		p, err := pager.Open(db.path)
+		p, err := pager.OpenEncrypted(db.path, db.key)
 		if err != nil {
 			return err // db.p stays closed: later calls fail with ErrClosed
 		}
@@ -496,6 +505,13 @@ func (db *DB) installLocked(w *SnapshotWriter) error {
 // writers wait. The result is a regular database file that can be opened
 // directly.
 func (db *DB) Backup(ctx context.Context, path string) error {
+	return db.BackupWithKey(ctx, path, db.key)
+}
+
+// BackupWithKey is Backup with the copy encrypted with key (nil: a
+// plaintext copy). With it a database can be encrypted, decrypted or given
+// a new key: back it up with the new key and use the copy.
+func (db *DB) BackupWithKey(ctx context.Context, path string, key []byte) error {
 	if path == "" || path == ":memory:" || path == db.path {
 		return errors.New("bangdb: invalid backup path")
 	}
@@ -504,7 +520,7 @@ func (db *DB) Backup(ctx context.Context, path string) error {
 		return err
 	}
 	defer snap.Close()
-	w, err := NewSnapshotWriter(path)
+	w, err := newSnapshotWriter(path, key)
 	if err != nil {
 		return err
 	}

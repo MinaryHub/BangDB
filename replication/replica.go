@@ -219,7 +219,7 @@ func (r *Replica) session() error {
 			if snap != nil {
 				snap.Abort()
 			}
-			if snap, err = engine.NewSnapshotWriter(r.db.Path()); err != nil {
+			if snap, err = r.db.NewSnapshotWriter(r.db.Path()); err != nil {
 				return err
 			}
 			snapDone = false

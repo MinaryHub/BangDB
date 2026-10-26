@@ -125,6 +125,20 @@ r.Promote()               // 장애 조치: 쓰기 가능한 primary로 승격
 
 자세한 내용: [docs/REPLICATION.md](docs/REPLICATION.md)
 
+### 저장 데이터 암호화
+
+```go
+key := loadKeyFromKMS() // 32바이트 무작위 키 (DB 밖에 보관)
+db, err := bangdb.OpenWithOptions("app.db", &bangdb.Options{EncryptionKey: key})
+// 키 없이 열면 bangdb.ErrEncrypted, 다른 키면 bangdb.ErrWrongKey
+db.BackupWithKey(ctx, "rekeyed.db", newKey) // 다른 키(또는 nil = 평문)로 복사 → 암호화·해제·키 교체
+```
+
+- 데이터 파일과 WAL의 모든 페이지(헤더 페이지 0 제외)를 **AES-256-XTS**(디스크 암호화 표준, 페이지 번호가 tweak)로 암호화합니다. 메모리 안의 페이지와 복제 스트림은 평문이며, 백업·VACUUM은 같은 키를 유지합니다. 복제본은 자기 키(또는 평문)를 따로 가질 수 있습니다.
+- 헤더 페이지에는 페이지 수·루트·커밋 번호·DB ID와 키 확인 값만 평문으로 남습니다(테이블 데이터·스키마 없음).
+- 무결성: 암호화된 페이지 안의 CRC가 잘못된 키·손상을 검출하지만 **암호학적 MAC은 아닙니다**(XTS는 위·변조 방지를 보장하지 않음). 디스크에서 읽는 페이지는 복호화 비용이 더해집니다(캐시 적중 시 없음).
+- 키 관리(KMS, 패스프레이즈에서 키 유도)는 애플리케이션 몫입니다.
+
 ### 덤프·이관
 
 ```go

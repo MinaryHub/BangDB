@@ -21,6 +21,7 @@ import (
 //   - the integrity check finds nothing.
 //
 // BANGDB_TORTURE=n runs n kill cycles (default 15; use -short to skip).
+// BANGDB_TORTURE_ENCRYPT=1 runs it on an encrypted database.
 func TestCrashTorture(t *testing.T) {
 	durableOnly(t)
 	if os.Getenv("BANGDB_TORTURE_CHILD") != "" {
@@ -67,7 +68,7 @@ func TestCrashTorture(t *testing.T) {
 		cmd.Wait()
 		lastAcked := <-acked
 
-		db, err := Open(path)
+		db, err := tortureOpen(path)
 		if err != nil {
 			t.Fatalf("cycle %d: reopen after kill: %v", cycle, err)
 		}
@@ -97,7 +98,7 @@ func TestCrashTorture(t *testing.T) {
 
 // tortureChild commits forever; the parent kills it.
 func tortureChild(path string) {
-	db, err := Open(path)
+	db, err := tortureOpen(path)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "child open:", err)
 		os.Exit(2)
@@ -150,4 +151,11 @@ func tortureChild(path string) {
 		n++
 		fmt.Printf("committed %d\n", n)
 	}
+}
+
+func tortureOpen(path string) (*DB, error) {
+	if os.Getenv("BANGDB_TORTURE_ENCRYPT") != "" {
+		return OpenWithOptions(path, &Options{EncryptionKey: []byte("torture-test-key-0123456789abcde")})
+	}
+	return Open(path)
 }
