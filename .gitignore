@@ -3,3 +3,6 @@
 /bangdb
 *.out
 *.test
+
+# build output
+/dist/
