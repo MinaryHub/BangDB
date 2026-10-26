@@ -1,0 +1,2 @@
+go test fuzz v1
+string("SELECT*FROM t WHERE''ORDER BY 2")

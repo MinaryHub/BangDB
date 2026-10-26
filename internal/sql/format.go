@@ -34,12 +34,16 @@ func formatExpr(sb *strings.Builder, e Expr) {
 			fmt.Fprintf(sb, "x'%x'", v)
 		}
 	case *Param:
-		sb.WriteString("?")
+		if x.Name != "" {
+			sb.WriteString(":" + x.Name)
+		} else {
+			fmt.Fprintf(sb, "?%d", x.Index+1)
+		}
 	case *ColumnRef:
 		if x.Table != "" {
-			sb.WriteString(x.Table + ".")
+			sb.WriteString(QuoteIdent(x.Table) + ".")
 		}
-		sb.WriteString(x.Name)
+		sb.WriteString(QuoteIdent(x.Name))
 	case *Unary:
 		if x.Op == "NOT" {
 			sb.WriteString("NOT ")
@@ -66,6 +70,9 @@ func formatExpr(sb *strings.Builder, e Expr) {
 			sb.WriteString(" NOT")
 		}
 		sb.WriteString(" IN (")
+		if x.Sub != nil {
+			sb.WriteString("SELECT ...")
+		}
 		for i, a := range x.List {
 			if i > 0 {
 				sb.WriteString(", ")
@@ -114,6 +121,52 @@ func formatExpr(sb *strings.Builder, e Expr) {
 			formatExpr(sb, a)
 		}
 		sb.WriteString(")")
+		if x.Over != nil {
+			sb.WriteString(" OVER (")
+			sep := ""
+			if len(x.Over.PartitionBy) > 0 {
+				sb.WriteString("PARTITION BY ")
+				for i, a := range x.Over.PartitionBy {
+					if i > 0 {
+						sb.WriteString(", ")
+					}
+					formatExpr(sb, a)
+				}
+				sep = " "
+			}
+			if len(x.Over.OrderBy) > 0 {
+				sb.WriteString(sep + "ORDER BY ")
+				for i, o := range x.Over.OrderBy {
+					if i > 0 {
+						sb.WriteString(", ")
+					}
+					formatExpr(sb, o.Expr)
+					if o.Desc {
+						sb.WriteString(" DESC")
+					}
+				}
+				sep = " "
+			}
+			if f := x.Over.Frame; f != nil {
+				sb.WriteString(sep)
+				if f.Rows {
+					sb.WriteString("ROWS BETWEEN ")
+				} else {
+					sb.WriteString("RANGE BETWEEN ")
+				}
+				formatBound(sb, f.Start)
+				sb.WriteString(" AND ")
+				formatBound(sb, f.End)
+			}
+			sb.WriteString(")")
+		}
+	case *Collate:
+		formatExpr(sb, x.X)
+		sb.WriteString(" COLLATE " + x.Name)
+	case *Subquery:
+		sb.WriteString("(SELECT ...)")
+	case *Exists:
+		sb.WriteString("EXISTS (SELECT ...)")
 	case *Case:
 		sb.WriteString("CASE")
 		if x.Operand != nil {
@@ -142,7 +195,7 @@ func ParseExpr(src string) (Expr, error) {
 	if err != nil {
 		return nil, err
 	}
-	p := &parser{toks: toks}
+	p := &parser{toks: toks, src: src}
 	e, err := p.parseExpr()
 	if err != nil {
 		return nil, err
@@ -151,4 +204,54 @@ func ParseExpr(src string) (Expr, error) {
 		return nil, p.errf("unexpected trailing input")
 	}
 	return e, nil
+}
+
+func formatBound(sb *strings.Builder, b FrameBound) {
+	switch b.Kind {
+	case UnboundedPreceding:
+		sb.WriteString("UNBOUNDED PRECEDING")
+	case UnboundedFollowing:
+		sb.WriteString("UNBOUNDED FOLLOWING")
+	case CurrentRow:
+		sb.WriteString("CURRENT ROW")
+	case Preceding:
+		formatExpr(sb, b.N)
+		sb.WriteString(" PRECEDING")
+	default:
+		formatExpr(sb, b.N)
+		sb.WriteString(" FOLLOWING")
+	}
+}
+
+// keywords that are quoted when used as identifiers in generated SQL.
+var keywords = map[string]bool{
+	"ADD": true, "ALL": true, "ALTER": true, "ANALYZE": true, "AUTOINCREMENT": true, "BEGIN": true,
+	"CHECK": true, "COLUMN": true, "COMMIT": true, "CONFLICT": true, "CONSTRAINT": true, "CREATE": true,
+	"CURRENT": true, "CURRENT_DATE": true, "CURRENT_TIME": true, "CURRENT_TIMESTAMP": true, "DEFAULT": true,
+	"DELETE": true, "DO": true, "DROP": true, "EXPLAIN": true, "FALSE": true, "FOLLOWING": true, "FOREIGN": true,
+	"FULL": true, "IF": true, "IGNORE": true, "INDEX": true, "INSERT": true, "KEY": true, "NOTHING": true,
+	"OVER": true, "PARTITION": true, "PRECEDING": true, "PRIMARY": true, "RANGE": true, "REFERENCES": true,
+	"RENAME": true, "REPLACE": true, "RIGHT": true, "ROLLBACK": true, "ROW": true, "ROWS": true, "TABLE": true,
+	"TO": true, "TRANSACTION": true, "TRUE": true, "UNBOUNDED": true, "UNIQUE": true, "UPDATE": true,
+	"USING": true, "VACUUM": true, "VIEW": true, "WITH": true, "CAST": true, "ESCAPE": true, "GLOB": true,
+}
+
+// QuoteIdent returns name as an SQL identifier, double-quoted when it is
+// not a plain identifier or could be read as a keyword.
+func QuoteIdent(name string) string {
+	plain := name != ""
+	for i, r := range name {
+		if !(r == '_' || r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || i > 0 && r >= '0' && r <= '9') {
+			plain = false
+			break
+		}
+	}
+	if plain {
+		u := strings.ToUpper(name)
+		plain = !reserved[u] && !keywords[u]
+	}
+	if plain {
+		return name
+	}
+	return `"` + strings.ReplaceAll(name, `"`, `""`) + `"`
 }

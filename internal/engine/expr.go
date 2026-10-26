@@ -6,6 +6,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 	"unicode/utf8"
 
 	"github.com/knoxxr/bangdb/internal/sql"
@@ -16,7 +17,21 @@ import (
 type env struct {
 	row  []any // combined row of all tables in scope
 	aggs []any // aggregate results for the current group
+	wins []any // window function results for the current row
 	args []any // bound parameters
+	buf  [8]any
+}
+
+// newEnv returns an env with a row of n slots (allocated together with it
+// when small).
+func newEnv(n int, args []any) *env {
+	e := &env{args: args}
+	if n <= len(e.buf) {
+		e.row = e.buf[:n:n]
+	} else {
+		e.row = make([]any, n)
+	}
+	return e
 }
 
 type evalFn func(e *env) (any, error)
@@ -26,11 +41,49 @@ type scopeCol struct {
 	name   string
 	level  int // position of the table in the FROM list
 	hidden bool
+	coll   string // collation of the column (NOCASE, RTRIM or "")
 }
 
-// scope maps column references to positions in env.row.
+// scope maps column references to positions in env.row. outer links to
+// the enclosing query when this scope belongs to a subquery.
 type scope struct {
-	cols []scopeCol
+	cols  []scopeCol
+	outer *outerCtx
+	used  []bool // columns referenced by the query (see coveringIndexes)
+}
+
+// outerCtx is the enclosing query of a subquery: its scope, and the row it
+// is currently evaluating (set each time the subquery runs).
+type outerCtx struct {
+	sc   *scope
+	cur  *env
+	used bool // the subquery references this scope (it is correlated)
+}
+
+// resolveOuter finds a column in the enclosing queries and returns an
+// evaluator reading it from the outer row being processed.
+func (s *scope) resolveOuter(tbl, name string) (evalFn, bool) {
+	var chain []*outerCtx
+	for o := s.outer; o != nil && o.sc != nil; o = o.sc.outer {
+		chain = append(chain, o)
+		if i, err := o.sc.resolve(tbl, name); err == nil {
+			for _, c := range chain {
+				c.used = true
+			}
+			return func(*env) (any, error) { return o.cur.row[i], nil }, true
+		}
+	}
+	return nil, false
+}
+
+// isOuter reports whether a column reference belongs to an enclosing query.
+func (s *scope) isOuter(tbl, name string) bool {
+	for o := s.outer; o != nil && o.sc != nil; o = o.sc.outer {
+		if _, err := o.sc.resolve(tbl, name); err == nil {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *scope) resolve(tbl, name string) (int, error) {
@@ -53,6 +106,10 @@ func (s *scope) resolve(tbl, name string) (int, error) {
 		}
 		return 0, fmt.Errorf("bangdb: no such column: %s", name)
 	}
+	if len(s.used) != len(s.cols) {
+		s.used = make([]bool, len(s.cols))
+	}
+	s.used[found] = true
 	return found, nil
 }
 
@@ -64,16 +121,19 @@ type aggSpec struct {
 }
 
 type compiler struct {
+	x        *execCtx // needed to plan subqueries; nil where they are not allowed
 	sc       *scope
 	allowAgg bool
 	aggs     *[]*aggSpec
+	wins     *[]*winSpec         // nil where window functions are not allowed
 	aliases  map[string]sql.Expr // SELECT aliases usable in HAVING / ORDER BY
 }
 
-var aggregateFuncs = map[string]bool{"COUNT": true, "SUM": true, "AVG": true, "MIN": true, "MAX": true, "TOTAL": true, "GROUP_CONCAT": true}
+var aggregateFuncs = map[string]bool{"COUNT": true, "SUM": true, "AVG": true, "MIN": true, "MAX": true, "TOTAL": true, "GROUP_CONCAT": true,
+	"JSON_GROUP_ARRAY": true, "JSON_GROUP_OBJECT": true}
 
 func isAggregateCall(f *sql.Func) bool {
-	if !aggregateFuncs[f.Name] {
+	if !aggregateFuncs[f.Name] || f.Over != nil {
 		return false
 	}
 	// min(a, b) / max(a, b) are scalar functions.
@@ -120,6 +180,16 @@ func walk(e sql.Expr, fn func(sql.Expr)) {
 		for _, a := range x.Args {
 			walk(a, fn)
 		}
+		if x.Over != nil {
+			for _, p := range x.Over.PartitionBy {
+				walk(p, fn)
+			}
+			for _, o := range x.Over.OrderBy {
+				walk(o.Expr, fn)
+			}
+		}
+	case *sql.Collate:
+		walk(x.X, fn)
 	case *sql.Case:
 		walk(x.Operand, fn)
 		for _, w := range x.Whens {
@@ -154,6 +224,9 @@ func (c *compiler) compile(e sql.Expr) (evalFn, error) {
 				inner := *c
 				inner.aliases = nil
 				return inner.compile(alias)
+			}
+			if f, ok := c.sc.resolveOuter(x.Table, x.Name); ok {
+				return f, nil
 			}
 			return nil, err
 		}
@@ -199,6 +272,9 @@ func (c *compiler) compile(e sql.Expr) (evalFn, error) {
 			return boolVal((v == nil) != not), nil
 		}, nil
 	case *sql.In:
+		if x.Sub != nil {
+			return c.compileInSubquery(x)
+		}
 		lhs, err := c.compile(x.X)
 		if err != nil {
 			return nil, err
@@ -206,6 +282,12 @@ func (c *compiler) compile(e sql.Expr) (evalFn, error) {
 		list, err := c.compileList(x.List)
 		if err != nil {
 			return nil, err
+		}
+		if coll := c.collationOf(x.X); coll != "" {
+			lhs = withCollation(lhs, coll)
+			for i := range list {
+				list[i] = withCollation(list[i], coll)
+			}
 		}
 		not := x.Not
 		return func(e *env) (any, error) {
@@ -232,6 +314,12 @@ func (c *compiler) compile(e sql.Expr) (evalFn, error) {
 		}, nil
 	case *sql.Between:
 		return c.compile(betweenAsAnd(x))
+	case *sql.Collate:
+		return c.compile(x.X) // collations only matter where values are compared
+	case *sql.Subquery:
+		return c.compileScalarSubquery(x.Select)
+	case *sql.Exists:
+		return c.compileExists(x)
 	case *sql.Like:
 		lhs, err := c.compile(x.X)
 		if err != nil {
@@ -324,6 +412,9 @@ func (c *compiler) compileBinary(x *sql.Binary) (evalFn, error) {
 			return boolVal(isAnd), nil
 		}, nil
 	case "=", "!=", "<", "<=", ">", ">=":
+		if coll := c.comparisonCollation(x.L, x.R); coll != "" {
+			l, r = withCollation(l, coll), withCollation(r, coll)
+		}
 		return func(e *env) (any, error) {
 			lv, err := l(e)
 			if err != nil {
@@ -350,6 +441,19 @@ func (c *compiler) compileBinary(x *sql.Binary) (evalFn, error) {
 				b = c >= 0
 			}
 			return boolVal(b), nil
+		}, nil
+	case "->", "->>":
+		asJSON := op == "->"
+		return func(e *env) (any, error) {
+			lv, err := l(e)
+			if err != nil {
+				return nil, err
+			}
+			rv, err := r(e)
+			if err != nil {
+				return nil, err
+			}
+			return jsonArrow(lv, rv, asJSON)
 		}, nil
 	case "||":
 		return func(e *env) (any, error) {
@@ -503,11 +607,78 @@ func likeMatch(pattern, s string) bool {
 	return pi == len(p)
 }
 
+// foldASCII folds case for LIKE (Unicode-aware despite its name: ASCII
+// takes a fast path).
 func foldASCII(r rune) rune {
 	if r >= 'A' && r <= 'Z' {
 		return r + 32
 	}
-	return r
+	if r < 0x80 {
+		return r
+	}
+	return unicode.ToLower(r)
+}
+
+// collationFold returns the text folding of a collation (nil = binary).
+func collationFold(name string) func(string) string {
+	switch name {
+	case "NOCASE":
+		return strings.ToLower
+	case "RTRIM":
+		return func(s string) string { return strings.TrimRight(s, " ") }
+	}
+	return nil
+}
+
+// foldValue applies a collation to a text value.
+func foldValue(v any, coll string) any {
+	if s, ok := v.(string); ok {
+		if f := collationFold(coll); f != nil {
+			return f(s)
+		}
+	}
+	return v
+}
+
+func withCollation(fn evalFn, coll string) evalFn {
+	if collationFold(coll) == nil {
+		return fn
+	}
+	return func(e *env) (any, error) {
+		v, err := fn(e)
+		return foldValue(v, coll), err
+	}
+}
+
+// collationOf returns the collation of an expression: an explicit COLLATE,
+// or the collation of a column it directly refers to.
+func (c *compiler) collationOf(e sql.Expr) string {
+	switch x := e.(type) {
+	case *sql.Collate:
+		return x.Name
+	case *sql.ColumnRef:
+		if c.sc != nil {
+			if i, err := c.sc.resolve(x.Table, x.Name); err == nil {
+				return c.sc.cols[i].coll
+			}
+		}
+	}
+	return ""
+}
+
+// comparisonCollation follows SQLite: an explicit COLLATE on the left, then
+// on the right, then the left column's collation, then the right's.
+func (c *compiler) comparisonCollation(l, r sql.Expr) string {
+	if x, ok := l.(*sql.Collate); ok {
+		return x.Name
+	}
+	if x, ok := r.(*sql.Collate); ok {
+		return x.Name
+	}
+	if coll := c.collationOf(l); coll != "" {
+		return coll
+	}
+	return c.collationOf(r)
 }
 
 func (c *compiler) compileCase(x *sql.Case) (evalFn, error) {
@@ -565,22 +736,53 @@ func (c *compiler) compileCase(x *sql.Case) (evalFn, error) {
 }
 
 func (c *compiler) compileFunc(f *sql.Func) (evalFn, error) {
+	if f.Over != nil {
+		return c.compileWindow(f)
+	}
+	if isWindowOnly(f.Name) {
+		return nil, fmt.Errorf("bangdb: %s() requires an OVER clause", f.Name)
+	}
 	if isAggregateCall(f) {
 		if !c.allowAgg || c.aggs == nil {
 			return nil, fmt.Errorf("bangdb: misuse of aggregate function %s()", f.Name)
 		}
 		spec := &aggSpec{name: f.Name, distinct: f.Distinct}
 		if !f.Star {
-			if len(f.Args) != 1 && f.Name != "GROUP_CONCAT" {
+			if f.Name == "JSON_GROUP_OBJECT" {
+				if len(f.Args) != 2 {
+					return nil, fmt.Errorf("bangdb: %s() takes exactly two arguments", f.Name)
+				}
+			} else if len(f.Args) != 1 && f.Name != "GROUP_CONCAT" {
 				return nil, fmt.Errorf("bangdb: %s() takes exactly one argument", f.Name)
 			}
 			if len(f.Args) == 0 {
 				return nil, fmt.Errorf("bangdb: %s() requires an argument", f.Name)
 			}
-			inner := &compiler{sc: c.sc}
+			inner := &compiler{x: c.x, sc: c.sc}
 			arg, err := inner.compile(f.Args[0])
 			if err != nil {
 				return nil, err
+			}
+			if jsonValueArg(f.Name, 0) && jsonProducing(f.Args[0]) {
+				arg = asJSONText(arg)
+			}
+			if f.Name == "JSON_GROUP_OBJECT" {
+				val, err := inner.compile(f.Args[1])
+				if err != nil {
+					return nil, err
+				}
+				if jsonProducing(f.Args[1]) {
+					val = asJSONText(val)
+				}
+				key := arg
+				arg = func(e *env) (any, error) {
+					k, err := key(e)
+					if err != nil {
+						return nil, err
+					}
+					v, err := val(e)
+					return jsonPair{k, v}, err
+				}
 			}
 			spec.arg = arg
 		} else if f.Name != "COUNT" {
@@ -593,6 +795,11 @@ func (c *compiler) compileFunc(f *sql.Func) (evalFn, error) {
 	args, err := c.compileList(f.Args)
 	if err != nil {
 		return nil, err
+	}
+	for i, a := range f.Args {
+		if jsonValueArg(f.Name, i) && jsonProducing(a) {
+			args[i] = asJSONText(args[i])
+		}
 	}
 	impl, ok := scalarFuncs[f.Name]
 	if !ok {
@@ -671,7 +878,6 @@ var scalarFuncs = map[string]scalarFunc{
 	"NOW": {0, 0, func([]any) (any, error) {
 		return time.Now().UTC().Format(time.RFC3339Nano), nil
 	}, nil},
-	"UNIXEPOCH": {0, 0, func([]any) (any, error) { return time.Now().Unix(), nil }, nil},
 }
 
 func coalesce(args []evalFn) evalFn {
@@ -854,6 +1060,8 @@ type aggState struct {
 	best  any
 	parts []string
 	seen  map[string]bool
+	items []any    // JSON_GROUP_ARRAY
+	obj   *jsonObj // JSON_GROUP_OBJECT
 }
 
 func newAggState(s *aggSpec) *aggState {
@@ -870,7 +1078,7 @@ func (st *aggState) step(e *env) error {
 		return nil
 	}
 	v, err := st.spec.arg(e)
-	if err != nil || v == nil {
+	if err != nil || v == nil && st.spec.name != "JSON_GROUP_ARRAY" {
 		return err
 	}
 	if st.seen != nil {
@@ -912,6 +1120,8 @@ func (st *aggState) step(e *env) error {
 		}
 	case "GROUP_CONCAT":
 		st.parts = append(st.parts, value.Format(v))
+	case "JSON_GROUP_ARRAY", "JSON_GROUP_OBJECT":
+		return st.stepJSON(v)
 	}
 	return nil
 }
@@ -945,6 +1155,8 @@ func (st *aggState) result() (any, error) {
 			return nil, nil
 		}
 		return strings.Join(st.parts, ","), nil
+	case "JSON_GROUP_ARRAY", "JSON_GROUP_OBJECT":
+		return st.resultJSON(), nil
 	}
 	return nil, nil
 }

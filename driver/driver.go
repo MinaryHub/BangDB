@@ -6,6 +6,7 @@
 //	)
 //
 //	db, err := sql.Open("bangdb", "app.db") // or ":memory:"
+//	db, err := sql.Open("bangdb", "bangdb://user:password@host:7432") // a server (package server)
 //
 // All connections of one *sql.DB share a single engine instance, so an
 // in-memory database is visible to every connection of that *sql.DB.
@@ -17,8 +18,12 @@ import (
 	"database/sql/driver"
 	"errors"
 	"io"
+	"reflect"
+	"strings"
 
+	"github.com/knoxxr/bangdb/client"
 	"github.com/knoxxr/bangdb/internal/engine"
+	"github.com/knoxxr/bangdb/internal/value"
 )
 
 func init() { sql.Register("bangdb", &Driver{}) }
@@ -29,6 +34,13 @@ type Driver struct{}
 // Open is used by database/sql only when OpenConnector is unavailable; it
 // opens a fresh engine whose lifetime is tied to the connection.
 func (d *Driver) Open(name string) (driver.Conn, error) {
+	if strings.HasPrefix(name, "bangdb://") {
+		c, err := d.OpenConnector(name)
+		if err != nil {
+			return nil, err
+		}
+		return c.Connect(context.Background())
+	}
 	db, err := engine.Open(name, nil)
 	if err != nil {
 		return nil, err
@@ -38,6 +50,13 @@ func (d *Driver) Open(name string) (driver.Conn, error) {
 
 // OpenConnector opens the database once; connections share it.
 func (d *Driver) OpenConnector(name string) (driver.Connector, error) {
+	if strings.HasPrefix(name, "bangdb://") {
+		addr, opts, err := client.ParseDSN(name)
+		if err != nil {
+			return nil, err
+		}
+		return &remoteConnector{addr: addr, opts: opts, drv: d}, nil
+	}
 	db, err := engine.Open(name, nil)
 	if err != nil {
 		return nil, err
@@ -77,31 +96,31 @@ func (c *conn) Begin() (driver.Tx, error) { return c.BeginTx(context.Background(
 
 // BeginTx starts a transaction. Read-only transactions are served as
 // regular ones (they take the single-writer lock).
-func (c *conn) BeginTx(context.Context, driver.TxOptions) (driver.Tx, error) {
-	if _, err := c.c.Exec("BEGIN"); err != nil {
+func (c *conn) BeginTx(ctx context.Context, _ driver.TxOptions) (driver.Tx, error) {
+	if _, err := c.c.ExecContext(ctx, "BEGIN"); err != nil {
 		return nil, err
 	}
 	return &tx{c: c}, nil
 }
 
-func (c *conn) ExecContext(_ context.Context, query string, args []driver.NamedValue) (driver.Result, error) {
+func (c *conn) ExecContext(ctx context.Context, query string, args []driver.NamedValue) (driver.Result, error) {
 	vals, err := values(args)
 	if err != nil {
 		return nil, err
 	}
-	r, err := c.c.Exec(query, vals...)
+	r, err := c.c.ExecContext(ctx, query, vals...)
 	if err != nil {
 		return nil, err
 	}
 	return result{r}, nil
 }
 
-func (c *conn) QueryContext(_ context.Context, query string, args []driver.NamedValue) (driver.Rows, error) {
+func (c *conn) QueryContext(ctx context.Context, query string, args []driver.NamedValue) (driver.Rows, error) {
 	vals, err := values(args)
 	if err != nil {
 		return nil, err
 	}
-	r, err := c.c.Exec(query, vals...)
+	r, err := c.c.QueryRows(ctx, query, vals...)
 	if err != nil {
 		return nil, err
 	}
@@ -120,9 +139,10 @@ func values(args []driver.NamedValue) ([]any, error) {
 	out := make([]any, len(args))
 	for i, a := range args {
 		if a.Name != "" {
-			return nil, errors.New("bangdb: named parameters are not supported; use ?")
+			out[i] = engine.NamedArg{Name: a.Name, Value: a.Value}
+		} else {
+			out[i] = a.Value
 		}
-		out[i] = a.Value
 	}
 	return out, nil
 }
@@ -144,8 +164,17 @@ type stmt struct {
 	query string
 }
 
-func (s *stmt) Close() error  { return nil }
-func (s *stmt) NumInput() int { return -1 }
+func (s *stmt) Close() error { return nil }
+
+// NumInput lets database/sql check the argument count of statements that
+// only use positional parameters.
+func (s *stmt) NumInput() int {
+	n, named, err := s.c.c.NumParams(s.query)
+	if err != nil || named {
+		return -1
+	}
+	return n
+}
 
 func (s *stmt) Exec(args []driver.Value) (driver.Result, error) {
 	return s.c.ExecContext(context.Background(), s.query, named(args))
@@ -176,21 +205,40 @@ type result struct{ r engine.Result }
 func (r result) LastInsertId() (int64, error) { return r.r.LastInsertID, nil }
 func (r result) RowsAffected() (int64, error) { return r.r.RowsAffected, nil }
 
-type rows struct {
-	r   engine.Result
-	pos int
+type rows struct{ r *engine.Rows }
+
+func (r *rows) Columns() []string { return r.r.Columns() }
+
+// ColumnTypeDatabaseTypeName reports the declared type of a column.
+func (r *rows) ColumnTypeDatabaseTypeName(i int) string {
+	return strings.ToUpper(r.r.ColumnTypes()[i])
 }
 
-func (r *rows) Columns() []string { return r.r.Columns }
-func (r *rows) Close() error      { return nil }
+// ColumnTypeScanType suggests a Go type for a column.
+func (r *rows) ColumnTypeScanType(i int) reflect.Type {
+	switch value.ParseType(r.r.ColumnTypes()[i]) {
+	case value.Integer:
+		return reflect.TypeOf(int64(0))
+	case value.Real:
+		return reflect.TypeOf(float64(0))
+	case value.Text:
+		return reflect.TypeOf("")
+	case value.Blob:
+		return reflect.TypeOf([]byte(nil))
+	}
+	return reflect.TypeOf((*any)(nil)).Elem()
+}
+func (r *rows) Close() error { return r.r.Close() }
 
 func (r *rows) Next(dest []driver.Value) error {
-	if r.pos >= len(r.r.Rows) {
+	if !r.r.Next() {
+		if err := r.r.Err(); err != nil {
+			return err
+		}
 		return io.EOF
 	}
-	for i, v := range r.r.Rows[r.pos] {
+	for i, v := range r.r.Row() {
 		dest[i] = v
 	}
-	r.pos++
 	return nil
 }

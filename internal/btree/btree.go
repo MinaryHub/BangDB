@@ -2,9 +2,9 @@
 // pager pages. Leaves are linked left-to-right for range scans. Values larger
 // than InlineMax are spilled to overflow page chains.
 //
-// Deletion removes entries without rebalancing (pages may become sparse or
-// empty); space is reclaimed when the whole tree is dropped. This keeps the
-// code small and is a common trade-off in embedded engines.
+// Deletion rebalances: a node that falls below a quarter of a page is merged
+// with a sibling (freeing a page) or takes entries from it. Builder loads
+// sorted entries into densely packed pages (used by VACUUM).
 package btree
 
 import (
@@ -29,7 +29,7 @@ const (
 
 	nodeHeader = 7 // type(1) n(2) next-or-child0(4)
 	ovHeader   = 7 // type(1) next(4) used(2)
-	ovChunk    = pager.PageSize - ovHeader
+	ovChunk    = pager.UsableSize - ovHeader
 )
 
 // ErrKeyTooLarge is returned when a key exceeds MaxKey bytes.
@@ -106,54 +106,75 @@ func (n *node) encode() []byte {
 }
 
 func decode(b []byte) (*node, error) {
+	if len(b) < pager.UsableSize {
+		return nil, errBadPage
+	}
+	b = b[:pager.UsableSize] // the rest is the page checksum
 	n := &node{}
 	switch b[0] {
 	case typeLeaf:
 		n.leaf = true
 		n.next = binary.BigEndian.Uint32(b[3:])
 	case typeInternal:
-		n.children = []uint32{binary.BigEndian.Uint32(b[3:])}
 	default:
 		return nil, errBadPage
 	}
 	cnt := int(binary.BigEndian.Uint16(b[1:]))
+	if cnt > pager.UsableSize/3 { // every cell needs at least 3 bytes
+		return nil, errBadPage
+	}
 	n.keys = make([][]byte, 0, cnt+1)
 	if n.leaf {
 		n.vals = make([]value, 0, cnt+1)
 	} else {
-		children := make([]uint32, 1, cnt+2)
-		children[0] = n.children[0]
-		n.children = children
+		n.children = make([]uint32, 1, cnt+2)
+		n.children[0] = binary.BigEndian.Uint32(b[3:])
 	}
 	off := nodeHeader
+	need := func(k int) bool { return off+k <= len(b) }
 	for i := 0; i < cnt; i++ {
-		if off+2 > len(b) {
+		if !need(2) {
 			return nil, errBadPage
 		}
 		kl := int(binary.BigEndian.Uint16(b[off:]))
 		off += 2
-		if off+kl > len(b) {
+		if !need(kl) {
 			return nil, errBadPage
 		}
 		n.keys = append(n.keys, b[off:off+kl:off+kl])
 		off += kl
 		if !n.leaf {
+			if !need(4) {
+				return nil, errBadPage
+			}
 			n.children = append(n.children, binary.BigEndian.Uint32(b[off:]))
 			off += 4
 			continue
 		}
-		if b[off] == 1 {
+		if !need(1) {
+			return nil, errBadPage
+		}
+		switch b[off] {
+		case 1:
+			if !need(9) {
+				return nil, errBadPage
+			}
 			n.vals = append(n.vals, value{overflow: true,
 				total: binary.BigEndian.Uint32(b[off+1:]), first: binary.BigEndian.Uint32(b[off+5:])})
 			off += 9
-		} else {
+		case 0:
+			if !need(3) {
+				return nil, errBadPage
+			}
 			vl := int(binary.BigEndian.Uint16(b[off+1:]))
 			off += 3
-			if off+vl > len(b) {
+			if !need(vl) {
 				return nil, errBadPage
 			}
 			n.vals = append(n.vals, value{inline: b[off : off+vl : off+vl]})
 			off += vl
+		default:
+			return nil, errBadPage
 		}
 	}
 	return n, nil
@@ -179,19 +200,95 @@ func Create(v *pager.View) (uint32, error) {
 // Open returns a handle for the tree rooted at root.
 func Open(v *pager.View, root uint32) *Tree { return &Tree{v: v, root: root} }
 
+// load returns the node at pg. It may be shared with other readers through
+// the pager's decoded-page cache and must not be modified; use loadMut.
 func (t *Tree) load(pg uint32) (*node, error) {
 	b, err := t.v.Read(pg)
 	if err != nil {
 		return nil, err
 	}
-	n, err := decode(b)
+	obj, err := t.v.Decoded(b, decodeAny)
 	if err != nil {
 		return nil, fmt.Errorf("%w (page %d)", err, pg)
 	}
-	return n, nil
+	return obj.(*node), nil
 }
 
-func (t *Tree) store(pg uint32, n *node) { t.v.Write(pg, n.encode()) }
+func decodeAny(b []byte) (any, error) { return decode(b) }
+
+// loadDescend returns the node at pg for a writer walking down the tree:
+// the view's own copy if it has one (the writer may change it next), else
+// the shared decoded node. The caller must not modify it; use loadMut.
+func (t *Tree) loadDescend(pg uint32) (*node, error) {
+	if l, ok := t.v.PeekLazy(pg); ok {
+		return l.(*node), nil
+	}
+	b, err := t.v.Read(pg)
+	if err != nil {
+		return nil, err
+	}
+	if obj, ok := t.v.PeekOwned(pg, b); ok {
+		return obj.(*node), nil
+	}
+	obj, err := t.v.Decoded(b, decodeAny)
+	if err != nil {
+		return nil, fmt.Errorf("%w (page %d)", err, pg)
+	}
+	return obj.(*node), nil
+}
+
+// loadMut returns a private copy of the node at pg for modification. It
+// does not populate the decoded-page cache: the page is about to change.
+func (t *Tree) loadMut(pg uint32) (*node, error) {
+	if l, ok := t.v.TakeLazy(pg); ok {
+		return l.(*node), nil // the view's own: changed in place
+	}
+	b, err := t.v.Read(pg)
+	if err != nil {
+		return nil, err
+	}
+	if obj, ok := t.v.TakeOwned(pg, b); ok {
+		return obj.(*node), nil // written by this view: already private
+	}
+	obj, ok := t.v.Cached(b)
+	if !ok {
+		n, err := decode(b)
+		if err != nil {
+			return nil, fmt.Errorf("%w (page %d)", err, pg)
+		}
+		return n, nil // freshly decoded: already private
+	}
+	n := obj.(*node)
+	c := *n
+	c.keys = append(make([][]byte, 0, len(n.keys)+1), n.keys...)
+	if n.leaf {
+		c.vals = append(make([]value, 0, len(n.vals)+1), n.vals...)
+	} else {
+		c.children = append(make([]uint32, 0, len(n.children)+1), n.children...)
+	}
+	return &c, nil
+}
+
+// store writes n to page pg. The page stays in decoded form in the view
+// (pager.Lazy) and is encoded at commit or when its bytes are read.
+func (t *Tree) store(pg uint32, n *node) { t.v.WriteLazy(pg, n) }
+
+// Encode implements pager.Lazy.
+func (n *node) Encode() []byte { return n.encode() }
+
+// Clone implements pager.Lazy.
+func (n *node) Clone() pager.Lazy {
+	c := *n
+	c.keys = append([][]byte(nil), n.keys...)
+	c.vals = append([]value(nil), n.vals...)
+	c.children = append([]uint32(nil), n.children...)
+	if n.leaf {
+		c.children = nil
+	} else {
+		c.vals = nil
+	}
+	return &c
+}
 
 // childIndex: children[i] holds keys < keys[i]; children[i+1] holds keys >= keys[i].
 func childIndex(n *node, key []byte) int {
@@ -203,10 +300,13 @@ func leafIndex(n *node, key []byte) (int, bool) {
 	return i, i < len(n.keys) && bytes.Equal(n.keys[i], key)
 }
 
+// findLeaf serves point lookups (Get, Has): they hold no node after
+// returning, so the view's own nodes can be used (loadDescend), which
+// spares decoding pages the writer has just changed.
 func (t *Tree) findLeaf(key []byte) (uint32, *node, error) {
 	pg := t.root
 	for {
-		n, err := t.load(pg)
+		n, err := t.loadDescend(pg)
 		if err != nil {
 			return 0, nil, err
 		}
@@ -337,11 +437,16 @@ func (t *Tree) Put(key, val []byte) error {
 }
 
 func (t *Tree) insert(pg uint32, key []byte, v value) (*split, error) {
-	n, err := t.load(pg)
+	// Internal nodes are descended through the shared (read-only) decoded
+	// node; a private copy is made only when a child split changes them.
+	n, err := t.loadDescend(pg)
 	if err != nil {
 		return nil, err
 	}
 	if n.leaf {
+		if n, err = t.loadMut(pg); err != nil {
+			return nil, err
+		}
 		i, found := leafIndex(n, key)
 		if found {
 			if err := t.freeValue(n.vals[i]); err != nil {
@@ -356,7 +461,7 @@ func (t *Tree) insert(pg uint32, key []byte, v value) (*split, error) {
 			copy(n.vals[i+1:], n.vals[i:])
 			n.vals[i] = v
 		}
-		if n.size() <= pager.PageSize {
+		if n.size() <= pager.UsableSize {
 			t.store(pg, n)
 			return nil, nil
 		}
@@ -367,21 +472,25 @@ func (t *Tree) insert(pg uint32, key []byte, v value) (*split, error) {
 	if err != nil || s == nil {
 		return nil, err
 	}
+	if n, err = t.loadMut(pg); err != nil {
+		return nil, err
+	}
 	n.keys = append(n.keys, nil)
 	copy(n.keys[ci+1:], n.keys[ci:])
 	n.keys[ci] = s.sep
 	n.children = append(n.children, 0)
 	copy(n.children[ci+2:], n.children[ci+1:])
 	n.children[ci+1] = s.right
-	if n.size() <= pager.PageSize {
+	if n.size() <= pager.UsableSize {
 		t.store(pg, n)
 		return nil, nil
 	}
 	return t.splitInternal(pg, n)
 }
 
-func (t *Tree) splitLeaf(pg uint32, n *node) (*split, error) {
-	// Split by bytes so both halves fit even with variable-size cells.
+// leafSplit returns the index of the first entry of the right half when
+// splitting leaf n by bytes, so both halves fit even with variable-size cells.
+func leafSplit(n *node) int {
 	half, acc, m := n.size()/2, nodeHeader, 0
 	for m < len(n.keys)-1 {
 		acc += (&node{leaf: true, keys: n.keys[m : m+1], vals: n.vals[m : m+1]}).size() - nodeHeader
@@ -390,6 +499,25 @@ func (t *Tree) splitLeaf(pg uint32, n *node) (*split, error) {
 			break
 		}
 	}
+	return m
+}
+
+// internalSplit returns the index of the key that moves up when splitting
+// internal node n by bytes.
+func internalSplit(n *node) int {
+	half, acc, m := n.size()/2, nodeHeader, 0
+	for m < len(n.keys)-2 {
+		acc += 2 + len(n.keys[m]) + 4
+		m++
+		if acc >= half {
+			break
+		}
+	}
+	return m
+}
+
+func (t *Tree) splitLeaf(pg uint32, n *node) (*split, error) {
+	m := leafSplit(n)
 	rpg, err := t.v.Alloc()
 	if err != nil {
 		return nil, err
@@ -402,15 +530,7 @@ func (t *Tree) splitLeaf(pg uint32, n *node) (*split, error) {
 }
 
 func (t *Tree) splitInternal(pg uint32, n *node) (*split, error) {
-	// Split by bytes; keys[m] moves up to the parent.
-	half, acc, m := n.size()/2, nodeHeader, 0
-	for m < len(n.keys)-2 {
-		acc += 2 + len(n.keys[m]) + 4
-		m++
-		if acc >= half {
-			break
-		}
-	}
+	m := internalSplit(n) // keys[m] moves up to the parent
 	rpg, err := t.v.Alloc()
 	if err != nil {
 		return nil, err
@@ -422,22 +542,135 @@ func (t *Tree) splitInternal(pg uint32, n *node) (*split, error) {
 	return &split{sep: n.keys[m], right: rpg}, nil
 }
 
+// minFill is the size below which a non-root node is rebalanced.
+const minFill = pager.UsableSize / 4
+
 // Delete removes key and reports whether it existed.
 func (t *Tree) Delete(key []byte) (bool, error) {
-	pg, n, err := t.findLeaf(key)
+	found, _, err := t.del(t.root, key)
+	if err != nil || !found {
+		return found, err
+	}
+	// An internal root left with a single child absorbs it, so the tree
+	// shrinks in height while the root page number stays the same.
+	for {
+		n, err := t.load(t.root)
+		if err != nil {
+			return true, err
+		}
+		if n.leaf || len(n.keys) > 0 {
+			return true, nil
+		}
+		child := n.children[0]
+		b, err := t.v.Read(child)
+		if err != nil {
+			return true, err
+		}
+		t.v.Write(t.root, append([]byte(nil), b...))
+		t.v.Free(child)
+	}
+}
+
+// del removes key from the subtree at pg. under reports that the node at pg
+// is now below minFill.
+func (t *Tree) del(pg uint32, key []byte) (found, under bool, err error) {
+	n, err := t.loadDescend(pg) // read-only until something changes (see insert)
+	if err != nil {
+		return false, false, err
+	}
+	if n.leaf {
+		if n, err = t.loadMut(pg); err != nil {
+			return false, false, err
+		}
+		i, ok := leafIndex(n, key)
+		if !ok {
+			return false, false, nil
+		}
+		if err := t.freeValue(n.vals[i]); err != nil {
+			return false, false, err
+		}
+		n.keys = append(n.keys[:i], n.keys[i+1:]...)
+		n.vals = append(n.vals[:i], n.vals[i+1:]...)
+		t.store(pg, n)
+		return true, n.size() < minFill, nil
+	}
+	ci := childIndex(n, key)
+	found, under, err = t.del(n.children[ci], key)
+	if err != nil || !found || !under {
+		return found, false, err
+	}
+	if n, err = t.loadMut(pg); err != nil {
+		return true, false, err
+	}
+	changed, err := t.rebalance(n, ci)
+	if err != nil || !changed {
+		return true, false, err
+	}
+	t.store(pg, n)
+	return true, n.size() < minFill, nil
+}
+
+// rebalance fixes the underfull child ci of n by merging it with a sibling
+// or, when both do not fit in one page, by sharing entries evenly. It
+// reports whether n changed (the caller stores it).
+func (t *Tree) rebalance(n *node, ci int) (bool, error) {
+	if len(n.children) < 2 {
+		return false, nil
+	}
+	li := ci - 1
+	if ci == 0 {
+		li = 0
+	}
+	lpg, rpg := n.children[li], n.children[li+1]
+	left, err := t.loadDescend(lpg) // read only: the result is built anew
 	if err != nil {
 		return false, err
 	}
-	i, ok := leafIndex(n, key)
-	if !ok {
-		return false, nil
-	}
-	if err := t.freeValue(n.vals[i]); err != nil {
+	right, err := t.loadDescend(rpg)
+	if err != nil {
 		return false, err
 	}
-	n.keys = append(n.keys[:i], n.keys[i+1:]...)
-	n.vals = append(n.vals[:i], n.vals[i+1:]...)
-	t.store(pg, n)
+	var merged *node
+	if left.leaf {
+		merged = &node{leaf: true, next: right.next,
+			keys: append(append([][]byte(nil), left.keys...), right.keys...),
+			vals: append(append([]value(nil), left.vals...), right.vals...)}
+	} else {
+		merged = &node{
+			keys:     append(append(append([][]byte(nil), left.keys...), n.keys[li]), right.keys...),
+			children: append(append([]uint32(nil), left.children...), right.children...)}
+	}
+	if merged.size() <= pager.UsableSize {
+		t.store(lpg, merged)
+		t.v.Free(rpg)
+		n.keys = append(n.keys[:li], n.keys[li+1:]...)
+		n.children = append(n.children[:li+1], n.children[li+2:]...)
+		return true, nil
+	}
+	// Redistribute. The new separator may be longer than the old one; give
+	// up if the parent would no longer fit in its page.
+	var nl, nr *node
+	var sep []byte
+	if merged.leaf {
+		m := leafSplit(merged)
+		// Capped slices: the halves share arrays and both stay owned by
+		// the view (see store), so appending to one must not clobber the
+		// other.
+		nl = &node{leaf: true, keys: merged.keys[:m:m], vals: merged.vals[:m:m], next: rpg}
+		nr = &node{leaf: true, keys: merged.keys[m:], vals: merged.vals[m:], next: right.next}
+		sep = nr.keys[0]
+	} else {
+		m := internalSplit(merged)
+		nl = &node{keys: merged.keys[:m:m], children: merged.children[: m+1 : m+1]}
+		nr = &node{keys: merged.keys[m+1:], children: merged.children[m+1:]}
+		sep = merged.keys[m]
+	}
+	if n.size()-len(n.keys[li])+len(sep) > pager.UsableSize {
+		return false, nil
+	}
+	t.store(lpg, nl)
+	t.store(rpg, nr)
+	n.keys[li] = sep
 	return true, nil
 }
 
@@ -551,4 +784,119 @@ func (c *Cursor) Next() {
 	}
 	c.i++
 	c.normalize()
+}
+
+// RevCursor iterates over the tree in descending key order. Leaves are only
+// linked forward, so it keeps the path from the root.
+type RevCursor struct {
+	t     *Tree
+	stack []revFrame // internal nodes on the path, with the child index taken
+	n     *node      // current leaf
+	i     int
+	err   error
+}
+
+type revFrame struct {
+	n  *node
+	ci int
+}
+
+// SeekReverse positions a reverse cursor at the last key <= key (nil = the
+// last key of the tree).
+func (t *Tree) SeekReverse(key []byte) *RevCursor {
+	c := &RevCursor{t: t}
+	pg := t.root
+	for {
+		n, err := t.load(pg)
+		if err != nil {
+			c.err = err
+			return c
+		}
+		if n.leaf {
+			c.n = n
+			if key == nil {
+				c.i = len(n.keys) - 1
+			} else {
+				c.i = sort.Search(len(n.keys), func(i int) bool { return bytes.Compare(n.keys[i], key) > 0 }) - 1
+			}
+			break
+		}
+		ci := len(n.children) - 1
+		if key != nil {
+			ci = childIndex(n, key)
+		}
+		c.stack = append(c.stack, revFrame{n, ci})
+		pg = n.children[ci]
+	}
+	if c.i < 0 {
+		c.Prev()
+	}
+	return c
+}
+
+// Valid reports whether the cursor points at an entry.
+func (c *RevCursor) Valid() bool { return c.n != nil && c.err == nil && c.i >= 0 }
+
+// Err returns the first error encountered.
+func (c *RevCursor) Err() error { return c.err }
+
+// Key returns the current key. It must not be modified.
+func (c *RevCursor) Key() []byte { return c.n.keys[c.i] }
+
+// Value returns the current value.
+func (c *RevCursor) Value() ([]byte, error) { return c.t.readValue(c.n.vals[c.i]) }
+
+// Prev moves to the previous entry.
+func (c *RevCursor) Prev() {
+	if c.n == nil {
+		return
+	}
+	c.i--
+	for c.i < 0 {
+		// Climb to the nearest ancestor with a left sibling subtree.
+		for len(c.stack) > 0 && c.stack[len(c.stack)-1].ci == 0 {
+			c.stack = c.stack[:len(c.stack)-1]
+		}
+		if len(c.stack) == 0 {
+			c.n = nil
+			return
+		}
+		top := &c.stack[len(c.stack)-1]
+		top.ci--
+		pg := top.n.children[top.ci]
+		// Descend along the rightmost path.
+		for {
+			n, err := c.t.load(pg)
+			if err != nil {
+				c.err, c.n = err, nil
+				return
+			}
+			if n.leaf {
+				c.n, c.i = n, len(n.keys)-1
+				break
+			}
+			c.stack = append(c.stack, revFrame{n, len(n.children) - 1})
+			pg = n.children[len(n.children)-1]
+		}
+	}
+}
+
+// Estimate returns an approximate number of entries: the fan-out of the
+// nodes on the path to a middle leaf, multiplied together and by the size of
+// that leaf. It reads one page per level. Exact for single-leaf trees.
+func (t *Tree) Estimate() (int64, error) {
+	est := int64(1)
+	pg := t.root
+	for depth := 0; depth < 64; depth++ {
+		n, err := t.load(pg)
+		if err != nil {
+			return 0, err
+		}
+		if n.leaf {
+			return est * int64(len(n.keys)), nil
+		}
+		est *= int64(len(n.children))
+		pg = n.children[len(n.children)/2]
+	}
+	return 0, errBadPage
 }

@@ -19,8 +19,23 @@ func open(t *testing.T) *DB {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { db.Close() })
+	t.Cleanup(func() {
+		checkIntegrity(t, db)
+		db.Close()
+	})
 	return db
+}
+
+// checkIntegrity fails the test if the database has any structural problem.
+func checkIntegrity(t *testing.T, db *DB) {
+	t.Helper()
+	problems, err := db.IntegrityCheck()
+	if err != nil {
+		t.Errorf("integrity check: %v", err)
+	}
+	for _, p := range problems {
+		t.Errorf("integrity: %s", p)
+	}
 }
 
 func exec(t *testing.T, db *DB, q string, args ...any) Result {
@@ -249,6 +264,27 @@ func TestRowidAndAutoincrement(t *testing.T) {
 	if r.LastInsertID != 101 {
 		t.Fatalf("id after explicit 100 = %d", r.LastInsertID)
 	}
+	// AUTOINCREMENT never reuses the id of a deleted maximum row, also
+	// across transactions and after reopening.
+	exec(t, db, `CREATE TABLE a (id INTEGER PRIMARY KEY AUTOINCREMENT, v TEXT)`)
+	exec(t, db, `INSERT INTO a (v) VALUES ('1'), ('2'), ('3')`)
+	exec(t, db, `DELETE FROM a WHERE id = 3`)
+	if r := exec(t, db, `INSERT INTO a (v) VALUES ('4')`); r.LastInsertID != 4 {
+		t.Fatalf("AUTOINCREMENT reused id: %d", r.LastInsertID)
+	}
+	exec(t, db, `DELETE FROM a`)
+	if r := exec(t, db, `INSERT INTO a (v) VALUES ('5')`); r.LastInsertID != 5 {
+		t.Fatalf("AUTOINCREMENT after delete-all: %d", r.LastInsertID)
+	}
+	// Plain INTEGER PRIMARY KEY may reuse (documented, like SQLite).
+	exec(t, db, `DELETE FROM t WHERE id = 101`)
+	if r := exec(t, db, `INSERT INTO t (v) VALUES ('x')`); r.LastInsertID != 101 {
+		t.Fatalf("rowid table: %d", r.LastInsertID)
+	}
+	exec(t, db, `DROP TABLE a; CREATE TABLE a (id INTEGER PRIMARY KEY AUTOINCREMENT, v TEXT)`)
+	if r := exec(t, db, `INSERT INTO a (v) VALUES ('fresh')`); r.LastInsertID != 1 {
+		t.Fatalf("dropped table kept its sequence: %d", r.LastInsertID)
+	}
 	exec(t, db, `INSERT INTO n VALUES ('x'), ('y')`)
 	expect(t, db, `SELECT rowid, v FROM n ORDER BY rowid DESC`, "2|y;1|x")
 	expect(t, db, `SELECT * FROM n`, "x;y")
@@ -338,6 +374,7 @@ func TestTransactions(t *testing.T) {
 }
 
 func TestPersistenceAndLargeValues(t *testing.T) {
+	durableOnly(t)
 	path := filepath.Join(t.TempDir(), "p.db")
 	db, err := Open(path)
 	if err != nil {
@@ -378,6 +415,7 @@ func TestPersistenceAndLargeValues(t *testing.T) {
 		t.Fatalf("blob = %v", data)
 	}
 	expect(t, db, `SELECT COUNT(*) FROM docs WHERE title >= 'title-1990' AND title < 'title-2000'`, "10")
+	checkIntegrity(t, db)
 
 	// Dropping and recreating reuses freed pages instead of growing the file.
 	pagesBefore := db.Engine().PageCount()
@@ -565,4 +603,11 @@ func randArg(rng *rand.Rand, col string, randVal func(string) any) any {
 		return int64(rng.Intn(700))
 	}
 	return randVal(col)
+}
+
+func TestSelectWithoutFrom(t *testing.T) {
+	db := open(t)
+	expect(t, db, `SELECT 1 WHERE 0`, "")
+	expect(t, db, `SELECT 'yes' WHERE 1 = 1`, "yes")
+	expect(t, db, `SELECT COUNT(*) WHERE 0`, "0")
 }

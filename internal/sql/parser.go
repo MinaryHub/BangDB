@@ -11,11 +11,26 @@ import (
 // the number of '?' placeholders. Parameter indexes are numbered across the
 // whole script.
 func Parse(src string) ([]Stmt, int, error) {
+	stmts, names, err := ParseNamed(src)
+	return stmts, len(names), err
+}
+
+// ParseNamed is Parse that also returns, for every argument slot, the name
+// of its placeholder ("" for positional ones).
+func ParseNamed(src string) ([]Stmt, []string, error) {
+	stmts, p, err := parseAll(src)
+	if err != nil {
+		return nil, nil, err
+	}
+	return stmts, p.names, nil
+}
+
+func parseAll(src string) ([]Stmt, *parser, error) {
 	toks, err := lex(src)
 	if err != nil {
-		return nil, 0, err
+		return nil, nil, err
 	}
-	p := &parser{toks: toks}
+	p := &parser{toks: toks, src: src}
 	var stmts []Stmt
 	for {
 		for p.acceptOp(";") {
@@ -25,20 +40,50 @@ func Parse(src string) ([]Stmt, int, error) {
 		}
 		s, err := p.parseStmt()
 		if err != nil {
-			return nil, 0, err
+			return nil, nil, err
 		}
 		stmts = append(stmts, s)
 		if !p.acceptOp(";") && p.peek().kind != tEOF {
-			return nil, 0, p.errf("expected ';' or end of input")
+			return nil, nil, p.errf("expected ';' or end of input")
 		}
 	}
-	return stmts, p.params, nil
+	return stmts, p, nil
 }
 
 type parser struct {
-	toks   []token
-	pos    int
-	params int
+	src   string
+	toks  []token
+	pos   int
+	names []string // per argument slot: placeholder name or ""
+}
+
+// param assigns the argument slot of a placeholder token.
+func (p *parser) param(t token) (*Param, error) {
+	text := t.text
+	if text == "?" {
+		p.names = append(p.names, "")
+		return &Param{Index: len(p.names) - 1}, nil
+	}
+	body := text[1:]
+	if n, err := strconv.Atoi(body); err == nil && (text[0] == '?' || text[0] == '$') {
+		if n < 1 || n > 1000 {
+			return nil, &SyntaxError{t.pos, "parameter number out of range: " + text}
+		}
+		for len(p.names) < n {
+			p.names = append(p.names, "")
+		}
+		return &Param{Index: n - 1}, nil
+	}
+	if text[0] == '?' {
+		return nil, &SyntaxError{t.pos, "invalid parameter " + text}
+	}
+	for i, name := range p.names {
+		if strings.EqualFold(name, body) {
+			return &Param{Index: i, Name: body}, nil
+		}
+	}
+	p.names = append(p.names, body)
+	return &Param{Index: len(p.names) - 1, Name: body}, nil
 }
 
 // reserved words that cannot be used as bare aliases.
@@ -48,7 +93,8 @@ var reserved = map[string]bool{
 	"OUTER": true, "ON": true, "AND": true, "OR": true, "NOT": true, "AS": true, "SET": true,
 	"VALUES": true, "UNION": true, "BY": true, "ASC": true, "DESC": true, "IS": true, "IN": true,
 	"LIKE": true, "BETWEEN": true, "NULL": true, "CASE": true, "WHEN": true, "THEN": true,
-	"ELSE": true, "END": true, "DISTINCT": true, "INTO": true,
+	"ELSE": true, "END": true, "DISTINCT": true, "INTO": true, "RETURNING": true,
+	"INTERSECT": true, "EXCEPT": true, "EXISTS": true, "COLLATE": true,
 }
 
 func (p *parser) peek() token { return p.toks[p.pos] }
@@ -127,14 +173,45 @@ func (p *parser) ident() (string, error) {
 	return "", p.errf("expected identifier")
 }
 
+// parseOptions parses "(name = value, ...)": values are identifiers,
+// strings or numbers.
+func (p *parser) parseOptions() (map[string]string, error) {
+	if err := p.expectOp("("); err != nil {
+		return nil, err
+	}
+	opts := map[string]string{}
+	for {
+		name, err := p.ident()
+		if err != nil {
+			return nil, err
+		}
+		if err := p.expectOp("="); err != nil {
+			return nil, err
+		}
+		t := p.peek()
+		switch t.kind {
+		case tIdent, tQuotedIdent, tString, tNumber:
+			p.pos++
+		default:
+			return nil, p.errf("expected an option value")
+		}
+		opts[strings.ToLower(name)] = t.text
+		if !p.acceptOp(",") {
+			break
+		}
+	}
+	return opts, p.expectOp(")")
+}
+
 func (p *parser) parseStmt() (Stmt, error) {
 	switch {
 	case p.acceptKw("EXPLAIN"):
+		analyze := p.acceptKw("ANALYZE")
 		s, err := p.parseStmt()
 		if err != nil {
 			return nil, err
 		}
-		return &Explain{Stmt: s}, nil
+		return &Explain{Stmt: s, Analyze: analyze}, nil
 	case p.isKw("SELECT"):
 		return p.parseSelect()
 	case p.acceptKw("INSERT"):
@@ -155,6 +232,14 @@ func (p *parser) parseStmt() (Stmt, error) {
 	case p.acceptKw("COMMIT"), p.acceptKw("END"):
 		p.acceptKw("TRANSACTION")
 		return &Commit{}, nil
+	case p.acceptKw("VACUUM"):
+		return &Vacuum{}, nil
+	case p.acceptKw("ANALYZE"):
+		st := &Analyze{}
+		if t := p.peek(); t.kind == tIdent || t.kind == tQuotedIdent {
+			st.Table = p.next().text
+		}
+		return st, nil
 	case p.acceptKw("ROLLBACK"):
 		p.acceptKw("TRANSACTION")
 		return &Rollback{}, nil
@@ -174,34 +259,47 @@ func (p *parser) parseCreate() (Stmt, error) {
 			return nil, err
 		}
 		for {
-			if p.isKw("PRIMARY") {
-				// Table constraint: PRIMARY KEY (col)
-				p.next()
-				if err := p.expectKw("KEY"); err != nil {
+			if p.acceptKw("CONSTRAINT") {
+				if _, err := p.ident(); err != nil {
 					return nil, err
 				}
-				if err := p.expectOp("("); err != nil {
-					return nil, err
+			}
+			if p.acceptKw("PRIMARY", "KEY") {
+				if ct.PrimaryKey != nil {
+					return nil, p.errf("more than one PRIMARY KEY constraint")
 				}
-				col, err := p.ident()
+				cols, err := p.parseColumnList()
 				if err != nil {
 					return nil, err
 				}
-				if p.acceptOp(",") {
-					return nil, p.errf("composite primary keys are not supported")
-				}
-				if err := p.expectOp(")"); err != nil {
+				ct.PrimaryKey = cols
+			} else if p.isKw("UNIQUE") && p.peekAt(1).kind == tOp && p.peekAt(1).text == "(" {
+				p.next()
+				cols, err := p.parseColumnList()
+				if err != nil {
 					return nil, err
 				}
-				found := false
-				for i := range ct.Columns {
-					if strings.EqualFold(ct.Columns[i].Name, col) {
-						ct.Columns[i].PrimaryKey, found = true, true
-					}
+				ct.Uniques = append(ct.Uniques, cols)
+			} else if p.acceptKw("CHECK") {
+				e, err := p.parseParenExpr()
+				if err != nil {
+					return nil, err
 				}
-				if !found {
-					return nil, fmt.Errorf("bangdb: unknown column %q in PRIMARY KEY", col)
+				ct.Checks = append(ct.Checks, e)
+			} else if p.acceptKw("FOREIGN", "KEY") {
+				cols, err := p.parseColumnList()
+				if err != nil {
+					return nil, err
 				}
+				if err := p.expectKw("REFERENCES"); err != nil {
+					return nil, err
+				}
+				fk, err := p.parseReferences()
+				if err != nil {
+					return nil, err
+				}
+				fk.Columns = cols
+				ct.ForeignKeys = append(ct.ForeignKeys, *fk)
 			} else {
 				cd, err := p.parseColumnDef()
 				if err != nil {
@@ -216,7 +314,38 @@ func (p *parser) parseCreate() (Stmt, error) {
 		if err := p.expectOp(")"); err != nil {
 			return nil, err
 		}
+		if p.acceptKw("USING") {
+			if ct.Using, err = p.ident(); err != nil {
+				return nil, err
+			}
+			if p.acceptKw("WITH") {
+				if ct.UsingOptions, err = p.parseOptions(); err != nil {
+					return nil, err
+				}
+			}
+		}
 		return ct, nil
+	}
+	if p.acceptKw("VIEW") {
+		cv := &CreateView{IfNotExists: p.acceptKw("IF", "NOT", "EXISTS")}
+		var err error
+		if cv.Name, err = p.ident(); err != nil {
+			return nil, err
+		}
+		if p.peek().kind == tOp && p.peek().text == "(" {
+			if cv.Columns, err = p.parseColumnList(); err != nil {
+				return nil, err
+			}
+		}
+		if err := p.expectKw("AS"); err != nil {
+			return nil, err
+		}
+		start := p.peek().pos
+		if cv.Select, err = p.parseSelect(); err != nil {
+			return nil, err
+		}
+		cv.SQL = strings.TrimSpace(p.src[start:p.peek().pos])
+		return cv, nil
 	}
 	unique := p.acceptKw("UNIQUE")
 	if p.acceptKw("INDEX") {
@@ -232,21 +361,35 @@ func (p *parser) parseCreate() (Stmt, error) {
 		if ci.Table, err = p.ident(); err != nil {
 			return nil, err
 		}
-		if err := p.expectOp("("); err != nil {
-			return nil, err
-		}
-		if ci.Column, err = p.ident(); err != nil {
-			return nil, err
-		}
-		if p.acceptOp(",") {
-			return nil, p.errf("multi-column indexes are not supported")
-		}
-		if err := p.expectOp(")"); err != nil {
+		if ci.Columns, err = p.parseColumnList(); err != nil {
 			return nil, err
 		}
 		return ci, nil
 	}
 	return nil, p.errf("expected TABLE or INDEX")
+}
+
+// parseColumnList parses "(a [ASC|DESC], b, ...)". Sort directions are
+// accepted for compatibility and ignored.
+func (p *parser) parseColumnList() ([]string, error) {
+	if err := p.expectOp("("); err != nil {
+		return nil, err
+	}
+	var cols []string
+	for {
+		c, err := p.ident()
+		if err != nil {
+			return nil, err
+		}
+		cols = append(cols, c)
+		if !p.acceptKw("ASC") {
+			p.acceptKw("DESC")
+		}
+		if !p.acceptOp(",") {
+			break
+		}
+	}
+	return cols, p.expectOp(")")
 }
 
 func (p *parser) parseColumnDef() (ColumnDef, error) {
@@ -260,15 +403,21 @@ func (p *parser) parseColumnDef() (ColumnDef, error) {
 	for p.peek().kind == tIdent && !isConstraintKw(p.peek().text) {
 		typ = append(typ, p.next().text)
 	}
+	size := ""
 	if len(typ) > 0 && p.acceptOp("(") {
+		var parts []string
 		for !p.acceptOp(")") {
-			if p.peek().kind == tEOF {
+			t := p.next()
+			if t.kind == tEOF {
 				return cd, p.errf("unterminated type")
 			}
-			p.next()
+			if t.text != "," {
+				parts = append(parts, t.text)
+			}
 		}
+		size = "(" + strings.Join(parts, ",") + ")"
 	}
-	cd.Type = strings.ToUpper(strings.Join(typ, " "))
+	cd.Type = strings.ToUpper(strings.Join(typ, " ")) + size
 	for {
 		switch {
 		case p.acceptKw("PRIMARY", "KEY"):
@@ -285,6 +434,24 @@ func (p *parser) parseColumnDef() (ColumnDef, error) {
 		case p.acceptKw("NULL"):
 		case p.acceptKw("UNIQUE"):
 			cd.Unique = true
+		case p.acceptKw("COLLATE"):
+			name, err := p.collationName()
+			if err != nil {
+				return cd, err
+			}
+			cd.Collate = name
+		case p.acceptKw("CHECK"):
+			e, err := p.parseParenExpr()
+			if err != nil {
+				return cd, err
+			}
+			cd.Check = e
+		case p.acceptKw("REFERENCES"):
+			fk, err := p.parseReferences()
+			if err != nil {
+				return cd, err
+			}
+			cd.References = fk
 		case p.acceptKw("DEFAULT"):
 			if p.acceptOp("(") {
 				e, err := p.parseExpr()
@@ -310,7 +477,7 @@ func (p *parser) parseColumnDef() (ColumnDef, error) {
 
 func isConstraintKw(s string) bool {
 	switch strings.ToUpper(s) {
-	case "PRIMARY", "NOT", "NULL", "UNIQUE", "DEFAULT", "AUTOINCREMENT", "AUTO_INCREMENT", "CONSTRAINT", "CHECK", "REFERENCES":
+	case "PRIMARY", "NOT", "NULL", "UNIQUE", "DEFAULT", "AUTOINCREMENT", "AUTO_INCREMENT", "CONSTRAINT", "CHECK", "REFERENCES", "COLLATE":
 		return true
 	}
 	return false
@@ -329,7 +496,64 @@ func (p *parser) parseDrop() (Stmt, error) {
 		d.Name, err = p.ident()
 		return d, err
 	}
-	return nil, p.errf("expected TABLE or INDEX")
+	if p.acceptKw("VIEW") {
+		d := &DropView{IfExists: p.acceptKw("IF", "EXISTS")}
+		var err error
+		d.Name, err = p.ident()
+		return d, err
+	}
+	return nil, p.errf("expected TABLE, INDEX or VIEW")
+}
+
+// parseParenExpr parses "( expr )".
+func (p *parser) parseParenExpr() (Expr, error) {
+	if err := p.expectOp("("); err != nil {
+		return nil, err
+	}
+	e, err := p.parseExpr()
+	if err != nil {
+		return nil, err
+	}
+	return e, p.expectOp(")")
+}
+
+// parseReferences parses "table [(cols)] [ON DELETE action] [ON UPDATE
+// action]" after REFERENCES.
+func (p *parser) parseReferences() (*ForeignKey, error) {
+	fk := &ForeignKey{}
+	var err error
+	if fk.RefTable, err = p.ident(); err != nil {
+		return nil, err
+	}
+	if p.peek().kind == tOp && p.peek().text == "(" {
+		if fk.RefColumns, err = p.parseColumnList(); err != nil {
+			return nil, err
+		}
+	}
+	for p.acceptKw("ON") {
+		var target *string
+		switch {
+		case p.acceptKw("DELETE"):
+			target = &fk.OnDelete
+		case p.acceptKw("UPDATE"):
+			target = &fk.OnUpdate
+		default:
+			return nil, p.errf("expected DELETE or UPDATE")
+		}
+		switch {
+		case p.acceptKw("CASCADE"):
+			*target = "CASCADE"
+		case p.acceptKw("RESTRICT"):
+			*target = "RESTRICT"
+		case p.acceptKw("NO", "ACTION"):
+			*target = "NO ACTION"
+		case p.acceptKw("SET", "NULL"):
+			*target = "SET NULL"
+		default:
+			return nil, p.errf("expected CASCADE, RESTRICT, NO ACTION or SET NULL")
+		}
+	}
+	return fk, nil
 }
 
 func (p *parser) parseAlter() (Stmt, error) {
@@ -340,138 +564,123 @@ func (p *parser) parseAlter() (Stmt, error) {
 	if err != nil {
 		return nil, err
 	}
-	if err := p.expectKw("ADD"); err != nil {
-		return nil, err
+	switch {
+	case p.acceptKw("ADD"):
+		p.acceptKw("COLUMN")
+		cd, err := p.parseColumnDef()
+		if err != nil {
+			return nil, err
+		}
+		return &AlterTableAddColumn{Table: name, Column: cd}, nil
+	case p.acceptKw("DROP"):
+		p.acceptKw("COLUMN")
+		col, err := p.ident()
+		return &AlterTableDropColumn{Table: name, Column: col}, err
+	case p.acceptKw("RENAME"):
+		if p.acceptKw("TO") {
+			n, err := p.ident()
+			return &AlterTableRename{Table: name, NewName: n}, err
+		}
+		p.acceptKw("COLUMN")
+		old, err := p.ident()
+		if err != nil {
+			return nil, err
+		}
+		if err := p.expectKw("TO"); err != nil {
+			return nil, err
+		}
+		n, err := p.ident()
+		return &AlterTableRenameColumn{Table: name, Old: old, New: n}, err
 	}
-	p.acceptKw("COLUMN")
-	cd, err := p.parseColumnDef()
-	if err != nil {
-		return nil, err
-	}
-	return &AlterTableAddColumn{Table: name, Column: cd}, nil
+	return nil, p.errf("expected ADD, DROP or RENAME")
 }
 
 func (p *parser) parseInsert() (Stmt, error) {
+	ins := &Insert{}
+	if p.acceptKw("OR") {
+		switch {
+		case p.acceptKw("IGNORE"):
+			ins.Or = "IGNORE"
+		case p.acceptKw("REPLACE"):
+			ins.Or = "REPLACE"
+		default:
+			return nil, p.errf("expected IGNORE or REPLACE")
+		}
+	}
 	if err := p.expectKw("INTO"); err != nil {
 		return nil, err
 	}
-	ins := &Insert{}
 	var err error
 	if ins.Table, err = p.ident(); err != nil {
 		return nil, err
 	}
-	if p.acceptOp("(") {
+	if p.peek().kind == tOp && p.peek().text == "(" {
+		if ins.Columns, err = p.parseColumnList(); err != nil {
+			return nil, err
+		}
+	}
+	if p.isKw("SELECT") {
+		if ins.Select, err = p.parseSelect(); err != nil {
+			return nil, err
+		}
+	} else {
+		if err := p.expectKw("VALUES"); err != nil {
+			return nil, err
+		}
 		for {
-			c, err := p.ident()
+			if err := p.expectOp("("); err != nil {
+				return nil, err
+			}
+			row, err := p.parseExprList()
 			if err != nil {
 				return nil, err
 			}
-			ins.Columns = append(ins.Columns, c)
+			if err := p.expectOp(")"); err != nil {
+				return nil, err
+			}
+			ins.Rows = append(ins.Rows, row)
 			if !p.acceptOp(",") {
 				break
 			}
 		}
-		if err := p.expectOp(")"); err != nil {
-			return nil, err
-		}
 	}
-	if err := p.expectKw("VALUES"); err != nil {
-		return nil, err
+	if p.acceptKw("ON", "CONFLICT") {
+		if ins.Or != "" {
+			return nil, p.errf("INSERT OR %s cannot be combined with ON CONFLICT", ins.Or)
+		}
+		oc := &OnConflict{}
+		if p.peek().kind == tOp && p.peek().text == "(" {
+			if oc.Target, err = p.parseColumnList(); err != nil {
+				return nil, err
+			}
+		}
+		if err := p.expectKw("DO"); err != nil {
+			return nil, err
+		}
+		if p.acceptKw("NOTHING") {
+			oc.DoNothing = true
+		} else {
+			if err := p.expectKw("UPDATE", "SET"); err != nil {
+				return nil, err
+			}
+			if oc.Sets, err = p.parseAssignments(); err != nil {
+				return nil, err
+			}
+			if p.acceptKw("WHERE") {
+				if oc.Where, err = p.parseExpr(); err != nil {
+					return nil, err
+				}
+			}
+		}
+		ins.OnConflict = oc
 	}
-	for {
-		if err := p.expectOp("("); err != nil {
-			return nil, err
-		}
-		row, err := p.parseExprList()
-		if err != nil {
-			return nil, err
-		}
-		if err := p.expectOp(")"); err != nil {
-			return nil, err
-		}
-		ins.Rows = append(ins.Rows, row)
-		if !p.acceptOp(",") {
-			break
-		}
-	}
-	return ins, nil
+	ins.Returning, err = p.parseReturning()
+	return ins, err
 }
 
-func (p *parser) parseUpdate() (Stmt, error) {
-	up := &Update{}
-	var err error
-	if up.Table, err = p.ident(); err != nil {
-		return nil, err
-	}
-	if err := p.expectKw("SET"); err != nil {
-		return nil, err
-	}
-	for {
-		col, err := p.ident()
-		if err != nil {
-			return nil, err
-		}
-		if err := p.expectOp("="); err != nil {
-			return nil, err
-		}
-		e, err := p.parseExpr()
-		if err != nil {
-			return nil, err
-		}
-		up.Sets = append(up.Sets, Assignment{col, e})
-		if !p.acceptOp(",") {
-			break
-		}
-	}
-	if p.acceptKw("WHERE") {
-		if up.Where, err = p.parseExpr(); err != nil {
-			return nil, err
-		}
-	}
-	return up, nil
-}
-
-func (p *parser) parseDelete() (Stmt, error) {
-	if err := p.expectKw("FROM"); err != nil {
-		return nil, err
-	}
-	d := &Delete{}
-	var err error
-	if d.Table, err = p.ident(); err != nil {
-		return nil, err
-	}
-	if p.acceptKw("WHERE") {
-		if d.Where, err = p.parseExpr(); err != nil {
-			return nil, err
-		}
-	}
-	return d, nil
-}
-
-func (p *parser) parseTableRef() (TableRef, error) {
-	var tr TableRef
-	var err error
-	if tr.Name, err = p.ident(); err != nil {
-		return tr, err
-	}
-	if p.acceptKw("AS") {
-		tr.Alias, err = p.ident()
-	} else if t := p.peek(); t.kind == tQuotedIdent || t.kind == tIdent && !reserved[strings.ToUpper(t.text)] {
-		tr.Alias, err = p.ident()
-	}
-	return tr, err
-}
-
-func (p *parser) parseSelect() (*Select, error) {
-	if err := p.expectKw("SELECT"); err != nil {
-		return nil, err
-	}
-	s := &Select{}
-	if p.acceptKw("DISTINCT") {
-		s.Distinct = true
-	} else {
-		p.acceptKw("ALL")
-	}
+// parseSelectItems parses a select list (also used by RETURNING).
+func (p *parser) parseSelectItems() ([]SelectItem, error) {
+	var items []SelectItem
 	for {
 		var item SelectItem
 		switch {
@@ -499,11 +708,158 @@ func (p *parser) parseSelect() (*Select, error) {
 				item.Alias, _ = p.ident()
 			}
 		}
-		s.Items = append(s.Items, item)
+		items = append(items, item)
 		if !p.acceptOp(",") {
-			break
+			return items, nil
 		}
 	}
+}
+
+// parseReturning parses an optional RETURNING clause.
+func (p *parser) parseReturning() ([]SelectItem, error) {
+	if !p.acceptKw("RETURNING") {
+		return nil, nil
+	}
+	return p.parseSelectItems()
+}
+
+func (p *parser) parseAssignments() ([]Assignment, error) {
+	var sets []Assignment
+	for {
+		col, err := p.ident()
+		if err != nil {
+			return nil, err
+		}
+		if err := p.expectOp("="); err != nil {
+			return nil, err
+		}
+		e, err := p.parseExpr()
+		if err != nil {
+			return nil, err
+		}
+		sets = append(sets, Assignment{col, e})
+		if !p.acceptOp(",") {
+			return sets, nil
+		}
+	}
+}
+
+func (p *parser) parseUpdate() (Stmt, error) {
+	up := &Update{}
+	var err error
+	if up.Table, err = p.ident(); err != nil {
+		return nil, err
+	}
+	if err := p.expectKw("SET"); err != nil {
+		return nil, err
+	}
+	if up.Sets, err = p.parseAssignments(); err != nil {
+		return nil, err
+	}
+	if p.acceptKw("WHERE") {
+		if up.Where, err = p.parseExpr(); err != nil {
+			return nil, err
+		}
+	}
+	up.Returning, err = p.parseReturning()
+	return up, err
+}
+
+func (p *parser) parseDelete() (Stmt, error) {
+	if err := p.expectKw("FROM"); err != nil {
+		return nil, err
+	}
+	d := &Delete{}
+	var err error
+	if d.Table, err = p.ident(); err != nil {
+		return nil, err
+	}
+	if p.acceptKw("WHERE") {
+		if d.Where, err = p.parseExpr(); err != nil {
+			return nil, err
+		}
+	}
+	d.Returning, err = p.parseReturning()
+	return d, err
+}
+
+func (p *parser) parseTableRef() (TableRef, error) {
+	var tr TableRef
+	var err error
+	if p.peek().kind == tOp && p.peek().text == "(" {
+		p.next()
+		if tr.Sub, err = p.parseSelect(); err != nil {
+			return tr, err
+		}
+		if err := p.expectOp(")"); err != nil {
+			return tr, err
+		}
+		p.acceptKw("AS")
+		if tr.Alias, err = p.ident(); err != nil {
+			return tr, p.errf("a subquery in FROM needs an alias")
+		}
+		tr.Name = tr.Alias
+		return tr, nil
+	}
+	if tr.Name, err = p.ident(); err != nil {
+		return tr, err
+	}
+	if p.acceptKw("AS") {
+		tr.Alias, err = p.ident()
+	} else if t := p.peek(); t.kind == tQuotedIdent || t.kind == tIdent && !reserved[strings.ToUpper(t.text)] {
+		tr.Alias, err = p.ident()
+	}
+	return tr, err
+}
+
+// parseSelect parses a full SELECT: one or more cores combined with set
+// operators, then ORDER BY / LIMIT / OFFSET.
+func (p *parser) parseSelect() (*Select, error) {
+	s, err := p.parseSelectCore()
+	if err != nil {
+		return nil, err
+	}
+	for {
+		var op string
+		switch {
+		case p.acceptKw("UNION", "ALL"):
+			op = "UNION ALL"
+		case p.acceptKw("UNION"):
+			op = "UNION"
+		case p.acceptKw("INTERSECT"):
+			op = "INTERSECT"
+		case p.acceptKw("EXCEPT"):
+			op = "EXCEPT"
+		}
+		if op == "" {
+			break
+		}
+		next, err := p.parseSelectCore()
+		if err != nil {
+			return nil, err
+		}
+		s.Compound = append(s.Compound, SetOp{op, next})
+	}
+	return s, p.parseOrderLimit(s)
+}
+
+// parseSelectCore parses SELECT ... [FROM ...] [WHERE ...] [GROUP BY ...]
+// [HAVING ...].
+func (p *parser) parseSelectCore() (*Select, error) {
+	if err := p.expectKw("SELECT"); err != nil {
+		return nil, err
+	}
+	s := &Select{}
+	if p.acceptKw("DISTINCT") {
+		s.Distinct = true
+	} else {
+		p.acceptKw("ALL")
+	}
+	items, err := p.parseSelectItems()
+	if err != nil {
+		return nil, err
+	}
+	s.Items = items
 	if p.acceptKw("FROM") {
 		tr, err := p.parseTableRef()
 		if err != nil {
@@ -534,7 +890,6 @@ func (p *parser) parseSelect() (*Select, error) {
 		}
 	doneJoins:
 	}
-	var err error
 	if p.acceptKw("WHERE") {
 		if s.Where, err = p.parseExpr(); err != nil {
 			return nil, err
@@ -550,11 +905,16 @@ func (p *parser) parseSelect() (*Select, error) {
 			return nil, err
 		}
 	}
+	return s, nil
+}
+
+func (p *parser) parseOrderLimit(s *Select) error {
+	var err error
 	if p.acceptKw("ORDER", "BY") {
 		for {
 			e, err := p.parseExpr()
 			if err != nil {
-				return nil, err
+				return err
 			}
 			oi := OrderItem{Expr: e}
 			if p.acceptKw("DESC") {
@@ -570,20 +930,20 @@ func (p *parser) parseSelect() (*Select, error) {
 	}
 	if p.acceptKw("LIMIT") {
 		if s.Limit, err = p.parseExpr(); err != nil {
-			return nil, err
+			return err
 		}
 		if p.acceptKw("OFFSET") {
 			if s.Offset, err = p.parseExpr(); err != nil {
-				return nil, err
+				return err
 			}
 		} else if p.acceptOp(",") { // LIMIT offset, count
 			s.Offset = s.Limit
 			if s.Limit, err = p.parseExpr(); err != nil {
-				return nil, err
+				return err
 			}
 		}
 	}
-	return s, nil
+	return nil
 }
 
 func (p *parser) parseExprList() ([]Expr, error) {
@@ -689,6 +1049,17 @@ func (p *parser) parseComparison() (Expr, error) {
 			if err := p.expectOp("("); err != nil {
 				return nil, err
 			}
+			if p.isKw("SELECT") {
+				sub, err := p.parseSelect()
+				if err != nil {
+					return nil, err
+				}
+				if err := p.expectOp(")"); err != nil {
+					return nil, err
+				}
+				l = &In{X: l, Sub: sub, Not: not}
+				continue
+			}
 			list, err := p.parseExprList()
 			if err != nil {
 				return nil, err
@@ -696,7 +1067,7 @@ func (p *parser) parseComparison() (Expr, error) {
 			if err := p.expectOp(")"); err != nil {
 				return nil, err
 			}
-			l = &In{l, list, not}
+			l = &In{X: l, List: list, Not: not}
 		case p.acceptKw("LIKE"):
 			r, err := p.parseAdditive()
 			if err != nil {
@@ -765,14 +1136,24 @@ func (p *parser) parseConcat() (Expr, error) {
 	if err != nil {
 		return nil, err
 	}
-	for p.acceptOp("||") {
+	for {
+		var op string
+		switch {
+		case p.acceptOp("||"):
+			op = "||"
+		case p.acceptOp("->"):
+			op = "->"
+		case p.acceptOp("->>"):
+			op = "->>"
+		default:
+			return l, nil
+		}
 		r, err := p.parseUnary()
 		if err != nil {
 			return nil, err
 		}
-		l = &Binary{"||", l, r}
+		l = &Binary{op, l, r}
 	}
-	return l, nil
 }
 
 func (p *parser) parseUnary() (Expr, error) {
@@ -812,7 +1193,25 @@ func (p *parser) parseUnary() (Expr, error) {
 			return nil, p.errf("integer literal out of range")
 		}
 	}
+	for p.acceptKw("COLLATE") {
+		name, err := p.collationName()
+		if err != nil {
+			return nil, err
+		}
+		x = &Collate{X: x, Name: name}
+	}
 	return x, nil
+}
+
+// collationName parses a collation: NOCASE, RTRIM or BINARY.
+func (p *parser) collationName() (string, error) {
+	t := p.next()
+	name := strings.ToUpper(t.text)
+	switch name {
+	case "NOCASE", "RTRIM", "BINARY":
+		return name, nil
+	}
+	return "", &SyntaxError{t.pos, "unknown collation " + t.text + " (use NOCASE, RTRIM or BINARY)"}
 }
 
 func (p *parser) parsePrimary() (Expr, error) {
@@ -842,11 +1241,17 @@ func (p *parser) parsePrimary() (Expr, error) {
 		return &Literal{b}, nil
 	case tParam:
 		p.next()
-		p.params++
-		return &Param{p.params - 1}, nil
+		return p.param(t)
 	case tOp:
 		if t.text == "(" {
 			p.next()
+			if p.isKw("SELECT") {
+				sub, err := p.parseSelect()
+				if err != nil {
+					return nil, err
+				}
+				return &Subquery{sub}, p.expectOp(")")
+			}
 			e, err := p.parseExpr()
 			if err != nil {
 				return nil, err
@@ -874,6 +1279,16 @@ func (p *parser) parsePrimary() (Expr, error) {
 		case "CASE":
 			p.next()
 			return p.parseCase()
+		case "EXISTS":
+			p.next()
+			if err := p.expectOp("("); err != nil {
+				return nil, err
+			}
+			sub, err := p.parseSelect()
+			if err != nil {
+				return nil, err
+			}
+			return &Exists{Select: sub}, p.expectOp(")")
 		case "CAST":
 			p.next()
 			if err := p.expectOp("("); err != nil {
@@ -916,13 +1331,100 @@ func (p *parser) parsePrimary() (Expr, error) {
 				}
 				f.Args = args
 			} else {
-				return f, nil
+				return f, p.parseOver(f)
 			}
-			return f, p.expectOp(")")
+			if err := p.expectOp(")"); err != nil {
+				return nil, err
+			}
+			return f, p.parseOver(f)
 		}
 		return p.columnRest(t.text)
 	}
 	return nil, p.errf("expected expression")
+}
+
+// parseOver parses an optional OVER (PARTITION BY ... ORDER BY ... frame)
+// after a function call.
+func (p *parser) parseOver(f *Func) error {
+	if !p.acceptKw("OVER") {
+		return nil
+	}
+	if err := p.expectOp("("); err != nil {
+		return err
+	}
+	w := &Window{}
+	var err error
+	if p.acceptKw("PARTITION", "BY") {
+		if w.PartitionBy, err = p.parseExprList(); err != nil {
+			return err
+		}
+	}
+	if p.acceptKw("ORDER", "BY") {
+		for {
+			e, err := p.parseExpr()
+			if err != nil {
+				return err
+			}
+			oi := OrderItem{Expr: e}
+			if p.acceptKw("DESC") {
+				oi.Desc = true
+			} else {
+				p.acceptKw("ASC")
+			}
+			w.OrderBy = append(w.OrderBy, oi)
+			if !p.acceptOp(",") {
+				break
+			}
+		}
+	}
+	if rows, rng := p.isKw("ROWS"), p.isKw("RANGE"); rows || rng {
+		p.next()
+		fr := &Frame{Rows: rows}
+		if p.acceptKw("BETWEEN") {
+			if fr.Start, err = p.parseFrameBound(); err != nil {
+				return err
+			}
+			if err := p.expectKw("AND"); err != nil {
+				return err
+			}
+			if fr.End, err = p.parseFrameBound(); err != nil {
+				return err
+			}
+		} else {
+			if fr.Start, err = p.parseFrameBound(); err != nil {
+				return err
+			}
+			fr.End = FrameBound{Kind: CurrentRow}
+		}
+		if fr.Start.Kind == UnboundedFollowing || fr.End.Kind == UnboundedPreceding || fr.Start.Kind > fr.End.Kind {
+			return p.errf("invalid window frame")
+		}
+		w.Frame = fr
+	}
+	f.Over = w
+	return p.expectOp(")")
+}
+
+func (p *parser) parseFrameBound() (FrameBound, error) {
+	switch {
+	case p.acceptKw("UNBOUNDED", "PRECEDING"):
+		return FrameBound{Kind: UnboundedPreceding}, nil
+	case p.acceptKw("UNBOUNDED", "FOLLOWING"):
+		return FrameBound{Kind: UnboundedFollowing}, nil
+	case p.acceptKw("CURRENT", "ROW"):
+		return FrameBound{Kind: CurrentRow}, nil
+	}
+	n, err := p.parseAdditive()
+	if err != nil {
+		return FrameBound{}, err
+	}
+	switch {
+	case p.acceptKw("PRECEDING"):
+		return FrameBound{Kind: Preceding, N: n}, nil
+	case p.acceptKw("FOLLOWING"):
+		return FrameBound{Kind: Following, N: n}, nil
+	}
+	return FrameBound{}, p.errf("expected PRECEDING or FOLLOWING")
 }
 
 func (p *parser) columnRest(first string) (Expr, error) {
