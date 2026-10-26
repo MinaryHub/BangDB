@@ -17,7 +17,8 @@ Go로 작성된 **경량 임베디드 관계형 데이터베이스**입니다. �
 - 트랜잭션: `BEGIN/COMMIT/ROLLBACK`, 문장 단위 원자성, **스냅샷 읽기** — 읽기와 쓰기가 서로를 기다리지 않음
 - 스트리밍 결과 커서, `context` 기반 쿼리 취소·타임아웃, 그룹 커밋
 - **온라인 백업**(서비스 중단 없이 일관된 백업 파일 생성)과 **primary → replica 미러링**(읽기 스케일 아웃, 자동 재접속, 장애 조치 승격)
-- `database/sql` 드라이버(`bangdb`) 및 대화형 CLI 제공
+- `database/sql` 드라이버(`bangdb`) 및 대화형 CLI 제공, **서버 모드**(TCP/TLS, 인증, `bangdb://` DSN)
+- 운영: `db.Stats()`, 슬로우 쿼리 훅, `EXPLAIN ANALYZE`, SQL 덤프·SQLite 덤프 가져오기·CSV, **저장 데이터 암호화**(AES-256-XTS), 반동기 복제·펜싱·**특정 시점 복구(PITR)**
 
 ## 설치
 
@@ -124,6 +125,25 @@ r.Promote()               // 장애 조치: 쓰기 가능한 primary로 승격
 ```
 
 자세한 내용: [docs/REPLICATION.md](docs/REPLICATION.md)
+
+### 서버 모드 (여러 프로세스가 공유할 때)
+
+```go
+// 서버: DB를 연 프로세스가 TCP/TLS로 제공
+srv := server.New(db, server.Options{Password: "s3cret", MaxConns: 100, IdleTimeout: 10 * time.Minute})
+go srv.ListenAndServe("127.0.0.1:7432") // 또는 ListenAndServeTLS(addr, tlsConfig)
+
+// 클라이언트: 직접
+c, _ := client.Dial(ctx, "db.internal:7432", &client.Options{User: "app", Password: "s3cret"})
+rows, _ := c.Query(ctx, "SELECT id, name FROM users WHERE age > ?", 30)
+
+// 클라이언트: database/sql (커넥션 풀)
+sdb, _ := sql.Open("bangdb", "bangdb://app:s3cret@db.internal:7432?tls=1")
+```
+
+- 연결마다 세션 하나: `BEGIN/COMMIT`이 그대로 동작하고, 연결이 끊기면 열린 트랜잭션은 롤백됩니다. 결과는 스트리밍되며 `Rows.Close`나 `ctx` 취소가 서버의 실행 중인 문장을 중단합니다. 오류 종류는 유지됩니다(`errors.Is(err, bangdb.ErrConstraint)` 등).
+- 인증은 비밀번호 또는 `Options.Authenticate(user, password)` 콜백, 암호화는 TLS. 루프백 왕복 지연은 단건 조회 약 44 µs.
+- CLI: `bangdb -listen :7432 -password s3cret [-tls-cert c.pem -tls-key k.pem] app.db`, 원격 셸 `bangdb -connect bangdb://app:s3cret@host:7432`.
 
 ### 저장 데이터 암호화
 

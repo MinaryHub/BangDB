@@ -10,6 +10,7 @@ package main
 import (
 	"bufio"
 	"context"
+	"crypto/tls"
 	"flag"
 	"fmt"
 	"io"
@@ -22,20 +23,31 @@ import (
 	"unicode/utf8"
 
 	"github.com/knoxxr/bangdb"
+	"github.com/knoxxr/bangdb/client"
 	"github.com/knoxxr/bangdb/internal/engine"
 	"github.com/knoxxr/bangdb/internal/value"
 	"github.com/knoxxr/bangdb/replication"
+	"github.com/knoxxr/bangdb/server"
 )
 
 func main() {
 	serve := flag.String("serve", "", "serve replicas on this address (primary mode)")
 	replicaOf := flag.String("replica-of", "", "mirror the primary at this address (read-only replica)")
 	token := flag.String("token", "", "replication token")
+	listen := flag.String("listen", "", "serve the database to clients on this address (server mode)")
+	password := flag.String("password", "", "password clients must present (server mode)")
+	tlsCert := flag.String("tls-cert", "", "TLS certificate file (server mode)")
+	tlsKey := flag.String("tls-key", "", "TLS key file (server mode)")
+	connect := flag.String("connect", "", "run the shell against a server: bangdb://user:password@host:port")
 	flag.Usage = func() {
-		fmt.Fprintln(os.Stderr, "usage: bangdb [-serve addr | -replica-of addr] [-token t] [database] [sql...]")
+		fmt.Fprintln(os.Stderr, "usage: bangdb [-serve addr | -replica-of addr] [-token t] [-listen addr [-password p] [-tls-cert f -tls-key f]] [database] [sql...]")
+		fmt.Fprintln(os.Stderr, "       bangdb -connect bangdb://user:password@host:port [sql...]")
 		flag.PrintDefaults()
 	}
 	flag.Parse()
+	if *connect != "" {
+		os.Exit(remoteShell(*connect, flag.Args()))
+	}
 	path := ":memory:"
 	if flag.NArg() > 0 {
 		path = flag.Arg(0)
@@ -47,7 +59,29 @@ func main() {
 	}
 	defer pub.Close()
 	db := pub.Engine()
-	sh := &shell{db: db, conn: db.Conn(), out: os.Stdout}
+	sh := &shell{db: db, conn: localSession{db.Conn()}, out: os.Stdout}
+	if *listen != "" {
+		srv := server.New(pub, server.Options{Password: *password})
+		go func() {
+			var err error
+			if *tlsCert != "" {
+				cert, cerr := tls.LoadX509KeyPair(*tlsCert, *tlsKey)
+				if cerr != nil {
+					fmt.Fprintln(os.Stderr, "server:", cerr)
+					os.Exit(1)
+				}
+				err = srv.ListenAndServeTLS(*listen, &tls.Config{Certificates: []tls.Certificate{cert}})
+			} else {
+				err = srv.ListenAndServe(*listen)
+			}
+			if err != nil {
+				fmt.Fprintln(os.Stderr, "server:", err)
+				os.Exit(1)
+			}
+		}()
+		defer srv.Close()
+		fmt.Fprintf(os.Stderr, "serving clients on %s\n", *listen)
+	}
 	if *serve != "" {
 		p := replication.NewPrimary(pub, replication.PrimaryOptions{Token: *token})
 		go func() {
@@ -79,7 +113,7 @@ func main() {
 	}
 	sh.loop(os.Stdin, interactive)
 	sh.conn.Close()
-	if *serve != "" || *replicaOf != "" {
+	if *serve != "" || *replicaOf != "" || *listen != "" {
 		// Keep replicating after stdin is closed until interrupted.
 		sig := make(chan os.Signal, 1)
 		signal.Notify(sig, os.Interrupt, syscall.SIGTERM)
@@ -92,9 +126,60 @@ func isTerminal() bool {
 	return err == nil && st.Mode()&os.ModeCharDevice != 0
 }
 
+// session runs SQL for the shell: locally or on a server.
+type session interface {
+	Exec(src string) (engine.Result, error)
+	InTx() bool
+	Close() error
+}
+
+type localSession struct{ c *engine.Conn }
+
+func (l localSession) Exec(src string) (engine.Result, error) { return l.c.Exec(src) }
+func (l localSession) InTx() bool                             { return l.c.InTx() }
+func (l localSession) Close() error                           { return l.c.Close() }
+
+type remoteSession struct{ c *client.Conn }
+
+func (r remoteSession) Exec(src string) (engine.Result, error) {
+	res, err := r.c.Exec(context.Background(), src)
+	return engine.Result{Columns: res.Columns, Types: res.Types, Rows: res.Rows,
+		RowsAffected: res.RowsAffected, LastInsertID: res.LastInsertID}, err
+}
+func (r remoteSession) InTx() bool   { return r.c.InTx() }
+func (r remoteSession) Close() error { return r.c.Close() }
+
+// remoteShell runs the shell (SQL only) against a server.
+func remoteShell(dsn string, args []string) int {
+	addr, opts, err := client.ParseDSN(dsn)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return 1
+	}
+	c, err := client.Dial(context.Background(), addr, opts)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return 1
+	}
+	defer c.Close()
+	sh := &shell{conn: remoteSession{c}, out: os.Stdout}
+	if len(args) > 0 {
+		if !sh.run(strings.Join(args, " ")) {
+			return 1
+		}
+		return 0
+	}
+	interactive := isTerminal()
+	if interactive {
+		fmt.Printf("BangDB shell — %s\nEnter \".help\" for usage hints.\n", addr)
+	}
+	sh.loop(os.Stdin, interactive)
+	return 0
+}
+
 type shell struct {
-	db      *engine.DB
-	conn    *engine.Conn
+	db      *engine.DB // nil for a remote shell
+	conn    session
 	out     io.Writer
 	timer   bool
 	primary *replication.Primary
@@ -143,6 +228,14 @@ func (s *shell) loop(in io.Reader, interactive bool) {
 
 func (s *shell) command(cmd string) bool {
 	fields := strings.Fields(cmd)
+	switch fields[0] {
+	case ".quit", ".exit", ".help", ".timer":
+	default:
+		if s.db == nil {
+			fmt.Fprintf(s.out, "%s is not available on a remote connection\n", fields[0])
+			return true
+		}
+	}
 	switch fields[0] {
 	case ".quit", ".exit":
 		return false

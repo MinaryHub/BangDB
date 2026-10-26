@@ -6,6 +6,7 @@
 //	)
 //
 //	db, err := sql.Open("bangdb", "app.db") // or ":memory:"
+//	db, err := sql.Open("bangdb", "bangdb://user:password@host:7432") // a server (package server)
 //
 // All connections of one *sql.DB share a single engine instance, so an
 // in-memory database is visible to every connection of that *sql.DB.
@@ -20,6 +21,7 @@ import (
 	"reflect"
 	"strings"
 
+	"github.com/knoxxr/bangdb/client"
 	"github.com/knoxxr/bangdb/internal/engine"
 	"github.com/knoxxr/bangdb/internal/value"
 )
@@ -32,6 +34,13 @@ type Driver struct{}
 // Open is used by database/sql only when OpenConnector is unavailable; it
 // opens a fresh engine whose lifetime is tied to the connection.
 func (d *Driver) Open(name string) (driver.Conn, error) {
+	if strings.HasPrefix(name, "bangdb://") {
+		c, err := d.OpenConnector(name)
+		if err != nil {
+			return nil, err
+		}
+		return c.Connect(context.Background())
+	}
 	db, err := engine.Open(name, nil)
 	if err != nil {
 		return nil, err
@@ -41,6 +50,13 @@ func (d *Driver) Open(name string) (driver.Conn, error) {
 
 // OpenConnector opens the database once; connections share it.
 func (d *Driver) OpenConnector(name string) (driver.Connector, error) {
+	if strings.HasPrefix(name, "bangdb://") {
+		addr, opts, err := client.ParseDSN(name)
+		if err != nil {
+			return nil, err
+		}
+		return &remoteConnector{addr: addr, opts: opts, drv: d}, nil
+	}
 	db, err := engine.Open(name, nil)
 	if err != nil {
 		return nil, err

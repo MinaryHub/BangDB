@@ -340,6 +340,21 @@ func (r *Rows) Scan(dest ...any) error {
 	return nil
 }
 
+// ScanValues converts row values (as returned by Rows.Values) into dest
+// like Scan does; it serves other result types, such as the client
+// package's.
+func ScanValues(row []any, dest ...any) error {
+	if len(dest) != len(row) {
+		return fmt.Errorf("bangdb: expected %d destination arguments, got %d", len(row), len(dest))
+	}
+	for i, d := range dest {
+		if err := convertAssign(d, row[i]); err != nil {
+			return fmt.Errorf("bangdb: column %d: %w", i+1, err)
+		}
+	}
+	return nil
+}
+
 // Row is the result of QueryRow.
 type Row struct {
 	rows Rows // held by value: one allocation per QueryRow

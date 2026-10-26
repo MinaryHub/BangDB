@@ -3,6 +3,8 @@
 ```
  ┌───────────────────────────────────────────────────────────────┐
  │  bangdb (공개 API)      driver (database/sql)     cmd/bangdb (CLI) │
+ │  server / client (TCP·TLS, internal/wire)                       │
+ │  replication (스트리밍 복제·반동기·펜싱·아카이브/PITR)              │
  └───────────────┬───────────────────────────────────────────────┘
                  │
  ┌───────────────▼───────────────────────────────────────────────┐
@@ -16,6 +18,8 @@
  │   expr.go    식 → 클로저 컴파일, 함수, collation, 집계 상태          │
  │   cursor.go  스트리밍 커서   plancache.go 플랜 캐시                 │
  │   vacuum.go  VACUUM   replication.go 백업·복제   check.go 무결성    │
+ │   window.go 윈도 함수  json.go JSON 함수  dump.go 덤프·가져오기·CSV  │
+ │   stats.go  통계·슬로우 쿼리                                       │
  ├──────────────────────────────┬────────────────────────────────┤
  │ internal/sql                 │ internal/value                 │
  │  lexer → parser → AST        │  값 타입, 비교, 타입 변환          │
