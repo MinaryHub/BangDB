@@ -95,6 +95,14 @@ func main() {
 }
 ```
 
+### Prepared statement
+
+```go
+get, _ := db.Prepare("SELECT name FROM users WHERE id = ?") // 파싱 1회, 플랜 보관 (동시 사용 가능)
+var name string
+get.QueryRow(42).Scan(&name)
+```
+
 ### database/sql 드라이버
 
 ```go

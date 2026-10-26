@@ -169,7 +169,7 @@ func (c *Conn) query(ctx context.Context, src string, args []any, maxRows int) (
 	if err != nil {
 		return nil, err
 	}
-	return c.db.stream(ctx, sel, nargs, maxRows, src, args)
+	return c.db.stream(ctx, sel, nargs, maxRows, src, args, nil)
 }
 
 // QueryRows is Conn.QueryRows on a fresh session.
@@ -185,7 +185,10 @@ func (db *DB) QueryFirst(ctx context.Context, src string, args ...any) (*Rows, e
 // stream runs sel on a snapshot. Queries with a small, bounded result (and
 // all of them when maxRows > 0, which stops after that many rows) run
 // synchronously; others produce rows from a goroutine as they are read.
-func (db *DB) stream(ctx context.Context, sel *sql.Select, args []any, maxRows int, src string, rawArgs []any) (rows *Rows, err error) {
+func (db *DB) stream(ctx context.Context, sel *sql.Select, args []any, maxRows int, src string, rawArgs []any, plans *planCache) (rows *Rows, err error) {
+	if plans == nil {
+		plans = &db.plans
+	}
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -211,30 +214,35 @@ func (db *DB) stream(ctx context.Context, sel *sql.Select, args []any, maxRows i
 		stopTimeout()
 		return nil, err
 	}
-	release := func() {
-		snap.Release()
-		db.swapMu.RUnlock()
-	}
-	x := &execCtx{v: snap.View(), cat: snap.Meta().(*Catalog), args: args, ctx: ctx, spill: db.spill, plans: &db.plans}
+	x := &execCtx{v: snap.View(), cat: snap.Meta().(*Catalog), args: args, ctx: ctx, spill: db.spill, plans: plans}
 	run, err := x.prepareSelect(sel)
 	if err != nil {
-		release()
+		snap.Release()
+		db.swapMu.RUnlock()
 		stopTimeout()
 		return nil, err
 	}
 
 	if maxRows > 0 || run.small() {
-		var rows [][]any
+		r := &Rows{cols: run.p.cols, types: run.p.types}
+		if maxRows == 1 {
+			r.static = make([][]any, 0, 1)
+		}
 		err := x.runSelect(run, func(vals []any) (bool, error) {
-			rows = append(rows, vals)
-			return maxRows <= 0 || len(rows) < maxRows, nil
+			r.static = append(r.static, vals)
+			return maxRows <= 0 || len(r.static) < maxRows, nil
 		})
-		release()
+		snap.Release()
+		db.swapMu.RUnlock()
 		stopTimeout()
 		if err != nil {
 			return nil, err
 		}
-		return &Rows{cols: run.p.cols, types: run.p.types, static: rows}, nil
+		return r, nil
+	}
+	release := func() {
+		snap.Release()
+		db.swapMu.RUnlock()
 	}
 
 	// Streamed from a goroutine: Close and DB.Close must be able to stop it.

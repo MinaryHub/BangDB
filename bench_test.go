@@ -104,3 +104,18 @@ func BenchmarkRangeScan(b *testing.B) {
 		}
 	}
 }
+
+func BenchmarkPointLookupPKPrepared(b *testing.B) {
+	db := benchDB(b, 100000)
+	st, err := db.Prepare(`SELECT name FROM t WHERE id = ?`)
+	if err != nil {
+		b.Fatal(err)
+	}
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		var name string
+		if err := st.QueryRow(i%100000 + 1).Scan(&name); err != nil {
+			b.Fatal(err)
+		}
+	}
+}

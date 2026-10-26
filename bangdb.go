@@ -131,6 +131,57 @@ func (db *DB) QueryRowContext(ctx context.Context, query string, args ...any) *R
 	return &Row{rows: Rows{r: r}}
 }
 
+// Stmt is a prepared statement (see Prepare). It is safe for concurrent
+// use; each call runs outside any transaction, like DB.Exec and DB.Query.
+type Stmt struct{ s *engine.Stmt }
+
+// Prepare parses query once for repeated execution. A single SELECT also
+// keeps its query plan, re-planned automatically after schema changes.
+func (db *DB) Prepare(query string) (*Stmt, error) {
+	s, err := db.e.Prepare(query)
+	if err != nil {
+		return nil, err
+	}
+	return &Stmt{s}, nil
+}
+
+// Exec runs the statement.
+func (s *Stmt) Exec(args ...any) (Result, error) { return s.ExecContext(context.Background(), args...) }
+
+// ExecContext is Exec with cancellation.
+func (s *Stmt) ExecContext(ctx context.Context, args ...any) (Result, error) {
+	r, err := s.s.Exec(ctx, args...)
+	return Result{RowsAffected: r.RowsAffected, LastInsertID: r.LastInsertID}, err
+}
+
+// Query runs the statement as a query.
+func (s *Stmt) Query(args ...any) (*Rows, error) { return s.QueryContext(context.Background(), args...) }
+
+// QueryContext is Query with cancellation.
+func (s *Stmt) QueryContext(ctx context.Context, args ...any) (*Rows, error) {
+	r, err := s.s.Query(ctx, args...)
+	if err != nil {
+		return nil, err
+	}
+	return &Rows{r: r}, nil
+}
+
+// QueryRow runs a query expected to return at most one row.
+func (s *Stmt) QueryRow(args ...any) *Row { return s.QueryRowContext(context.Background(), args...) }
+
+// QueryRowContext is QueryRow with cancellation.
+func (s *Stmt) QueryRowContext(ctx context.Context, args ...any) *Row {
+	r, err := s.s.QueryFirst(ctx, args...)
+	if err != nil {
+		return &Row{err: err}
+	}
+	return &Row{rows: Rows{r: r}}
+}
+
+// Close releases the statement (it holds no resources; provided for
+// symmetry with database/sql).
+func (s *Stmt) Close() error { return nil }
+
 // Begin starts a write transaction. Only one write transaction can be active
 // at a time; others wait up to the busy timeout. Readers are not blocked.
 func (db *DB) Begin() (*Tx, error) { return db.BeginContext(context.Background()) }

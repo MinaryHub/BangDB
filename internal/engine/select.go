@@ -584,8 +584,14 @@ func (x *execCtx) runStreaming(r *selectRun, sink func(vals []any) (bool, error)
 	if r.limit == 0 {
 		return nil
 	}
-	s := streamState{x: x, p: p, sink: sink, limit: r.limit, offset: r.offset,
-		e: newEnv(len(p.sc.cols), x.args)}
+	s := streamState{x: x, p: p, sink: sink, limit: r.limit, offset: r.offset}
+	s.e = &s.env
+	s.e.args = x.args
+	if n := len(p.sc.cols); n <= len(s.e.buf) {
+		s.e.row = s.e.buf[:n:n]
+	} else {
+		s.e.row = make([]any, n)
+	}
 	if len(p.levels) == 0 {
 		ok, err := passes(p.final, s.e)
 		if err != nil || !ok {
@@ -604,6 +610,7 @@ type streamState struct {
 	sink             func(vals []any) (bool, error)
 	limit, offset    int64
 	emitted, skipped int64
+	env              env // s.e points here (one allocation for both)
 }
 
 func (s *streamState) emit() (bool, error) {

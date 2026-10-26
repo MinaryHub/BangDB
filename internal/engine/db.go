@@ -364,7 +364,7 @@ func (db *DB) ExecContext(ctx context.Context, src string, args ...any) (Result,
 	if c.tx != nil {
 		c.tx.Rollback()
 		if err == nil {
-			err = errors.New("bangdb: script left a transaction open; it was rolled back (use DB.Begin or Conn for multi-call transactions)")
+			err = errScriptTx
 		}
 	}
 	return res, err
@@ -617,11 +617,17 @@ func (c *Conn) ExecContext(ctx context.Context, src string, args ...any) (Result
 	return res, err
 }
 
+var errScriptTx = errors.New("bangdb: script left a transaction open; it was rolled back (use DB.Begin or Conn for multi-call transactions)")
+
 func (c *Conn) execScript(ctx context.Context, src string, args []any) (Result, error) {
 	pr, err := c.db.parse(src)
 	if err != nil {
 		return Result{}, err
 	}
+	return c.execParsed(ctx, pr, args)
+}
+
+func (c *Conn) execParsed(ctx context.Context, pr parsed, args []any) (Result, error) {
 	nargs, err := normalizeArgs(args, pr.names)
 	if err != nil {
 		return Result{}, err

@@ -584,7 +584,26 @@ func (x *execCtx) scan(t *Table, acc *access, e *env, visit func(rowid int64, ro
 		return visit(rowid, row)
 	}
 	switch acc.kind {
-	case accRowidEq, accRowidIn:
+	case accRowidEq:
+		// The common point lookup, without the emit closure.
+		v, err := acc.eq[0](e)
+		if err != nil {
+			return err
+		}
+		k, ok := keyValue(v, value.Integer)
+		if !ok {
+			return nil // NULL or incomparable type: cannot be equal
+		}
+		if err := x.tick(); err != nil {
+			return err
+		}
+		row, found, err := x.getRow(t, k.(int64))
+		if err != nil || !found {
+			return err
+		}
+		_, err = visit(k.(int64), row)
+		return err
+	case accRowidIn:
 		var seen map[int64]bool // IN lists may repeat values
 		if len(acc.eq) > 1 {
 			seen = map[int64]bool{}
