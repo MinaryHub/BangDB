@@ -342,6 +342,17 @@ INSERT INTO emp (dept_id, email, salary) VALUES (1, 'kim@example.com', 100)
 - [백업과 미러링](docs/REPLICATION.md)
 - [시계열·인메모리 DB 확장 적합성 검토](docs/REVIEW-timeseries-inmemory.md)
 
+## 빌드와 버전
+
+```bash
+scripts/build.sh            # 이 PC용 → dist/bangdb-<버전>-<os>-<arch>
+scripts/build.sh all        # Windows·macOS·Linux 전부
+scripts/build.sh install    # 버전을 넣어 go install
+bangdb -version             # 예: bangdb 0.6.44 (1a2b3c4, 2026-10-26T23:30:00Z)
+```
+
+버전은 `VERSION` 파일의 기준 버전(주.부)에 **커밋 수**를 붙인 `주.부.커밋수`이므로, 커밋이 생길 때마다 빌드 버전이 올라갑니다. 커밋하지 않은 변경이 있으면 `-dirty`가 붙습니다. 기능 단계가 바뀌면 `VERSION`(예: 0.6 → 0.7)을 올리세요. 셸에서는 `.version`, 코드에서는 `bangdb.Version`/`bangdb.VersionString()`.
+
 ## 개발
 
 ```bash

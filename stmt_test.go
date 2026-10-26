@@ -69,3 +69,12 @@ func TestPreparedStatements(t *testing.T) {
 	}
 	expect(t, db, "SELECT count(*) FROM t WHERE name = 'zz'", "0")
 }
+
+func TestVersionString(t *testing.T) {
+	old := Version
+	defer func() { Version = old }()
+	Version, Commit, BuildTime = "0.6.43", "a94717d1234", "2026-10-26T00:00:00Z"
+	if got := VersionString(); got != "0.6.43 (a94717d, 2026-10-26T00:00:00Z)" {
+		t.Errorf("VersionString() = %q", got)
+	}
+}

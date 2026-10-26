@@ -38,7 +38,7 @@ func TestPersistentMemoryTables(t *testing.T) {
 		db = openDB()
 		expect(t, db, "SELECT k, hex(v), hits FROM cache ORDER BY k", "a|0102|5;b||7;secret-key|53454352455456414C5545|1")
 		expect(t, db, "SELECT k FROM cache WHERE hits > 4 ORDER BY hits", "a;b") // the index was restored
-		expect(t, db, "SELECT count(*) FROM scratch", "0")                    // not persistent
+		expect(t, db, "SELECT count(*) FROM scratch", "0")                       // not persistent
 		expect(t, db, "SELECT s FROM durable", "d")
 		if db.Seq() != seq {
 			t.Fatalf("restoring changed the commit sequence: %d -> %d", seq, db.Seq())

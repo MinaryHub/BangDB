@@ -38,6 +38,7 @@ func main() {
 	password := flag.String("password", "", "password clients must present (server mode)")
 	tlsCert := flag.String("tls-cert", "", "TLS certificate file (server mode)")
 	tlsKey := flag.String("tls-key", "", "TLS key file (server mode)")
+	showVersion := flag.Bool("version", false, "print the version and exit")
 	connect := flag.String("connect", "", "run the shell against a server: bangdb://user:password@host:port")
 	flag.Usage = func() {
 		fmt.Fprintln(os.Stderr, "usage: bangdb [-serve addr | -replica-of addr] [-token t] [-listen addr [-password p] [-tls-cert f -tls-key f]] [database] [sql...]")
@@ -45,6 +46,10 @@ func main() {
 		flag.PrintDefaults()
 	}
 	flag.Parse()
+	if *showVersion {
+		fmt.Println("bangdb", bangdb.VersionString())
+		return
+	}
 	if *connect != "" {
 		os.Exit(remoteShell(*connect, flag.Args()))
 	}
@@ -109,7 +114,7 @@ func main() {
 	}
 	interactive := isTerminal()
 	if interactive {
-		fmt.Printf("BangDB shell — %s\nEnter \".help\" for usage hints.\n", path)
+		fmt.Printf("BangDB %s — %s\nEnter \".help\" for usage hints.\n", bangdb.Version, path)
 	}
 	sh.loop(os.Stdin, interactive)
 	sh.conn.Close()
@@ -229,7 +234,7 @@ func (s *shell) loop(in io.Reader, interactive bool) {
 func (s *shell) command(cmd string) bool {
 	fields := strings.Fields(cmd)
 	switch fields[0] {
-	case ".quit", ".exit", ".help", ".timer":
+	case ".quit", ".exit", ".help", ".timer", ".version":
 	default:
 		if s.db == nil {
 			fmt.Fprintf(s.out, "%s is not available on a remote connection\n", fields[0])
@@ -245,6 +250,7 @@ func (s *shell) command(cmd string) bool {
 .timer on|off      show execution time
 .backup FILE       write an online backup to FILE
 .check             verify checksums, structure and indexes
+.version           show the BangDB version
 .stats             show database statistics
 .dump [FILE]       write the database as SQL (to FILE or the screen)
 .read FILE         import an SQL script or dump (also SQLite .dump output)
@@ -405,6 +411,8 @@ SQL statements end with ';'. BEGIN/COMMIT/ROLLBACK are supported.`)
 		fmt.Fprintf(s.out, "WAL         %d pages, %d bytes; checkpoints %d (%d pages, %s)\n", st.WALPages, st.WALBytes, st.Checkpoints, st.CheckpointPages, st.CheckpointTime)
 		fmt.Fprintf(s.out, "cache       pages %s (%d disk reads), nodes %s\n", hit(st.PageCacheHits, st.PageReads), st.PageReads, hit(st.NodeHits, st.NodeMisses))
 		fmt.Fprintf(s.out, "snapshots   %d open (lag %d commits), cursors %d; seq %d, %d pages\n", st.Snapshots, st.SnapshotLag, st.OpenCursors, st.Seq, st.PageCount)
+	case ".version":
+		fmt.Fprintln(s.out, "bangdb", bangdb.VersionString())
 	case ".timer":
 		s.timer = len(fields) > 1 && fields[1] == "on"
 	default:
