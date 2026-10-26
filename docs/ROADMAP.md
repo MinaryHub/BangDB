@@ -2,7 +2,24 @@
 
 > 이 문서가 BangDB의 **기준 개발 계획**입니다. [시계열·인메모리 검토](REVIEW-timeseries-inmemory.md)의 단계 계획은 여기 통합되었습니다.
 
-## 0. 진행 현황 — 5단계(시계열 테이블) 완료
+## 0. 진행 현황 — 6단계(운영·분산) 및 이월 항목 완료
+
+계획한 단계(0~6)와 앞 단계에서 미뤄 둔 항목을 모두 구현했습니다. 남은 것은 아래 "남긴 것"의 개선 과제입니다.
+
+| 항목 | 결과 |
+|------|------|
+| P2-6 SQL | 윈도우 함수(`ROW_NUMBER/RANK/DENSE_RANK/PERCENT_RANK/CUME_DIST/NTILE/LAG/LEAD/FIRST_VALUE/LAST_VALUE/NTH_VALUE`, 집계 + `ROWS/RANGE` 프레임, 그룹 질의 위에서도), JSON 함수(`json_extract/set/insert/replace/remove/patch/type/array/object/group_array/group_object` 등)와 `->`/`->>` |
+| P2-1 관측성 | `db.Stats()`(문장·오류·슬로우, 커밋 수·시간, 락 대기, WAL·체크포인트, 페이지/노드 캐시 적중, 스냅샷 지연, 커서), `Options.SlowQueryThreshold/OnSlowQuery`, `EXPLAIN ANALYZE`, CLI `.stats` — 오버헤드는 측정 오차 수준 |
+| P2-2 덤프·이관 | `Dump`(스냅샷에서 SQL), `ImportSQL`(Dump·SQLite `.dump` 호환: PRAGMA/트랜잭션 무시, 부모보다 먼저 만든 자식 테이블 대기, `sqlite_sequence`, 마지막에 FK 일괄 검사, 전부 아니면 전무), CSV 가져오기·내보내기, CLI `.dump/.read/.import/.export` — 10만 행 덤프 0.1 s, 가져오기 1.1 s |
+| P2-5 암호화 | AES-256-XTS 페이지 암호화(파일·WAL, 헤더 제외), 키 확인 값으로 잘못된 키 보고, 백업·VACUUM·복제본 각자 키, `BackupWithKey`로 키 교체 — IEEE 1619 벡터·크래시 토처 통과 |
+| P2-3 복제 | 프로토콜 v2: replica ack → replica별 지연(커밋 수·시간), **반동기**(`SyncReplicas`, 타임아웃 시 비동기로 강등), **term 펜싱**(승격 시 term+1, 새 term 노드가 닿으면 옛 primary는 읽기 전용), **PITR**(`Archiver`: 베이스 백업 + 커밋 세그먼트(선택 AES-GCM), `Restore`로 커밋 번호·시각까지) |
+| P2-4 서버 모드 | `server`(TCP/TLS, 비밀번호·콜백 인증, 연결 제한·유휴 종료, 세션 = 트랜잭션, 스트리밍·취소), `client`, `database/sql` DSN `bangdb://user:pw@host:port`, CLI `-listen`/`-connect` — 루프백 단건 왕복 44 µs |
+| 플래너 (P1-5 ④⑤) | `ANALYZE` 통계 + 비용 기반 조인 순서(쓴 순서보다 2배 이상 쌀 때만), 통계로 인덱스 선택, **covering index**(5만 행 범위 집계 139 → 11 ms) |
+| 기타 이월 | `DB.Prepare`(파싱 1회·문장 전용 플랜), 시계열 블록 compaction, 메모리 테이블 `persist` 스냅샷 |
+
+- **남긴 것:** 단건 조회는 여전히 약 2 µs(실행 상태·행 디코드 할당과 GC가 주 비용). 시계열의 열 단위 집계·블록 요약·태그 인덱스. 자동 장애 조치(합의 기반 리더 선출). 트리거, 식 인덱스, 이름 있는 윈도(`WINDOW w AS`), `json_each` 같은 테이블 값 함수. 통계는 평균값이라 치우친 분포는 잘못 추정할 수 있음.
+
+## 0-5. 5단계(시계열 테이블) 완료 기록
 
 | 항목 | 결과 |
 |------|------|
@@ -269,20 +286,22 @@
 | 3 ✅ | 저장 엔진 인터페이스 | `TableStore`/`IndexStore` 추출 (B+트리 = RowKind), `CREATE TABLE … USING` | 완료 — 기존 테스트 무수정 통과, 시험용 kind로 전체 스위트 통과 |
 | 4 ✅ | 인메모리 최적화 | `USING memory`(영속 B+트리, Pager 객체 슬롯), 공통 실행 경로 개선 | 삽입 2.6~5.1배 달성, 단건 조회 1.5배(미달 — 0절 참고) |
 | 5 ✅ | 시계열 테이블 유형 | `USING timeseries`: 시간 순 rowid, 열 지향 압축 블록, `time_bucket`, 보존 정책, 블록 단위 삭제 | 완료 — 1천만 포인트 25.5만/초 수집, 5.5배 작은 저장, 0절 참고 |
-| **6 (다음)** | 운영·분산 | P2-1 ~ P2-6 (필요한 것부터) | 항목별 |
+| 6 ✅ | 운영·분산 + 이월 항목 | P2-1 ~ P2-6, P1-5 ④⑤, prepared statement, 시계열 compaction, 메모리 테이블 보존 | 완료 — 0절 참고 |
 
 ### 순서에 대한 근거
 - **P0-1을 가장 먼저**: Pager의 커밋/체크포인트 구조를 바꾸므로, 그 위에 올라갈 스트리밍 커서(P0-3), 그룹 커밋(P1-6), 체크섬(P0-5), 시계열 chunk가 모두 영향을 받습니다. 나중에 바꿀수록 비용이 커집니다.
 - 복제는 Frame(페이지 이미지) 기반이므로 P0-1 이후에도 프로토콜 변경 없이 유지됩니다. 단, Frame 생성 시점이 "WAL append"로 바뀌는 것만 조정하면 됩니다.
 - 복합 인덱스(P1-1)는 시계열(5단계)의 선행 조건이므로 2단계에 둡니다.
 
-## 5. 현재(2단계 완료 시점) 사용 가이드
+## 5. 사용 가이드 (6단계 완료 시점)
 
-- **적합:** 단일 프로세스 앱의 업무 데이터 저장, 수 GB 이하, OLTP 중심. 일반적인 웹 앱 스키마(복합 키, FK, UPSERT, 서브쿼리, 뷰)를 그대로 쓸 수 있습니다.
-- **조회에는 타임아웃을:** `QueryContext`나 `Options.QueryTimeout`으로 상한을 두세요. 조인 순서는 아직 FROM 순서를 따릅니다 (작은 테이블을 앞에, `EXPLAIN`으로 확인).
+- **적합:** 앱에 내장하는 업무 데이터 저장(수 GB 이하, OLTP 중심), 여러 서비스가 공유하면 서버 모드, 읽기 확장은 복제본. 일반적인 웹 앱 스키마(복합 키, FK, UPSERT, 서브쿼리, 뷰, 윈도우·JSON 함수)를 그대로 쓸 수 있습니다. 측정·이벤트 데이터는 `USING timeseries`, 캐시성 데이터는 `USING memory`.
+- **조회에는 타임아웃을:** `QueryContext`나 `Options.QueryTimeout`으로 상한을 두세요. 데이터가 크게 바뀐 뒤에는 `ANALYZE`를 실행하고, 느린 질의는 `EXPLAIN ANALYZE`와 `Options.OnSlowQuery`로 찾으세요.
 - **FK 컬럼에는 인덱스를:** 부모 행 삭제·키 변경 시 자식 조회에 쓰입니다.
 - **`Rows`는 끝까지 읽거나 `Close`:** 열린 커서는 스냅샷을 붙잡아 체크포인트와 `VACUUM` 교체를 미룹니다.
 - **메모리 상한:** 큰 정렬·그룹핑은 `Options.SortMemory`를 넘으면 `Options.TempDir`의 임시 파일을 씁니다. 캐시는 `Options.CacheSize`.
 - **대량 삭제 후:** 빈 페이지는 자동으로 재사용됩니다. 파일 크기를 줄이려면 한가한 시간에 `VACUUM`을 실행하세요 (실행 중 쓰기는 대기, 복제본은 재동기화).
 - **대량 쓰기는 트랜잭션으로 묶기:** 동시 자동 커밋은 그룹 커밋으로 수천~1만 건/초, 트랜잭션 내 삽입은 행당 ~18 µs입니다.
-- **정기 점검·백업:** `db.Backup()`을 주기적으로, `db.IntegrityCheck()`(FK 검증 포함)를 배포 전·장애 후에 실행하세요.
+- **정기 점검·백업:** `db.Backup()`을 주기적으로(특정 시점 복구가 필요하면 `replication.StartArchiver`), `db.IntegrityCheck()`(FK 검증 포함)를 배포 전·장애 후에 실행하고, `db.Stats()`를 모니터링에 연결하세요.
+- **보안:** 디스크 암호화가 필요하면 `Options.EncryptionKey`(키는 DB 밖에), 네트워크는 서버 모드·복제 모두 TLS를 쓰세요.
+- **장애 조치:** 복제본 승격(`Promote`)은 수동입니다. 승격 후 옛 primary는 새 term의 노드가 닿으면 스스로 읽기 전용이 되지만, 프로세스 중지·주소 전환을 함께 하세요.
