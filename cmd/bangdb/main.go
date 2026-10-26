@@ -153,6 +153,10 @@ func (s *shell) command(cmd string) bool {
 .backup FILE       write an online backup to FILE
 .check             verify checksums, structure and indexes
 .stats             show database statistics
+.dump [FILE]       write the database as SQL (to FILE or the screen)
+.read FILE         import an SQL script or dump (also SQLite .dump output)
+.import FILE TABLE import CSV with a header row (creates TABLE if missing)
+.export FILE QUERY write the result of QUERY as CSV
 .repl              show replication status
 .promote           turn this replica into a writable primary
 .quit              exit
@@ -215,6 +219,77 @@ SQL statements end with ';'. BEGIN/COMMIT/ROLLBACK are supported.`)
 		} else {
 			s.replica = nil
 			fmt.Fprintln(s.out, "promoted: database is now writable")
+		}
+	case ".dump":
+		w := io.Writer(s.out)
+		if len(fields) > 1 {
+			f, err := os.Create(fields[1])
+			if err != nil {
+				fmt.Fprintln(s.out, "Error:", err)
+				break
+			}
+			defer f.Close()
+			w = f
+		}
+		if err := s.db.Dump(context.Background(), w); err != nil {
+			fmt.Fprintln(s.out, "Error:", err)
+		}
+	case ".read":
+		if len(fields) < 2 {
+			fmt.Fprintln(s.out, "usage: .read FILE")
+			break
+		}
+		f, err := os.Open(fields[1])
+		if err != nil {
+			fmt.Fprintln(s.out, "Error:", err)
+			break
+		}
+		res, err := s.db.ImportSQL(context.Background(), f)
+		f.Close()
+		if err != nil {
+			fmt.Fprintln(s.out, "Error:", err)
+			break
+		}
+		fmt.Fprintf(s.out, "%d statements, %d rows imported\n", res.Statements, res.Rows)
+		for _, sk := range res.Skipped {
+			fmt.Fprintln(s.out, "skipped:", sk)
+		}
+	case ".import":
+		if len(fields) < 3 {
+			fmt.Fprintln(s.out, "usage: .import FILE TABLE")
+			break
+		}
+		f, err := os.Open(fields[1])
+		if err != nil {
+			fmt.Fprintln(s.out, "Error:", err)
+			break
+		}
+		n, err := s.db.ImportCSV(context.Background(), fields[2], f, &engine.CSVOptions{Create: true})
+		f.Close()
+		if err != nil {
+			fmt.Fprintln(s.out, "Error:", err)
+		} else {
+			fmt.Fprintf(s.out, "%d rows imported\n", n)
+		}
+	case ".export":
+		parts := strings.SplitN(strings.TrimSpace(cmd), " ", 3)
+		if len(parts) < 3 {
+			fmt.Fprintln(s.out, "usage: .export FILE QUERY")
+			break
+		}
+		f, err := os.Create(parts[1])
+		if err != nil {
+			fmt.Fprintln(s.out, "Error:", err)
+			break
+		}
+		n, err := s.db.ExportCSV(context.Background(), f, nil, strings.TrimSuffix(strings.TrimSpace(parts[2]), ";"))
+		if cerr := f.Close(); err == nil {
+			err = cerr
+		}
+		if err != nil {
+			fmt.Fprintln(s.out, "Error:", err)
+		} else {
+			fmt.Fprintf(s.out, "%d rows exported\n", n)
 		}
 	case ".stats":
 		st := s.db.Stats()

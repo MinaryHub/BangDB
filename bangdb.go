@@ -18,6 +18,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"strconv"
 	"time"
 
@@ -179,6 +180,36 @@ func (db *DB) Vacuum(ctx context.Context) error { return db.e.Vacuum(ctx) }
 // index/table consistency on a snapshot, without blocking other work. It
 // returns the problems found; an empty slice means the database is sound.
 func (db *DB) IntegrityCheck() ([]string, error) { return db.e.IntegrityCheck(context.Background()) }
+
+// ImportResult describes an import; see ImportSQL.
+type ImportResult = engine.ImportResult
+
+// CSVOptions configures ImportCSV and ExportCSV.
+type CSVOptions = engine.CSVOptions
+
+// Dump writes the database as an SQL script (schema, rows, indexes and
+// views) from a consistent snapshot, without blocking writers. Load it with
+// ImportSQL.
+func (db *DB) Dump(ctx context.Context, w io.Writer) error { return db.e.Dump(ctx, w) }
+
+// ImportSQL runs an SQL script, such as the output of Dump or of SQLite's
+// .dump, in a single transaction. See engine.DB.ImportSQL for the SQLite
+// statements it accepts or skips.
+func (db *DB) ImportSQL(ctx context.Context, r io.Reader) (ImportResult, error) {
+	return db.e.ImportSQL(ctx, r)
+}
+
+// ImportCSV inserts CSV records into table in one transaction (columns
+// matched by the header row) and returns the number of rows inserted.
+func (db *DB) ImportCSV(ctx context.Context, table string, r io.Reader, opts *CSVOptions) (int64, error) {
+	return db.e.ImportCSV(ctx, table, r, opts)
+}
+
+// ExportCSV writes the result of a query as CSV and returns the number of
+// rows written.
+func (db *DB) ExportCSV(ctx context.Context, w io.Writer, opts *CSVOptions, query string, args ...any) (int64, error) {
+	return db.e.ExportCSV(ctx, w, opts, query, args...)
+}
 
 // Stats returns counters and gauges of the database: statements, errors,
 // slow calls, commits and their total time, write lock waits, WAL size,

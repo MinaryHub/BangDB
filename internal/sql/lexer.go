@@ -102,12 +102,25 @@ func lex(src string) ([]token, error) {
 			if c == '[' {
 				end = ']'
 			}
-			j := strings.IndexByte(src[i+1:], end)
-			if j < 0 {
-				return nil, &SyntaxError{i, "unterminated quoted identifier"}
+			// A doubled closing quote stands for itself ("a""b").
+			var name strings.Builder
+			j := i + 1
+			for {
+				k := strings.IndexByte(src[j:], end)
+				if k < 0 {
+					return nil, &SyntaxError{i, "unterminated quoted identifier"}
+				}
+				name.WriteString(src[j : j+k])
+				j += k + 1
+				if end != ']' && j < len(src) && src[j] == end {
+					name.WriteByte(end)
+					j++
+					continue
+				}
+				break
 			}
-			toks = append(toks, token{tQuotedIdent, src[i+1 : i+1+j], i})
-			i += j + 2
+			toks = append(toks, token{tQuotedIdent, name.String(), i})
+			i = j
 		case c == '?' || (c == ':' || c == '@' || c == '$') && i+1 < len(src) && isIdentPart(src[i+1]):
 			// ?, ?NNN, $NNN (numbered) and :name, @name, $name (named)
 			start := i

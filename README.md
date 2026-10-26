@@ -125,6 +125,20 @@ r.Promote()               // 장애 조치: 쓰기 가능한 primary로 승격
 
 자세한 내용: [docs/REPLICATION.md](docs/REPLICATION.md)
 
+### 덤프·이관
+
+```go
+f, _ := os.Create("backup.sql")
+db.Dump(ctx, f)                         // 스냅샷에서 SQL 스크립트로 (쓰기 차단 없음)
+
+res, err := db.ImportSQL(ctx, file)     // Dump 결과 또는 SQLite `.dump` 결과를 한 트랜잭션으로 가져오기
+n, err := db.ImportCSV(ctx, "people", csvFile, &bangdb.CSVOptions{Create: true}) // 헤더 행으로 컬럼 매칭
+n, err = db.ExportCSV(ctx, w, nil, "SELECT * FROM people WHERE age > ?", 30)
+```
+
+- `ImportSQL`은 SQLite 덤프를 그대로 받습니다: `PRAGMA`/`BEGIN`/`COMMIT` 무시, `sqlite_sequence`로 AUTOINCREMENT 값 복원, 부모보다 먼저 만든 자식 테이블은 부모가 생길 때까지 대기, `WITHOUT ROWID`/`STRICT` 제거, 트리거는 건너뛰고 결과에 표시. 외래 키는 마지막에 한 번 검사하며, 실패하면 아무것도 반영하지 않습니다.
+- CLI: `.dump [FILE]`, `.read FILE`, `.import FILE TABLE`, `.export FILE QUERY`.
+
 ### 관측성
 
 ```go

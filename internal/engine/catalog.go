@@ -141,7 +141,15 @@ func (ix *Index) hasNull(row []any) bool {
 	return false
 }
 
-func (ix *Index) columnList() string { return strings.Join(ix.Columns, ", ") }
+func (ix *Index) columnList() string { return quoteIdents(ix.Columns) }
+
+func quoteIdents(names []string) string {
+	q := make([]string, len(names))
+	for i, n := range names {
+		q[i] = sql.QuoteIdent(n)
+	}
+	return strings.Join(q, ", ")
+}
 
 // spec describes t to its storage kind.
 func (t *Table) spec() store.TableSpec {
@@ -489,10 +497,21 @@ func (c *Catalog) Describe(name string) string {
 	if t == nil {
 		return ""
 	}
+	out := t.createSQL()
+	for _, ix := range t.indexes {
+		if !ix.Auto {
+			out += "\n" + ix.createSQL()
+		}
+	}
+	return out
+}
+
+// createSQL is the CREATE TABLE statement of t (without its own indexes).
+func (t *Table) createSQL() string {
 	var sb strings.Builder
-	fmt.Fprintf(&sb, "CREATE TABLE %s (\n", t.Name)
+	fmt.Fprintf(&sb, "CREATE TABLE %s (\n", sql.QuoteIdent(t.Name))
 	for i, col := range t.Columns {
-		fmt.Fprintf(&sb, "  %s", col.Name)
+		fmt.Fprintf(&sb, "  %s", sql.QuoteIdent(col.Name))
 		if col.DeclType != "" {
 			sb.WriteString(" " + col.DeclType)
 		}
@@ -521,7 +540,7 @@ func (c *Catalog) Describe(name string) string {
 	}
 	var constraints []string
 	if len(t.PrimaryKey) > 0 {
-		constraints = append(constraints, "PRIMARY KEY ("+strings.Join(t.PrimaryKey, ", ")+")")
+		constraints = append(constraints, "PRIMARY KEY ("+quoteIdents(t.PrimaryKey)+")")
 	}
 	for _, ix := range t.indexes {
 		if ix.Auto && len(ix.Columns) > 1 && !strings.HasSuffix(ix.Name, "_pk") {
@@ -532,7 +551,7 @@ func (c *Catalog) Describe(name string) string {
 		constraints = append(constraints, "CHECK ("+chk+")")
 	}
 	for _, fk := range t.ForeignKeys {
-		s := fmt.Sprintf("FOREIGN KEY (%s) REFERENCES %s (%s)", strings.Join(fk.Columns, ", "), fk.RefTable, strings.Join(fk.RefColumns, ", "))
+		s := fmt.Sprintf("FOREIGN KEY (%s) REFERENCES %s (%s)", quoteIdents(fk.Columns), sql.QuoteIdent(fk.RefTable), quoteIdents(fk.RefColumns))
 		if fk.OnDelete != "" {
 			s += " ON DELETE " + fk.OnDelete
 		}
@@ -562,17 +581,16 @@ func (c *Catalog) Describe(name string) string {
 		sb.WriteString(" WITH (" + strings.Join(opts, ", ") + ")")
 	}
 	sb.WriteString(";")
-	for _, ix := range t.indexes {
-		if ix.Auto {
-			continue
-		}
-		u := ""
-		if ix.Unique {
-			u = "UNIQUE "
-		}
-		fmt.Fprintf(&sb, "\nCREATE %sINDEX %s ON %s (%s);", u, ix.Name, t.Name, ix.columnList())
-	}
 	return sb.String()
+}
+
+// createSQL is the CREATE INDEX statement of ix.
+func (ix *Index) createSQL() string {
+	u := ""
+	if ix.Unique {
+		u = "UNIQUE "
+	}
+	return fmt.Sprintf("CREATE %sINDEX %s ON %s (%s);", u, sql.QuoteIdent(ix.Name), sql.QuoteIdent(ix.Table), ix.columnList())
 }
 
 func isIdent(s string) bool {

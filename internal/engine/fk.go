@@ -108,7 +108,7 @@ func (x *execCtx) buildForeignKeys(t *Table, st *sql.CreateTable) error {
 		p := t
 		if !strings.EqualFold(d.RefTable, t.Name) {
 			if p = x.cat.table(d.RefTable); p == nil {
-				return fmt.Errorf("bangdb: foreign key references unknown table %s", d.RefTable)
+				return &unknownRefError{d.RefTable}
 			}
 		}
 		if p.kind.Volatile() && !t.kind.Volatile() {
@@ -172,6 +172,9 @@ func (t *Table) uniqueIndex(cols []string) *Index {
 // checkParents verifies that every foreign key of row (in t) has a parent.
 // For an update, old is the previous row and only changed keys are checked.
 func (x *execCtx) checkParents(t *Table, row, old []any) error {
+	if x.tx != nil && x.tx.deferFK {
+		return nil // checked at the end of an import
+	}
 	for i := range t.ForeignKeys {
 		fk := &t.ForeignKeys[i]
 		if old != nil && !keyChanged(fk.cols, old, row) {
@@ -604,7 +607,15 @@ func (c *Catalog) DescribeView(name string) string {
 	}
 	cols := ""
 	if len(v.Columns) > 0 {
-		cols = " (" + strings.Join(v.Columns, ", ") + ")"
+		cols = " (" + quoteIdents(v.Columns) + ")"
 	}
-	return fmt.Sprintf("CREATE VIEW %s%s AS %s;", v.Name, cols, v.SQL)
+	return fmt.Sprintf("CREATE VIEW %s%s AS %s;", sql.QuoteIdent(v.Name), cols, v.SQL)
+}
+
+// unknownRefError is returned when a foreign key references a table that
+// does not exist (yet).
+type unknownRefError struct{ table string }
+
+func (e *unknownRefError) Error() string {
+	return "bangdb: foreign key references unknown table " + e.table
 }

@@ -450,6 +450,9 @@ type Tx struct {
 	cat    *Catalog
 	rowids map[string]int64 // next-rowid cache per table
 	done   bool
+	// deferFK skips foreign key checks of new and changed rows (ImportSQL
+	// checks every row at the end).
+	deferFK bool
 }
 
 // Exec runs statements inside the transaction. A failing statement is rolled

@@ -41,9 +41,9 @@ func formatExpr(sb *strings.Builder, e Expr) {
 		}
 	case *ColumnRef:
 		if x.Table != "" {
-			sb.WriteString(x.Table + ".")
+			sb.WriteString(QuoteIdent(x.Table) + ".")
 		}
-		sb.WriteString(x.Name)
+		sb.WriteString(QuoteIdent(x.Name))
 	case *Unary:
 		if x.Op == "NOT" {
 			sb.WriteString("NOT ")
@@ -221,4 +221,37 @@ func formatBound(sb *strings.Builder, b FrameBound) {
 		formatExpr(sb, b.N)
 		sb.WriteString(" FOLLOWING")
 	}
+}
+
+// keywords that are quoted when used as identifiers in generated SQL.
+var keywords = map[string]bool{
+	"ADD": true, "ALL": true, "ALTER": true, "ANALYZE": true, "AUTOINCREMENT": true, "BEGIN": true,
+	"CHECK": true, "COLUMN": true, "COMMIT": true, "CONFLICT": true, "CONSTRAINT": true, "CREATE": true,
+	"CURRENT": true, "CURRENT_DATE": true, "CURRENT_TIME": true, "CURRENT_TIMESTAMP": true, "DEFAULT": true,
+	"DELETE": true, "DO": true, "DROP": true, "EXPLAIN": true, "FALSE": true, "FOLLOWING": true, "FOREIGN": true,
+	"FULL": true, "IF": true, "IGNORE": true, "INDEX": true, "INSERT": true, "KEY": true, "NOTHING": true,
+	"OVER": true, "PARTITION": true, "PRECEDING": true, "PRIMARY": true, "RANGE": true, "REFERENCES": true,
+	"RENAME": true, "REPLACE": true, "RIGHT": true, "ROLLBACK": true, "ROW": true, "ROWS": true, "TABLE": true,
+	"TO": true, "TRANSACTION": true, "TRUE": true, "UNBOUNDED": true, "UNIQUE": true, "UPDATE": true,
+	"USING": true, "VACUUM": true, "VIEW": true, "WITH": true, "CAST": true, "ESCAPE": true, "GLOB": true,
+}
+
+// QuoteIdent returns name as an SQL identifier, double-quoted when it is
+// not a plain identifier or could be read as a keyword.
+func QuoteIdent(name string) string {
+	plain := name != ""
+	for i, r := range name {
+		if !(r == '_' || r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || i > 0 && r >= '0' && r <= '9') {
+			plain = false
+			break
+		}
+	}
+	if plain {
+		u := strings.ToUpper(name)
+		plain = !reserved[u] && !keywords[u]
+	}
+	if plain {
+		return name
+	}
+	return `"` + strings.ReplaceAll(name, `"`, `""`) + `"`
 }
