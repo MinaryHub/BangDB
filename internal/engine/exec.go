@@ -11,6 +11,7 @@ import (
 	"github.com/knoxxr/bangdb/internal/btree"
 	"github.com/knoxxr/bangdb/internal/pager"
 	"github.com/knoxxr/bangdb/internal/sql"
+	"github.com/knoxxr/bangdb/internal/store"
 	"github.com/knoxxr/bangdb/internal/value"
 )
 
@@ -26,7 +27,11 @@ type execCtx struct {
 
 	fkDepth int          // nesting of foreign key actions and views
 	spill   *spillConfig // nil: defaults
-	plans   *planCache   // nil: no plan reuse
+
+	lastTable *Table // cache of rows()
+	lastRoot  uint32
+	lastRows  store.TableStore
+	plans     *planCache // nil: no plan reuse
 }
 
 // tick is called once per row visited; every 256 rows it checks whether the
@@ -104,26 +109,70 @@ func constraintErr(format string, args ...any) error {
 }
 
 // ---- row storage helpers ----
+//
+// Rows and index entries are reached only through package store, so tables
+// can use other storage kinds than the B+tree.
+
+// defaultStore is the storage kind of tables created without USING.
+var defaultStore = ""
+
+// SetDefaultStore sets the storage kind of tables created without USING
+// ("" or "btree" = the B+tree row store). It is meant for tests that run a
+// whole suite against another kind; it is not safe to call concurrently
+// with CREATE TABLE.
+func SetDefaultStore(name string) { defaultStore = name }
+
+// rows returns the store holding t's rows in the statement's view. The
+// last one is kept, as row fetches by rowid come in long runs.
+func (x *execCtx) rows(t *Table) store.TableStore {
+	if x.lastTable != t || x.lastRoot != t.Root {
+		x.lastTable, x.lastRoot, x.lastRows = t, t.Root, t.kind.Open(x.v, t.Root)
+	}
+	return x.lastRows
+}
+
+// index returns the store holding ix's entries.
+func (x *execCtx) index(ix *Index) store.IndexStore { return store.OpenIndex(x.v, ix.Root) }
+
+// padRow completes a stored row: rows written before ALTER TABLE ADD COLUMN
+// are shorter.
+func padRow(t *Table, row []any) []any {
+	for len(row) < len(t.Columns) {
+		row = append(row, t.Columns[len(row)].defConst)
+	}
+	return row
+}
 
 func (x *execCtx) decodeRow(t *Table, data []byte) ([]any, error) {
 	row, err := value.DecodeRow(data)
 	if err != nil {
 		return nil, err
 	}
-	// Rows written before ALTER TABLE ADD COLUMN are shorter.
-	for len(row) < len(t.Columns) {
-		row = append(row, t.Columns[len(row)].defConst)
-	}
-	return row, nil
+	return padRow(t, row), nil
 }
 
 func (x *execCtx) getRow(t *Table, rowid int64) ([]any, bool, error) {
-	data, ok, err := btree.Open(x.v, t.Root).Get(value.EncodeRowID(rowid))
+	row, ok, err := x.rows(t).Get(rowid)
 	if err != nil || !ok {
 		return nil, false, err
 	}
-	row, err := x.decodeRow(t, data)
-	return row, err == nil, err
+	return padRow(t, row), true, nil
+}
+
+// scanRows visits t's rows with lo <= rowid <= hi in rowid order (desc:
+// descending), checking for cancellation.
+func (x *execCtx) scanRows(t *Table, lo, hi int64, desc bool, fn func(rowid int64, row []any) (bool, error)) error {
+	return x.rows(t).Scan(lo, hi, desc, func(rowid int64, row []any) (bool, error) {
+		if err := x.tick(); err != nil {
+			return false, err
+		}
+		return fn(rowid, padRow(t, row))
+	})
+}
+
+// scanAll visits every row of t in rowid order.
+func (x *execCtx) scanAll(t *Table, fn func(rowid int64, row []any) (bool, error)) error {
+	return x.scanRows(t, store.MinRowid, store.MaxRowid, false, fn)
 }
 
 func indexEntry(ix *Index, row []any, rowid int64) ([]byte, error) {
@@ -135,7 +184,7 @@ func indexEntry(ix *Index, row []any, rowid int64) ([]byte, error) {
 func (x *execCtx) findKey(t *Table, ix *Index, row []any, self int64) (int64, bool, error) {
 	full := ix.fullKey(row)
 	prefix, trunc := truncKey(full)
-	c := btree.Open(x.v, ix.Root).Seek(prefix)
+	c := x.index(ix).Seek(prefix)
 	for ; c.Valid() && bytes.HasPrefix(c.Key(), prefix); c.Next() {
 		id := value.DecodeRowID(c.Key()[len(c.Key())-8:])
 		if id == self {
@@ -171,13 +220,13 @@ func (x *execCtx) nextRowid(t *Table) (int64, error) {
 	if id, ok := x.tx.rowids[key]; ok {
 		return id, nil
 	}
-	last, ok, err := btree.Open(x.v, t.Root).Last()
+	last, ok, err := x.rows(t).Last()
 	if err != nil {
 		return 0, err
 	}
 	high := int64(0)
 	if ok {
-		high = value.DecodeRowID(last)
+		high = last
 	}
 	if t.autoIncrement() {
 		// AUTOINCREMENT never reuses ids, even after the largest row was
@@ -270,10 +319,10 @@ func prepareRow(t *Table, row []any) error {
 // insertRow writes a new row (already prepared) and returns its rowid.
 func (x *execCtx) insertRow(t *Table, row []any) (int64, error) {
 	var rowid int64
-	tree := btree.Open(x.v, t.Root)
+	rows := x.rows(t)
 	if t.RowidCol >= 0 && row[t.RowidCol] != nil {
 		rowid = row[t.RowidCol].(int64)
-		exists, err := tree.Has(value.EncodeRowID(rowid))
+		_, exists, err := rows.Get(rowid)
 		if err != nil {
 			return 0, err
 		}
@@ -306,11 +355,11 @@ func (x *execCtx) insertRow(t *Table, row []any) (int64, error) {
 		if err != nil {
 			return 0, err
 		}
-		if err := btree.Open(x.v, ix.Root).Put(k, nil); err != nil {
+		if err := x.index(ix).Put(k); err != nil {
 			return 0, err
 		}
 	}
-	return rowid, tree.Put(value.EncodeRowID(rowid), value.EncodeRow(row))
+	return rowid, rows.Put(rowid, row)
 }
 
 func (x *execCtx) deleteRow(t *Table, rowid int64, row []any) error {
@@ -319,11 +368,11 @@ func (x *execCtx) deleteRow(t *Table, rowid int64, row []any) error {
 		if err != nil {
 			return err
 		}
-		if _, err := btree.Open(x.v, ix.Root).Delete(k); err != nil {
+		if _, err := x.index(ix).Delete(k); err != nil {
 			return err
 		}
 	}
-	_, err := btree.Open(x.v, t.Root).Delete(value.EncodeRowID(rowid))
+	_, err := x.rows(t).Delete(rowid)
 	return err
 }
 
@@ -452,7 +501,19 @@ func (x *execCtx) createTable(st *sql.CreateTable) error {
 		t.Checks = append(t.Checks, src)
 	}
 
-	root, err := btree.Create(x.v)
+	t.Store = st.Using
+	if t.Store == "" {
+		t.Store = defaultStore
+	}
+	if t.Store == "btree" {
+		t.Store = "" // the default kind's catalog name
+	}
+	kind, err := store.Lookup(t.Store)
+	if err != nil {
+		return err
+	}
+	t.kind = kind
+	root, err := kind.Create(x.v)
 	if err != nil {
 		return err
 	}
@@ -539,7 +600,7 @@ func (x *execCtx) dropTable(st *sql.DropTable) error {
 	x.mutableCatalog()
 	t = x.cat.table(st.Name)
 	for _, ix := range t.indexes {
-		if err := btree.Drop(x.v, ix.Root); err != nil {
+		if err := store.DropIndex(x.v, ix.Root); err != nil {
 			return err
 		}
 		if err := deleteEntry(x.v, indexKey(ix.Name)); err != nil {
@@ -547,7 +608,7 @@ func (x *execCtx) dropTable(st *sql.DropTable) error {
 		}
 		delete(x.cat.indexes, strings.ToLower(ix.Name))
 	}
-	if err := btree.Drop(x.v, t.Root); err != nil {
+	if err := t.kind.Drop(x.v, t.Root); err != nil {
 		return err
 	}
 	if err := deleteEntry(x.v, tableKey(t.Name)); err != nil {
@@ -599,38 +660,23 @@ func (x *execCtx) createIndex(st *sql.CreateIndex) error {
 func (x *execCtx) addIndex(ix *Index) error {
 	t := x.cat.table(ix.Table)
 	ix.resolve(t)
-	root, err := btree.Create(x.v)
+	root, err := store.CreateIndex(x.v)
 	if err != nil {
 		return err
 	}
 	ix.Root = root
-	tree := btree.Open(x.v, root)
-	c := btree.Open(x.v, t.Root).Seek(nil)
-	for ; c.Valid(); c.Next() {
-		if err := x.tick(); err != nil {
-			return err
-		}
-		data, err := c.Value()
-		if err != nil {
-			return err
-		}
-		row, err := x.decodeRow(t, data)
-		if err != nil {
-			return err
-		}
-		rowid := value.DecodeRowID(c.Key())
+	entries := x.index(ix)
+	err = x.scanAll(t, func(rowid int64, row []any) (bool, error) {
 		if err := x.checkUnique(t, ix, row, rowid); err != nil {
-			return err
+			return false, err
 		}
 		k, err := indexEntry(ix, row, rowid)
 		if err != nil {
-			return err
+			return false, err
 		}
-		if err := tree.Put(k, nil); err != nil {
-			return err
-		}
-	}
-	if err := c.Err(); err != nil {
+		return true, entries.Put(k)
+	})
+	if err != nil {
 		return err
 	}
 	x.cat.indexes[strings.ToLower(ix.Name)] = ix
@@ -649,7 +695,7 @@ func (x *execCtx) dropIndex(st *sql.DropIndex) error {
 		return fmt.Errorf("bangdb: index %s is associated with a UNIQUE or PRIMARY KEY constraint and cannot be dropped", ix.Name)
 	}
 	x.mutableCatalog()
-	if err := btree.Drop(x.v, ix.Root); err != nil {
+	if err := store.DropIndex(x.v, ix.Root); err != nil {
 		return err
 	}
 	delete(x.cat.indexes, strings.ToLower(ix.Name))
@@ -839,31 +885,20 @@ func (x *execCtx) dropColumn(st *sql.AlterTableDropColumn) error {
 	}
 	// Rewrite every row without the column (rows are collected first).
 	type rec struct {
-		key []byte
-		row []any
+		rowid int64
+		row   []any
 	}
 	var rows []rec
-	c := btree.Open(x.v, t.Root).Seek(nil)
-	for ; c.Valid(); c.Next() {
-		if err := x.tick(); err != nil {
-			return err
-		}
-		data, err := c.Value()
-		if err != nil {
-			return err
-		}
-		row, err := x.decodeRow(t, data)
-		if err != nil {
-			return err
-		}
-		rows = append(rows, rec{append([]byte(nil), c.Key()...), append(row[:i:i], row[i+1:]...)})
-	}
-	if err := c.Err(); err != nil {
+	err = x.scanAll(t, func(rowid int64, row []any) (bool, error) {
+		rows = append(rows, rec{rowid, append(row[:i:i], row[i+1:]...)})
+		return true, nil
+	})
+	if err != nil {
 		return err
 	}
-	tree := btree.Open(x.v, t.Root)
+	stored := x.rows(t)
 	for _, r := range rows {
-		if err := tree.Put(r.key, value.EncodeRow(r.row)); err != nil {
+		if err := stored.Put(r.rowid, r.row); err != nil {
 			return err
 		}
 	}

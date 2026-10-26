@@ -12,6 +12,7 @@ Go로 작성된 **경량 임베디드 관계형 데이터베이스**입니다. �
   - 파라미터: `?`, `?N`, `:name`, `@name`, `$name`
 - B+트리 기반 테이블/인덱스(삭제 시 병합, 긴 키 지원), 비용 기반 접근 경로 선택: rowid·인덱스 동등/범위/IN, OR → 인덱스 합집합, 인덱스 순서로 ORDER BY 생략, 해시 조인
 - 디코드된 노드 캐시·플랜 캐시, 메모리 한도를 넘는 정렬·그룹핑은 임시 파일로 처리
+- 교체 가능한 저장 방식 인터페이스(`internal/store`, `CREATE TABLE … USING <kind>`) — 기본은 B+트리
 - 트랜잭션: `BEGIN/COMMIT/ROLLBACK`, 문장 단위 원자성, **스냅샷 읽기** — 읽기와 쓰기가 서로를 기다리지 않음
 - 스트리밍 결과 커서, `context` 기반 쿼리 취소·타임아웃, 그룹 커밋
 - **온라인 백업**(서비스 중단 없이 일관된 백업 파일 생성)과 **primary → replica 미러링**(읽기 스케일 아웃, 자동 재접속, 장애 조치 승격)
@@ -239,5 +240,6 @@ INSERT INTO emp (dept_id, email, salary) VALUES (1, 'kim@example.com', 100)
 ```bash
 go test ./...           # 단위/통합 테스트
 go test -race ./...     # 레이스 검사
+BANGDB_TEST_STORE=reversed go test .   # 저장 방식 인터페이스 우회 검사
 go test -bench . -run XXX .
 ```

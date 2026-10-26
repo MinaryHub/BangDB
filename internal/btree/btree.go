@@ -824,3 +824,23 @@ func (c *RevCursor) Prev() {
 		}
 	}
 }
+
+// Estimate returns an approximate number of entries: the fan-out of the
+// nodes on the path to a middle leaf, multiplied together and by the size of
+// that leaf. It reads one page per level. Exact for single-leaf trees.
+func (t *Tree) Estimate() (int64, error) {
+	est := int64(1)
+	pg := t.root
+	for depth := 0; depth < 64; depth++ {
+		n, err := t.load(pg)
+		if err != nil {
+			return 0, err
+		}
+		if n.leaf {
+			return est * int64(len(n.keys)), nil
+		}
+		est *= int64(len(n.children))
+		pg = n.children[len(n.children)/2]
+	}
+	return 0, errBadPage
+}

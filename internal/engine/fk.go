@@ -7,7 +7,6 @@ import (
 	"math"
 	"strings"
 
-	"github.com/knoxxr/bangdb/internal/btree"
 	"github.com/knoxxr/bangdb/internal/sql"
 	"github.com/knoxxr/bangdb/internal/value"
 )
@@ -286,7 +285,7 @@ func (x *execCtx) children(child *Table, fk *ForeignKey, vals []any) ([]target, 
 			prefix, _ = groupKey(prefix)
 		}
 		var ids []int64
-		c := btree.Open(x.v, ix.Root).Seek(prefix)
+		c := x.index(ix).Seek(prefix)
 		for ; c.Valid() && bytes.HasPrefix(c.Key(), prefix); c.Next() {
 			if err := x.tick(); err != nil {
 				return nil, err
@@ -305,25 +304,13 @@ func (x *execCtx) children(child *Table, fk *ForeignKey, vals []any) ([]target, 
 		return out, nil
 	}
 	// No usable index: scan the child table.
-	c := btree.Open(x.v, child.Root).Seek(nil)
-	for ; c.Valid(); c.Next() {
-		if err := x.tick(); err != nil {
-			return nil, err
+	err := x.scanAll(child, func(rowid int64, row []any) (bool, error) {
+		if cv, ok := fkValues(row, fk.cols); ok && sameValues(cv, vals) {
+			out = append(out, target{rowid, row})
 		}
-		data, err := c.Value()
-		if err != nil {
-			return nil, err
-		}
-		row, err := x.decodeRow(child, data)
-		if err != nil {
-			return nil, err
-		}
-		cv, ok := fkValues(row, fk.cols)
-		if ok && sameValues(cv, vals) {
-			out = append(out, target{value.DecodeRowID(c.Key()), row})
-		}
-	}
-	return out, c.Err()
+		return true, nil
+	})
+	return out, err
 }
 
 // removeRow deletes a row and applies the ON DELETE actions of foreign keys

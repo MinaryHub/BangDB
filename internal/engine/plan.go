@@ -7,8 +7,8 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/knoxxr/bangdb/internal/btree"
 	"github.com/knoxxr/bangdb/internal/sql"
+	"github.com/knoxxr/bangdb/internal/store"
 	"github.com/knoxxr/bangdb/internal/value"
 )
 
@@ -519,7 +519,6 @@ func (x *execCtx) scan(t *Table, acc *access, e *env, visit func(rowid int64, ro
 		}
 		return visit(rowid, row)
 	}
-	tree := btree.Open(x.v, t.Root)
 	emit := func(rowid int64) (bool, error) {
 		row, ok, err := x.getRow(t, rowid)
 		if err != nil || !ok {
@@ -550,9 +549,7 @@ func (x *execCtx) scan(t *Table, acc *access, e *env, visit func(rowid int64, ro
 	case accUnion:
 		return x.scanUnion(t, acc, e, visit)
 	case accRowidRange:
-		start := []byte(nil)
-		var stop []byte
-		stopInc := false
+		lo, hi := int64(store.MinRowid), int64(store.MaxRowid)
 		if acc.lo != nil {
 			v, err := acc.lo(e)
 			if err != nil {
@@ -562,14 +559,13 @@ func (x *execCtx) scan(t *Table, acc *access, e *env, visit func(rowid int64, ro
 				return nil
 			}
 			if k, ok, inc := rangeBound(v, value.Integer, true, acc.loInc); ok {
-				id := k.(int64)
+				lo = k.(int64)
 				if !inc {
-					if id == math.MaxInt64 {
+					if lo == math.MaxInt64 {
 						return nil
 					}
-					id++
+					lo++
 				}
-				start = value.EncodeRowID(id)
 			}
 		}
 		if acc.hi != nil {
@@ -581,52 +577,18 @@ func (x *execCtx) scan(t *Table, acc *access, e *env, visit func(rowid int64, ro
 				return nil
 			}
 			if k, ok, inc := rangeBound(v, value.Integer, false, acc.hiInc); ok {
-				stop, stopInc = value.EncodeRowID(k.(int64)), inc
-			}
-		}
-		if acc.reverse {
-			return x.scanRowsReverse(t, stop, stopInc, start, fn)
-		}
-		c := tree.Seek(start)
-		for ; c.Valid(); c.Next() {
-			if stop != nil {
-				cmp := bytes.Compare(c.Key(), stop)
-				if cmp > 0 || cmp == 0 && !stopInc {
-					break
+				hi = k.(int64)
+				if !inc {
+					if hi == math.MinInt64 {
+						return nil
+					}
+					hi--
 				}
 			}
-			data, err := c.Value()
-			if err != nil {
-				return err
-			}
-			row, err := x.decodeRow(t, data)
-			if err != nil {
-				return err
-			}
-			if cont, err := fn(value.DecodeRowID(c.Key()), row); err != nil || !cont {
-				return err
-			}
 		}
-		return c.Err()
+		return x.scanRows(t, lo, hi, acc.reverse, visit)
 	}
-	if acc.reverse {
-		return x.scanRowsReverse(t, nil, true, nil, fn)
-	}
-	c := tree.Seek(nil)
-	for ; c.Valid(); c.Next() {
-		data, err := c.Value()
-		if err != nil {
-			return err
-		}
-		row, err := x.decodeRow(t, data)
-		if err != nil {
-			return err
-		}
-		if cont, err := fn(value.DecodeRowID(c.Key()), row); err != nil || !cont {
-			return err
-		}
-	}
-	return c.Err()
+	return x.scanRows(t, store.MinRowid, store.MaxRowid, acc.reverse, visit)
 }
 
 // scanHash probes the level's hash table (built on first use).
@@ -698,33 +660,6 @@ func (x *execCtx) scanUnion(t *Table, acc *access, e *env, visit func(rowid int6
 	return nil
 }
 
-// scanRowsReverse visits table rows in descending rowid order, from hi
-// (nil = the end; exclusive unless hiInc) down to lo (nil = the start,
-// inclusive).
-func (x *execCtx) scanRowsReverse(t *Table, hi []byte, hiInc bool, lo []byte, fn func(int64, []any) (bool, error)) error {
-	c := btree.Open(x.v, t.Root).SeekReverse(hi)
-	for ; c.Valid(); c.Prev() {
-		if hi != nil && !hiInc && bytes.Equal(c.Key(), hi) {
-			continue
-		}
-		if lo != nil && bytes.Compare(c.Key(), lo) < 0 {
-			break
-		}
-		data, err := c.Value()
-		if err != nil {
-			return err
-		}
-		row, err := x.decodeRow(t, data)
-		if err != nil {
-			return err
-		}
-		if cont, err := fn(value.DecodeRowID(c.Key()), row); err != nil || !cont {
-			return err
-		}
-	}
-	return c.Err()
-}
-
 // scanLevel visits the rows of one FROM level.
 func (x *execCtx) scanLevel(l *level, e *env, visit func(rowid int64, row []any) (bool, error)) error {
 	if l.acc.kind == accHash {
@@ -766,7 +701,7 @@ func (x *execCtx) scanIndex(acc *access, e *env, emit func(int64) (bool, error))
 	} else {
 		prefix, _ = groupKey(prefix)
 	}
-	tree := btree.Open(x.v, acc.ix.Root)
+	tree := x.index(acc.ix)
 	// collect returns the row ids of entries from start on that keep the
 	// prefix, as long as accept says so.
 	collect := func(start, prefix []byte, accept func(key []byte) (keep, more bool)) error {
@@ -882,7 +817,7 @@ func (x *execCtx) scanIndex(acc *access, e *env, emit func(int64) (bool, error))
 var maxSuffix = []byte{0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF}
 
 // scanIndexReverse is scanIndex in descending key order (no IN lists).
-func (x *execCtx) scanIndexReverse(acc *access, e *env, tree *btree.Tree, prefix []byte, emit func(int64) (bool, error)) error {
+func (x *execCtx) scanIndexReverse(acc *access, e *env, tree store.IndexStore, prefix []byte, emit func(int64) (bool, error)) error {
 	clone := func(b []byte) []byte { return append([]byte(nil), b...) }
 	bound := func(k any) (b []byte, trunc bool) {
 		return groupKey(value.AppendKey(clone(prefix), foldValue(k, acc.coll)))
@@ -919,7 +854,7 @@ func (x *execCtx) scanIndexReverse(acc *access, e *env, tree *btree.Tree, prefix
 	}
 	out := x.keyOrder(acc.ix, true, emit)
 	c := tree.SeekReverse(upper)
-	for ; c.Valid() && bytes.HasPrefix(c.Key(), prefix); c.Prev() {
+	for ; c.Valid() && bytes.HasPrefix(c.Key(), prefix); c.Next() {
 		if err := x.tick(); err != nil {
 			return err
 		}

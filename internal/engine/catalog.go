@@ -9,6 +9,7 @@ import (
 	"github.com/knoxxr/bangdb/internal/btree"
 	"github.com/knoxxr/bangdb/internal/pager"
 	"github.com/knoxxr/bangdb/internal/sql"
+	"github.com/knoxxr/bangdb/internal/store"
 	"github.com/knoxxr/bangdb/internal/value"
 )
 
@@ -33,10 +34,13 @@ type Column struct {
 
 // Table describes a table. Rows are stored in a B+tree keyed by rowid.
 type Table struct {
-	Name     string   `json:"name"`
-	Columns  []Column `json:"columns"`
-	Root     uint32   `json:"root"`
-	RowidCol int      `json:"rowidCol"` // INTEGER PRIMARY KEY column, or -1
+	Name    string   `json:"name"`
+	Columns []Column `json:"columns"`
+	Root    uint32   `json:"root"`
+	// Store names the storage kind of the rows ("" = the B+tree row
+	// store; see package store).
+	Store    string `json:"store,omitempty"`
+	RowidCol int    `json:"rowidCol"` // INTEGER PRIMARY KEY column, or -1
 	// PrimaryKey lists the primary key columns when the key is composite
 	// (single-column keys are flagged on the column).
 	PrimaryKey []string `json:"primaryKey,omitempty"`
@@ -44,6 +48,7 @@ type Table struct {
 	Checks      []string     `json:"checks,omitempty"`
 	ForeignKeys []ForeignKey `json:"foreignKeys,omitempty"`
 
+	kind         store.Kind // resolved Store
 	indexes      []*Index
 	checkFns     []evalFn // compiled Checks
 	referencedBy []fkRef  // foreign keys of other tables pointing here
@@ -321,6 +326,11 @@ func loadCatalog(v *pager.View) (*Catalog, error) {
 					return nil, err
 				}
 			}
+			kind, err := store.Lookup(t.Store)
+			if err != nil {
+				return nil, fmt.Errorf("table %s: %w", t.Name, err)
+			}
+			t.kind = kind
 			c.tables[strings.ToLower(t.Name)] = t
 		case 'i':
 			ix := &Index{}
@@ -480,7 +490,11 @@ func (c *Catalog) Describe(name string) string {
 		sb.Reset()
 		sb.WriteString(out + ",\n  " + strings.Join(constraints, ",\n  ") + "\n")
 	}
-	sb.WriteString(");")
+	sb.WriteString(")")
+	if t.Store != "" {
+		sb.WriteString(" USING " + t.Store)
+	}
+	sb.WriteString(";")
 	for _, ix := range t.indexes {
 		if ix.Auto {
 			continue

@@ -8,7 +8,6 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/knoxxr/bangdb/internal/btree"
 	"github.com/knoxxr/bangdb/internal/sql"
 	"github.com/knoxxr/bangdb/internal/value"
 )
@@ -1258,11 +1257,11 @@ func (x *execCtx) writeRow(t *Table, rowid int64, row []any) error {
 		if err != nil {
 			return err
 		}
-		if err := btree.Open(x.v, ix.Root).Put(k, nil); err != nil {
+		if err := x.index(ix).Put(k); err != nil {
 			return err
 		}
 	}
-	return btree.Open(x.v, t.Root).Put(value.EncodeRowID(rowid), value.EncodeRow(row))
+	return x.rows(t).Put(rowid, row)
 }
 
 // prepareCompound plans every SELECT of a UNION / INTERSECT / EXCEPT chain.

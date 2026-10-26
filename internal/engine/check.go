@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	"github.com/knoxxr/bangdb/internal/btree"
+	"github.com/knoxxr/bangdb/internal/store"
 	"github.com/knoxxr/bangdb/internal/value"
 )
 
@@ -127,9 +128,36 @@ func (x *execCtx) integrityCheck() []string {
 	return problems
 }
 
-// checkRows decodes every row of t and returns the row count.
+// checkRows decodes every row of t and returns the row count. Rows of the
+// default kind are read from the B+tree directly, so that one undecodable
+// row does not hide the others; other kinds are read through their store.
 func (x *execCtx) checkRows(t *Table, add func(string, ...any)) int {
 	count := 0
+	check := func(rowid int64, row []any) {
+		if len(row) > len(t.Columns) {
+			add("table %s row %d has %d values for %d columns", t.Name, rowid, len(row), len(t.Columns))
+			return
+		}
+		if t.RowidCol >= 0 && t.RowidCol < len(row) && row[t.RowidCol] != rowid {
+			add("table %s row %d: primary key column holds %v", t.Name, rowid, row[t.RowidCol])
+		}
+		if len(t.ForeignKeys) > 0 {
+			if err := x.checkParents(t, padRow(t, row), nil); err != nil {
+				add("table %s row %d: %v", t.Name, rowid, err)
+			}
+		}
+	}
+	if t.Store != "" {
+		err := x.rows(t).Scan(store.MinRowid, store.MaxRowid, false, func(rowid int64, row []any) (bool, error) {
+			count++
+			check(rowid, row)
+			return true, nil
+		})
+		if err != nil {
+			add("table %s: %v", t.Name, err)
+		}
+		return count
+	}
 	c := btree.Open(x.v, t.Root).Seek(nil)
 	for ; c.Valid(); c.Next() {
 		count++
@@ -144,18 +172,7 @@ func (x *execCtx) checkRows(t *Table, add func(string, ...any)) int {
 			add("table %s row %d: %v", t.Name, rowid, err)
 			continue
 		}
-		if len(row) > len(t.Columns) {
-			add("table %s row %d has %d values for %d columns", t.Name, rowid, len(row), len(t.Columns))
-		}
-		if t.RowidCol >= 0 && t.RowidCol < len(row) && row[t.RowidCol] != rowid {
-			add("table %s row %d: primary key column holds %v", t.Name, rowid, row[t.RowidCol])
-		}
-		if len(t.ForeignKeys) > 0 && len(row) <= len(t.Columns) {
-			full, _ := x.decodeRow(t, data)
-			if err := x.checkParents(t, full, nil); err != nil {
-				add("table %s row %d: %v", t.Name, rowid, err)
-			}
-		}
+		check(rowid, row)
 	}
 	if err := c.Err(); err != nil {
 		add("table %s: %v", t.Name, err)

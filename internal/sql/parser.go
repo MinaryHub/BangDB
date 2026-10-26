@@ -277,6 +277,11 @@ func (p *parser) parseCreate() (Stmt, error) {
 		if err := p.expectOp(")"); err != nil {
 			return nil, err
 		}
+		if p.acceptKw("USING") {
+			if ct.Using, err = p.ident(); err != nil {
+				return nil, err
+			}
+		}
 		return ct, nil
 	}
 	if p.acceptKw("VIEW") {

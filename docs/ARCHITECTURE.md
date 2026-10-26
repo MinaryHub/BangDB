@@ -21,6 +21,9 @@
  │  lexer → parser → AST        │  값 타입, 비교, 타입 변환          │
  │  FormatExpr (AST → SQL)      │  행 인코딩, 순서 보존 키 인코딩      │
  ├──────────────────────────────┴────────────────────────────────┤
+ │ internal/store   TableStore / IndexStore 인터페이스, 저장 방식(Kind)   │
+ │                  등록소, 기본 RowKind(B+트리), 적합성 테스트(storetest) │
+ ├───────────────────────────────────────────────────────────────┤
  │ internal/btree   B+트리 (가변 길이 키/값, overflow 체인, 리프 연결,    │
  │                  삭제 시 병합/재분배, 정렬 입력 bulk 로더)            │
  ├───────────────────────────────────────────────────────────────┤
@@ -107,7 +110,11 @@ SQLite의 WAL 모드와 같은 방식의 **다중 버전 페이지 저장소**�
 - **VACUUM**: 쓰기 락을 잡고 최신 커밋의 스냅샷에서 모든 트리(테이블·인덱스·시퀀스·카탈로그)를 `Builder`로 새 파일에 다시 쓴 뒤, 리더가 끝나기를 기다려 파일을 교체합니다. 커밋 순번은 이어지고 DBID는 새로 발급되며, 연결된 구독자는 끊겨 replica가 스냅샷으로 재동기화합니다.
 - 자세한 내용은 [REPLICATION.md](REPLICATION.md).
 
-## 8. 확장 지점
+## 8. 저장 방식 (`internal/store`)과 확장 지점
 
+- 실행기는 행과 인덱스 항목을 `store.TableStore`(rowid → 행)와 `store.IndexStore`(정렬된 바이트 키)로만 다룹니다. 테이블마다 카탈로그에 저장 방식 이름(`store`, 기본 `""` = B+트리)이 기록되고, `store.Lookup`으로 찾은 `Kind`가 루트 페이지에서 저장소를 엽니다.
+- 저장소의 상태는 모두 Pager 페이지에 있으므로 트랜잭션·스냅샷·WAL·체크포인트·백업·물리 복제를 그대로 공유합니다.
+- 새 저장 방식을 추가하려면 `store.Kind`를 구현해 `store.Register`로 등록하고 `storetest.TestTableStore`를 통과시킨 뒤 `CREATE TABLE … USING <이름>`으로 씁니다. 인메모리 최적화(4단계)와 시계열 chunk(5단계)가 이 지점에 들어갑니다.
+- 현재 제약: 무결성 검사의 구조 검사와 VACUUM은 테이블 루트를 B+트리로 보고 직접 다룹니다. B+트리가 아닌 페이지 구조를 쓰는 kind를 넣을 때 `Kind`에 Check/Rebuild를 추가합니다.
+- 루트 테스트를 다른 kind로 돌리기: `BANGDB_TEST_STORE=<kind> go test .` (시험용 `reversed` kind는 행 값을 뒤집어 저장해, 인터페이스를 우회하는 코드를 드러냅니다).
 - `pager.Pager` 저장소(파일/메모리)를 교체하면 저장 매체를 바꿀 수 있습니다.
-- 실행기는 현재 `btree`를 직접 호출합니다(`exec.go`의 행/인덱스 유지, `plan.go`의 `scan`). 시계열·인메모리 전용 저장 구조를 붙이려면 이 부분을 `TableStore` 인터페이스로 추출하는 것이 첫 단계입니다. 자세한 내용은 [검토 문서](REVIEW-timeseries-inmemory.md)를 보세요.

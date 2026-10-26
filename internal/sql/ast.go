@@ -38,6 +38,7 @@ type CreateTable struct {
 	Uniques     [][]string // table constraints UNIQUE (a, b, ...)
 	Checks      []Expr     // table constraints CHECK (...)
 	ForeignKeys []ForeignKey
+	Using       string // storage kind (CREATE TABLE ... USING kind); "" = default
 }
 
 type CreateView struct {
