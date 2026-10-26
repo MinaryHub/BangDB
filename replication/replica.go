@@ -3,6 +3,7 @@ package replication
 import (
 	"bufio"
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
@@ -32,6 +33,8 @@ type ReplicaStatus struct {
 	Seq        uint64 // last applied commit
 	PrimarySeq uint64 // last commit known on the primary
 	Snapshots  int    // snapshots installed since start
+	Lag        uint64 // PrimarySeq - Seq: commits known on the primary but not applied
+	Term       uint64 // the primary's term
 	LastError  string
 }
 
@@ -77,7 +80,11 @@ func StartReplica(db *bangdb.DB, primaryAddr string, opts ReplicaOptions) *Repli
 func (r *Replica) Status() ReplicaStatus {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	return r.status
+	s := r.status
+	if s.PrimarySeq > s.Seq {
+		s.Lag = s.PrimarySeq - s.Seq
+	}
+	return s
 }
 
 // WaitFor blocks until the replica has applied commit seq (e.g. the value of
@@ -163,7 +170,8 @@ func (r *Replica) session() error {
 		return nil
 	}
 	conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
-	if err := writeHello(conn, hello{dbid: r.db.DBID(), seq: r.db.Seq(), token: r.opts.Token}); err != nil {
+	localTerm := r.db.Term()
+	if err := writeHello(conn, hello{dbid: r.db.DBID(), seq: r.db.Seq(), term: localTerm, token: r.opts.Token}); err != nil {
 		return err
 	}
 	rd := bufio.NewReaderSize(&deadlineReader{conn, r.opts.ReadTimeout}, 256<<10)
@@ -175,10 +183,32 @@ func (r *Replica) session() error {
 	case statusOK:
 	case statusUnauthorized:
 		return errors.New("replication: primary rejected the token")
+	case statusStale:
+		return errors.New("replication: the primary was replaced by a newer one (it has an older term) and is now fenced")
 	default:
 		return fmt.Errorf("replication: primary refused connection (status %d)", status)
 	}
-	r.update(func(s *ReplicaStatus) { s.Connected = true; s.LastError = "" })
+	term, err := readU64(rd)
+	if err != nil {
+		return err
+	}
+	if term < localTerm {
+		return fmt.Errorf("replication: the primary's term %d is older than this database's term %d; refusing to follow a stale primary", term, localTerm)
+	}
+	r.update(func(s *ReplicaStatus) { s.Connected = true; s.LastError = ""; s.Term = term })
+	// ack reports the applied sequence once the received data is used up
+	// (acknowledgements of a burst of frames are coalesced).
+	ack := func(seq uint64) error {
+		if rd.Buffered() > 0 {
+			return nil
+		}
+		var b [9]byte
+		b[0] = msgAck
+		binary.BigEndian.PutUint64(b[1:], seq)
+		conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
+		_, err := conn.Write(b[:])
+		return err
+	}
 
 	var snap *engine.SnapshotWriter // non-nil while a snapshot is being received
 	var snapBase, snapEnd uint64
@@ -193,8 +223,9 @@ func (r *Replica) session() error {
 			return err
 		}
 		snap = nil
-		r.update(func(s *ReplicaStatus) { s.Seq = r.db.Seq(); s.Snapshots++ })
-		return nil
+		seq := r.db.Seq()
+		r.update(func(s *ReplicaStatus) { s.Seq = seq; s.Snapshots++ })
+		return ack(seq)
 	}
 	for {
 		typ, err := rd.ReadByte()
@@ -277,12 +308,20 @@ func (r *Replica) session() error {
 				s.Seq = f.Seq
 				s.PrimarySeq = max(s.PrimarySeq, f.Seq)
 			})
+			if err := ack(f.Seq); err != nil {
+				return err
+			}
 		case msgHeartbeat:
 			seq, err := readU64(rd)
 			if err != nil {
 				return err
 			}
 			r.update(func(s *ReplicaStatus) { s.PrimarySeq = seq })
+			if snap == nil {
+				if err := ack(r.db.Seq()); err != nil {
+					return err
+				}
+			}
 		default:
 			return fmt.Errorf("replication: unknown message type %q", typ)
 		}

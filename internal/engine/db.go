@@ -101,6 +101,7 @@ type DB struct {
 	repl     *replLog
 
 	key           []byte // encryption key of the file (nil: plaintext)
+	commitWaiter  atomic.Pointer[func(seq uint64)]
 	counters      dbCounters
 	slowThreshold time.Duration
 	onSlow        func(SlowQuery)
@@ -563,6 +564,9 @@ func (tx *Tx) Commit() error {
 		return err
 	}
 	tx.db.maybeCheckpoint()
+	if w := tx.db.commitWaiter.Load(); w != nil {
+		(*w)(c.Seq())
+	}
 	return nil
 }
 

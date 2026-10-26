@@ -253,7 +253,7 @@
 |----|------|------|------|
 | P2-1 ✅ | 관측성 | `db.Stats()` (캐시 적중률, 커밋 수/지연, WAL 크기, 락 대기), 슬로우 쿼리 로그 훅, `EXPLAIN ANALYZE` | M |
 | P2-2 ✅ | 덤프·이관 | `.dump`(SQL 텍스트), `.import/.export` CSV, SQLite 파일에서 가져오기 | S |
-| P2-3 | 복제 고도화 | 반동기 복제(커밋 시 N개 replica ack 대기), PITR(Frame 스트림 아카이빙 + 특정 시점 복구), replica 지연 메트릭, fencing 토큰 | M |
+| P2-3 ✅ | 복제 고도화 | 반동기 복제(커밋 시 N개 replica ack 대기), PITR(Frame 스트림 아카이빙 + 특정 시점 복구), replica 지연 메트릭, fencing 토큰 | M |
 | P2-4 | 서버 모드 | 여러 프로세스/서비스가 접속해야 하는 경우: 네트워크 프로토콜 + 인증 + 커넥션 관리. (임베디드만 쓴다면 불필요) | L |
 | P2-5 ✅ | 저장 데이터 암호화 | 페이지 단위 암호화 — 구현은 **AES-256-XTS**(페이지에 nonce·태그 자리가 없어 GCM 대신 디스크 암호화 방식 채택, 페이지 내 CRC로 키 오류·손상 검출) | M |
 | P2-6 ✅ | 윈도우 함수, JSON 함수 | `ROW_NUMBER/LAG/...`, `json_extract` | M |

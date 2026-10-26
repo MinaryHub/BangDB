@@ -86,11 +86,27 @@ replica ──hello(DBID, Seq, token)──▶ primary
 ### 상태 확인
 
 ```go
-r.Status()       // {Connected, Seq, PrimarySeq, Snapshots, LastError} → 지연 = PrimarySeq - Seq
-p.Replicas()     // 연결된 replica 목록과 전송한 Seq
+r.Status()       // {Connected, Seq, PrimarySeq, Lag, Term, Snapshots, LastError}
+p.Replicas()     // replica별 {Seq(전송), AckSeq(적용 확인), AckTime, Lag(미적용 커밋 수), LagTime(가장 오래된 미적용 커밋의 나이)}
+p.Stats()        // 반동기 대기 수·타임아웃 수·대기 시간, 펜싱 여부
 ```
 
+replica는 Frame을 적용하면 `'A' seq`로 확인(ack)을 보냅니다(연속 수신 중에는 묶어서). primary는 이를 바탕으로 replica별 지연을 커밋 수와 시간으로 계산합니다.
+
+### 반동기 복제
+
+```go
+p := replication.NewPrimary(db, replication.PrimaryOptions{
+	SyncReplicas: 1,                      // 커밋마다 1개 이상의 replica가 적용할 때까지 대기
+	SyncTimeout:  500 * time.Millisecond, // 넘으면 비동기로 진행(커밋은 성공, Stats().SyncTimeouts 증가)
+})
+```
+
+- 커밋은 primary에서 먼저 내구화된 뒤(그룹 커밋) 응답 전에 replica의 ack를 기다립니다. 정상 상태에서는 **커밋이 반환되면 replica에도 적용되어 있습니다**(`TestSemiSyncReplication`). replica가 모두 끊기면 커밋마다 `SyncTimeout`만큼 지연된 뒤 진행합니다(MySQL 반동기와 같은 강등 방식).
+
 CLI:
+```
+
 ```bash
 bangdb -serve :7070 -token s3cret app.db              # primary + 셸
 bangdb -replica-of host:7070 -token s3cret replica.db  # replica + 셸 (.repl 로 상태 확인)
@@ -103,13 +119,37 @@ r.Promote()   // 복제 중단 + 쓰기 가능 + 새 DBID 부여
 ```
 
 - 승격된 노드는 **새 DBID**를 받습니다. 다른 replica들이 이 노드를 따라오면 이력이 섞이지 않도록 스냅샷부터 다시 받습니다.
-- 기존 primary가 살아나 계속 쓰지 않도록 막는 것(fencing)은 운영 측 책임입니다 (예: 기존 primary 프로세스 중지, 연결 주소 전환).
+- **term(펜싱 토큰)**: 승격할 때마다 term이 1 올라가고(헤더에 저장, `db.Engine().Term()`), replica는 primary의 term을 그대로 가집니다. 새 term의 노드가 옛 primary에 접속하면 옛 primary는 자신이 교체되었음을 알고 **읽기 전용으로 전환**합니다(`OnFenced` 콜백, `Stats().Fenced`). replica는 자기보다 낮은 term의 primary를 따르지 않습니다(`TestFencingAfterFailover`). term은 외부 시스템(락 서비스, 스토리지)에 함께 넘겨 늦게 도착한 옛 primary의 요청을 거부하는 토큰으로도 쓸 수 있습니다.
+- 옛 primary를 확실히 멈추는 것(프로세스 중지, 연결 주소 전환)은 여전히 권장됩니다: 펜싱은 새 term의 노드가 옛 primary에 닿아야 동작합니다.
+
+## 3-1. 연속 아카이빙과 특정 시점 복구 (PITR)
+
+```go
+a, _ := replication.StartArchiver(db, "/backup/archive", replication.ArchiveOptions{
+	SegmentBytes: 64 << 20, // 세그먼트 파일 크기
+	BaseEvery:    1 << 30,  // 커밋 1GiB마다 새 베이스 백업 (복구 시간 상한)
+	KeepBases:    7,        // 오래된 베이스와 그것만 필요로 하는 세그먼트 삭제
+	Key:          archiveKey, // 선택: 세그먼트를 AES-256-GCM으로 암호화
+})
+defer a.Stop()
+
+// 복구: 지정한 커밋 또는 시각까지 (둘 다 없으면 끝까지)
+res, err := replication.Restore("/backup/archive", "restored.db", replication.RestoreOptions{
+	Time: time.Date(2026, 10, 26, 9, 30, 0, 0, time.Local), // 또는 Seq: 12345
+	Key: dbKey, ArchiveKey: archiveKey,
+})
+```
+
+- 아카이버는 primary 안에서 replica와 같은 커밋 스트림을 구독해 **베이스 백업 + 커밋(Frame) 세그먼트**를 디렉터리에 씁니다. 커밋 시각이 함께 기록되어 시각 기준 복구가 가능합니다. 세그먼트는 `SyncInterval`(기본 1초)마다 fsync합니다.
+- 다시 시작하면 기존 체인에 이어 씁니다(새 베이스 없음). 너무 뒤처졌거나 VACUUM·승격으로 DB 식별자가 바뀌면 새 베이스로 새 체인을 시작합니다.
+- `Restore`는 목표 이전의 가장 최근 베이스를 복사하고 그 뒤 커밋을 재생한 뒤 **새 타임라인으로 승격**(새 DBID, term+1)합니다. 베이스 백업은 DB와 같은 키로 암호화됩니다.
 
 ## 4. 보장과 한계
 
 | 항목 | 내용 |
 |------|------|
-| 복제 방식 | **비동기**. primary 커밋 완료 후 replica에 전달됨. primary 장애 시 아직 전송되지 않은 마지막 커밋들은 replica에 없을 수 있음 |
+| 복제 방식 | 기본 **비동기**(primary 장애 시 아직 전송되지 않은 마지막 커밋들은 replica에 없을 수 있음). `SyncReplicas`로 **반동기**: 정상 시 커밋 반환 = N개 replica 적용 완료, 타임아웃 시 비동기로 강등 |
+| 프로토콜 | 버전 2 (term·ack·커밋 시각 포함). 버전이 다른 노드끼리는 연결을 거부하므로 primary와 replica를 같은 버전으로 올려야 함 |
 | 일관성 | replica는 항상 primary의 어떤 커밋 시점과 정확히 같은 상태 (중간 상태 노출 없음) |
 | 쓰기 확장 | 쓰기는 primary 한 곳. replica는 읽기 확장용 (샤딩 아님) |
 | 전송 단위 | 페이지(4KB) 단위. 작은 UPDATE도 변경된 페이지 전체를 전송 |
@@ -121,6 +161,5 @@ r.Promote()   // 복제 중단 + 쓰기 가능 + 새 DBID 부여
 
 ## 5. 향후 확장 후보
 
-- **동기/반동기 복제**: primary가 커밋 응답 전에 N개 replica의 수신 확인(ack)을 기다리는 모드 (`WaitFor`의 역방향).
-- **연속 아카이빙(PITR)**: Frame 스트림을 파일로 저장하면 "백업 + 로그 재생"으로 특정 시점 복구 가능. 현재 프로토콜을 그대로 재사용할 수 있음.
+- **자동 장애 조치**: 현재 승격은 수동(`Promote`). 합의(Raft 등) 기반 리더 선출은 범위 밖.
 - **원격 백업**: replica에 연결해 `.backup`을 실행하면 primary 부하 없이 백업 가능 (현재도 가능).

@@ -17,6 +17,7 @@ import (
 	"fmt"
 	"hash/crc32"
 	"io"
+	"time"
 
 	"github.com/knoxxr/bangdb/internal/engine"
 	"github.com/knoxxr/bangdb/internal/pager"
@@ -24,27 +25,35 @@ import (
 
 // Wire protocol (all integers big-endian):
 //
-//	replica -> primary  hello:   "BREP" ver(1) dbid(16) seq(8) tokenLen(2) token
-//	primary -> replica  status:  0 = ok, 1 = unauthorized, 2 = bad request
+//	replica -> primary  hello:   "BREP" ver(1) dbid(16) seq(8) term(8) tokenLen(2) token
+//	primary -> replica  status:  0 = ok, 1 = unauthorized, 2 = bad request,
+//	                             3 = stale primary (the replica has a newer term)
+//	                    then, if ok: term(8)
 //	primary -> replica  messages, each starting with a type byte:
 //	  'S' dbid(16) baseSeq(8) pageCount(4)        snapshot begins
 //	  'P' pgno(4) page(4096) crc(4)               snapshot page
 //	  'E' endSeq(8)                               snapshot pages done
-//	  'F' seq(8) n(4) n*(pgno(4) page(4096)) crc(4)  committed transaction
+//	  'F' seq(8) unixNano(8) n(4) n*(pgno(4) page(4096)) crc(4)  committed transaction
 //	  'H' primarySeq(8)                           heartbeat
+//	replica -> primary  acknowledgements:
+//	  'A' seq(8)                                  applied up to seq
+//
+// The same frame encoding is used by archive segments (see Archiver).
 const (
 	helloMagic = "BREP"
-	version    = 1
+	version    = 2
 
 	statusOK           = 0
 	statusUnauthorized = 1
 	statusBadRequest   = 2
+	statusStale        = 3
 
 	msgSnapshot  = 'S'
 	msgPage      = 'P'
 	msgSnapEnd   = 'E'
 	msgFrame     = 'F'
 	msgHeartbeat = 'H'
+	msgAck       = 'A'
 
 	maxFramePages = 1 << 20
 )
@@ -54,6 +63,7 @@ var errChecksum = errors.New("replication: checksum mismatch")
 type hello struct {
 	dbid  [16]byte
 	seq   uint64
+	term  uint64
 	token string
 }
 
@@ -62,6 +72,7 @@ func writeHello(w io.Writer, h hello) error {
 	b = append(b, version)
 	b = append(b, h.dbid[:]...)
 	b = binary.BigEndian.AppendUint64(b, h.seq)
+	b = binary.BigEndian.AppendUint64(b, h.term)
 	b = binary.BigEndian.AppendUint16(b, uint16(len(h.token)))
 	b = append(b, h.token...)
 	_, err := w.Write(b)
@@ -70,16 +81,20 @@ func writeHello(w io.Writer, h hello) error {
 
 func readHello(r io.Reader) (hello, error) {
 	var h hello
-	head := make([]byte, 4+1+16+8+2)
-	if _, err := io.ReadFull(r, head); err != nil {
+	head := make([]byte, 4+1+16+8+8+2)
+	if _, err := io.ReadFull(r, head[:5]); err != nil {
 		return h, err
 	}
 	if string(head[:4]) != helloMagic || head[4] != version {
-		return h, errors.New("replication: bad hello")
+		return h, errors.New("replication: bad hello (or a replica of another version)")
+	}
+	if _, err := io.ReadFull(r, head[5:]); err != nil {
+		return h, err
 	}
 	copy(h.dbid[:], head[5:21])
 	h.seq = binary.BigEndian.Uint64(head[21:29])
-	tok := make([]byte, binary.BigEndian.Uint16(head[29:31]))
+	h.term = binary.BigEndian.Uint64(head[29:37])
+	tok := make([]byte, binary.BigEndian.Uint16(head[37:39]))
 	if _, err := io.ReadFull(r, tok); err != nil {
 		return h, err
 	}
@@ -109,8 +124,14 @@ func writePage(w *bufio.Writer, no uint32, data []byte) error {
 func writeFrame(w *bufio.Writer, f engine.Frame) error {
 	w.WriteByte(msgFrame)
 	writeU64(w, f.Seq)
+	var ts [8]byte
+	if !f.Time.IsZero() {
+		binary.BigEndian.PutUint64(ts[:], uint64(f.Time.UnixNano()))
+	}
+	w.Write(ts[:])
 	writeU32(w, uint32(len(f.Pages)))
 	crc := crc32.NewIEEE()
+	crc.Write(ts[:])
 	var nb [4]byte
 	for _, p := range f.Pages {
 		binary.BigEndian.PutUint32(nb[:], p.No)
@@ -169,6 +190,13 @@ func readFrame(r io.Reader) (engine.Frame, error) {
 	if f.Seq, err = readU64(r); err != nil {
 		return f, err
 	}
+	var ts [8]byte
+	if _, err := io.ReadFull(r, ts[:]); err != nil {
+		return f, err
+	}
+	if t := binary.BigEndian.Uint64(ts[:]); t != 0 {
+		f.Time = time.Unix(0, int64(t))
+	}
 	n, err := readU32(r)
 	if err != nil {
 		return f, err
@@ -177,6 +205,7 @@ func readFrame(r io.Reader) (engine.Frame, error) {
 		return f, fmt.Errorf("replication: invalid frame size %d", n)
 	}
 	crc := crc32.NewIEEE()
+	crc.Write(ts[:])
 	for i := uint32(0); i < n; i++ {
 		buf := make([]byte, 4+pager.PageSize)
 		if _, err := io.ReadFull(r, buf); err != nil {

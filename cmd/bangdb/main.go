@@ -200,10 +200,11 @@ SQL statements end with ';'. BEGIN/COMMIT/ROLLBACK are supported.`)
 			fmt.Fprintln(s.out, strings.Join(problems, "\n"))
 		}
 	case ".repl":
-		fmt.Fprintf(s.out, "seq %d, read-only %v\n", s.db.Seq(), s.db.ReadOnly())
+		fmt.Fprintf(s.out, "seq %d, term %d, read-only %v\n", s.db.Seq(), s.db.Term(), s.db.ReadOnly())
 		if s.primary != nil {
 			for _, r := range s.primary.Replicas() {
-				fmt.Fprintf(s.out, "replica %s: sent seq %d, snapshots %d, since %s\n", r.Addr, r.Seq, r.Snapshots, r.Since.Format(time.RFC3339))
+				fmt.Fprintf(s.out, "replica %s: sent %d, applied %d, lag %d commits (%s), snapshots %d, since %s\n",
+					r.Addr, r.Seq, r.AckSeq, r.Lag, r.LagTime.Round(time.Millisecond), r.Snapshots, r.Since.Format(time.RFC3339))
 			}
 		}
 		if s.replica != nil {

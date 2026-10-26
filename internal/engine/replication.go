@@ -7,6 +7,7 @@ import (
 	"os"
 	"sort"
 	"sync"
+	"time"
 
 	"github.com/knoxxr/bangdb/internal/pager"
 )
@@ -43,6 +44,7 @@ type PageImage struct {
 // number and include the header page 0.
 type Frame struct {
 	Seq   uint64
+	Time  time.Time // when the primary committed it (zero if unknown)
 	Pages []PageImage
 }
 
@@ -80,7 +82,7 @@ func (l *replLog) onCommit(seq uint64, pages map[uint32][]byte) {
 		l.frames, l.bytes = nil, 0
 		return
 	}
-	f := Frame{Seq: seq, Pages: make([]PageImage, 0, len(pages))}
+	f := Frame{Seq: seq, Time: time.Now(), Pages: make([]PageImage, 0, len(pages))}
 	for no, data := range pages {
 		f.Pages = append(f.Pages, PageImage{no, data}) // page slices are immutable
 	}
@@ -281,6 +283,9 @@ func (db *DB) SetReadOnly(ro bool) { db.readOnly.Store(ro) }
 // Promote turns a replica into a writable primary. The database gets a new
 // identity so that other replicas re-synchronize from a fresh snapshot
 // instead of mixing histories.
+//
+// Promotion also starts a new term (see Term), which fences the old
+// primary off from replicas that follow the new one.
 func (db *DB) Promote() error {
 	db.readOnly.Store(false)
 	tx, err := db.Begin()
@@ -288,7 +293,33 @@ func (db *DB) Promote() error {
 		return err
 	}
 	tx.v.NewIdentity()
+	tx.v.SetMeta(metaTerm, tx.v.Meta(metaTerm)+1)
 	return tx.Commit()
+}
+
+// metaTerm is the header meta slot holding the replication term.
+const metaTerm = 2
+
+// Term returns the replication term: 0 for a database that was never
+// promoted, +1 for every promotion in its history. Replicas share their
+// primary's term. A primary that meets a replica with a higher term has
+// been replaced and stops accepting writes; applications can also pass the
+// term to external systems as a fencing token.
+func (db *DB) Term() uint64 {
+	db.swapMu.RLock()
+	defer db.swapMu.RUnlock()
+	return uint64(db.p.Header().Meta[metaTerm])
+}
+
+// SetCommitWaiter installs fn, called after every local commit is durable
+// and before the commit returns, with the commit's sequence number (nil
+// removes it). Semi-synchronous replication uses it to wait for replicas.
+func (db *DB) SetCommitWaiter(fn func(seq uint64)) {
+	if fn == nil {
+		db.commitWaiter.Store(nil)
+		return
+	}
+	db.commitWaiter.Store(&fn)
 }
 
 // Path returns the database file path ("" for in-memory databases).
