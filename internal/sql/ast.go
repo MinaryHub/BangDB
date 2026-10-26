@@ -275,6 +275,35 @@ type Func struct {
 	Args     []Expr
 	Star     bool // COUNT(*)
 	Distinct bool
+	Over     *Window // window function call: f(...) OVER (...)
+}
+
+// Window is the OVER clause of a window function.
+type Window struct {
+	PartitionBy []Expr
+	OrderBy     []OrderItem
+	Frame       *Frame // nil: the default frame
+}
+
+// Frame is ROWS|RANGE BETWEEN Start AND End.
+type Frame struct {
+	Rows       bool
+	Start, End FrameBound
+}
+
+// Frame bound kinds.
+const (
+	UnboundedPreceding = iota
+	Preceding
+	CurrentRow
+	Following
+	UnboundedFollowing
+)
+
+// FrameBound is one end of a frame; N is the offset of Preceding/Following.
+type FrameBound struct {
+	Kind int
+	N    Expr
 }
 
 type Case struct {

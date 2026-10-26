@@ -121,6 +121,45 @@ func formatExpr(sb *strings.Builder, e Expr) {
 			formatExpr(sb, a)
 		}
 		sb.WriteString(")")
+		if x.Over != nil {
+			sb.WriteString(" OVER (")
+			sep := ""
+			if len(x.Over.PartitionBy) > 0 {
+				sb.WriteString("PARTITION BY ")
+				for i, a := range x.Over.PartitionBy {
+					if i > 0 {
+						sb.WriteString(", ")
+					}
+					formatExpr(sb, a)
+				}
+				sep = " "
+			}
+			if len(x.Over.OrderBy) > 0 {
+				sb.WriteString(sep + "ORDER BY ")
+				for i, o := range x.Over.OrderBy {
+					if i > 0 {
+						sb.WriteString(", ")
+					}
+					formatExpr(sb, o.Expr)
+					if o.Desc {
+						sb.WriteString(" DESC")
+					}
+				}
+				sep = " "
+			}
+			if f := x.Over.Frame; f != nil {
+				sb.WriteString(sep)
+				if f.Rows {
+					sb.WriteString("ROWS BETWEEN ")
+				} else {
+					sb.WriteString("RANGE BETWEEN ")
+				}
+				formatBound(sb, f.Start)
+				sb.WriteString(" AND ")
+				formatBound(sb, f.End)
+			}
+			sb.WriteString(")")
+		}
 	case *Collate:
 		formatExpr(sb, x.X)
 		sb.WriteString(" COLLATE " + x.Name)
@@ -165,4 +204,21 @@ func ParseExpr(src string) (Expr, error) {
 		return nil, p.errf("unexpected trailing input")
 	}
 	return e, nil
+}
+
+func formatBound(sb *strings.Builder, b FrameBound) {
+	switch b.Kind {
+	case UnboundedPreceding:
+		sb.WriteString("UNBOUNDED PRECEDING")
+	case UnboundedFollowing:
+		sb.WriteString("UNBOUNDED FOLLOWING")
+	case CurrentRow:
+		sb.WriteString("CURRENT ROW")
+	case Preceding:
+		formatExpr(sb, b.N)
+		sb.WriteString(" PRECEDING")
+	default:
+		formatExpr(sb, b.N)
+		sb.WriteString(" FOLLOWING")
+	}
 }

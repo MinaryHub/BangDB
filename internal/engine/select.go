@@ -30,6 +30,7 @@ type selectPlan struct {
 	orderBy []orderFn
 	agg     bool
 	aggs    []*aggSpec
+	wins    []*winSpec
 	groupBy []evalFn
 	having  evalFn
 	ordered bool // the scan already delivers rows in ORDER BY order
@@ -74,7 +75,7 @@ func (x *execCtx) planSelect(st *sql.Select) (*selectPlan, error) {
 			p.agg = true
 		}
 	}
-	c := &compiler{x: x, sc: p.sc, allowAgg: p.agg, aggs: &p.aggs}
+	c := &compiler{x: x, sc: p.sc, allowAgg: p.agg, aggs: &p.aggs, wins: &p.wins}
 
 	// Projection.
 	var exprs []sql.Expr
@@ -148,7 +149,7 @@ func (x *execCtx) planSelect(st *sql.Select) (*selectPlan, error) {
 		p.orderBy = append(p.orderBy, of)
 	}
 
-	if !p.agg && !st.Distinct && len(st.OrderBy) > 0 && len(p.levels) > 0 {
+	if !p.agg && !st.Distinct && len(st.OrderBy) > 0 && len(p.levels) > 0 && len(p.wins) == 0 {
 		p.ordered = p.useScanOrder(st)
 	}
 	if p.agg {
@@ -164,7 +165,9 @@ func (x *execCtx) planSelect(st *sql.Select) (*selectPlan, error) {
 			p.groupBy = append(p.groupBy, withCollation(f, gc.collationOf(g)))
 		}
 		if st.Having != nil {
-			if p.having, err = c.compile(st.Having); err != nil {
+			hc := *c
+			hc.wins = nil
+			if p.having, err = hc.compile(st.Having); err != nil {
 				return nil, err
 			}
 		}
@@ -350,7 +353,7 @@ func (x *execCtx) runSelect(r *selectRun, sink func(vals []any) (bool, error)) e
 		return x.runCompound(r, sink)
 	}
 	p, st, limit, offset := r.p, r.st, r.limit, r.offset
-	if !p.agg && (len(p.orderBy) == 0 || p.ordered) && !st.Distinct {
+	if !p.agg && (len(p.orderBy) == 0 || p.ordered) && !st.Distinct && len(p.wins) == 0 {
 		return x.runStreaming(r, sink)
 	}
 	e := &env{row: make([]any, len(p.sc.cols)), args: x.args}
@@ -468,10 +471,21 @@ func (x *execCtx) runSelect(r *selectRun, sink func(vals []any) (bool, error)) e
 		}
 		return stage(row)
 	}
+	// With window functions the rows are collected first; they are
+	// projected once the windows are computed.
+	var winRows []winRow
+	produce := project
+	if len(p.wins) > 0 {
+		produce = func() error {
+			r, err := collectWindowRow(p.wins, e)
+			winRows = append(winRows, r)
+			return err
+		}
+	}
 
 	if !p.agg {
 		emit := func() (bool, error) {
-			if err := project(); err != nil {
+			if err := produce(); err != nil {
 				return false, err
 			}
 			return !stopped, nil
@@ -489,8 +503,21 @@ func (x *execCtx) runSelect(r *selectRun, sink func(vals []any) (bool, error)) e
 				return err
 			}
 		}
-	} else if err := x.runGrouped(p, e, project); err != nil {
+	} else if err := x.runGrouped(p, e, produce); err != nil {
 		return err
+	}
+	if len(p.wins) > 0 {
+		vals, err := computeWindows(p.wins, winRows, x.args)
+		if err != nil {
+			return err
+		}
+		for i, r := range winRows {
+			e.row, e.aggs, e.wins = r.row, r.aggs, vals[i]
+			if err := project(); err != nil {
+				return err
+			}
+			winRows[i] = winRow{}
+		}
 	}
 	if distinctSort != nil {
 		it, err := distinctSort.Finish()

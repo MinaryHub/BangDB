@@ -17,6 +17,7 @@ import (
 type env struct {
 	row  []any // combined row of all tables in scope
 	aggs []any // aggregate results for the current group
+	wins []any // window function results for the current row
 	args []any // bound parameters
 	buf  [8]any
 }
@@ -119,13 +120,14 @@ type compiler struct {
 	sc       *scope
 	allowAgg bool
 	aggs     *[]*aggSpec
+	wins     *[]*winSpec         // nil where window functions are not allowed
 	aliases  map[string]sql.Expr // SELECT aliases usable in HAVING / ORDER BY
 }
 
 var aggregateFuncs = map[string]bool{"COUNT": true, "SUM": true, "AVG": true, "MIN": true, "MAX": true, "TOTAL": true, "GROUP_CONCAT": true}
 
 func isAggregateCall(f *sql.Func) bool {
-	if !aggregateFuncs[f.Name] {
+	if !aggregateFuncs[f.Name] || f.Over != nil {
 		return false
 	}
 	// min(a, b) / max(a, b) are scalar functions.
@@ -171,6 +173,14 @@ func walk(e sql.Expr, fn func(sql.Expr)) {
 	case *sql.Func:
 		for _, a := range x.Args {
 			walk(a, fn)
+		}
+		if x.Over != nil {
+			for _, p := range x.Over.PartitionBy {
+				walk(p, fn)
+			}
+			for _, o := range x.Over.OrderBy {
+				walk(o.Expr, fn)
+			}
 		}
 	case *sql.Collate:
 		walk(x.X, fn)
@@ -707,6 +717,12 @@ func (c *compiler) compileCase(x *sql.Case) (evalFn, error) {
 }
 
 func (c *compiler) compileFunc(f *sql.Func) (evalFn, error) {
+	if f.Over != nil {
+		return c.compileWindow(f)
+	}
+	if isWindowOnly(f.Name) {
+		return nil, fmt.Errorf("bangdb: %s() requires an OVER clause", f.Name)
+	}
 	if isAggregateCall(f) {
 		if !c.allowAgg || c.aggs == nil {
 			return nil, fmt.Errorf("bangdb: misuse of aggregate function %s()", f.Name)

@@ -1314,13 +1314,100 @@ func (p *parser) parsePrimary() (Expr, error) {
 				}
 				f.Args = args
 			} else {
-				return f, nil
+				return f, p.parseOver(f)
 			}
-			return f, p.expectOp(")")
+			if err := p.expectOp(")"); err != nil {
+				return nil, err
+			}
+			return f, p.parseOver(f)
 		}
 		return p.columnRest(t.text)
 	}
 	return nil, p.errf("expected expression")
+}
+
+// parseOver parses an optional OVER (PARTITION BY ... ORDER BY ... frame)
+// after a function call.
+func (p *parser) parseOver(f *Func) error {
+	if !p.acceptKw("OVER") {
+		return nil
+	}
+	if err := p.expectOp("("); err != nil {
+		return err
+	}
+	w := &Window{}
+	var err error
+	if p.acceptKw("PARTITION", "BY") {
+		if w.PartitionBy, err = p.parseExprList(); err != nil {
+			return err
+		}
+	}
+	if p.acceptKw("ORDER", "BY") {
+		for {
+			e, err := p.parseExpr()
+			if err != nil {
+				return err
+			}
+			oi := OrderItem{Expr: e}
+			if p.acceptKw("DESC") {
+				oi.Desc = true
+			} else {
+				p.acceptKw("ASC")
+			}
+			w.OrderBy = append(w.OrderBy, oi)
+			if !p.acceptOp(",") {
+				break
+			}
+		}
+	}
+	if rows, rng := p.isKw("ROWS"), p.isKw("RANGE"); rows || rng {
+		p.next()
+		fr := &Frame{Rows: rows}
+		if p.acceptKw("BETWEEN") {
+			if fr.Start, err = p.parseFrameBound(); err != nil {
+				return err
+			}
+			if err := p.expectKw("AND"); err != nil {
+				return err
+			}
+			if fr.End, err = p.parseFrameBound(); err != nil {
+				return err
+			}
+		} else {
+			if fr.Start, err = p.parseFrameBound(); err != nil {
+				return err
+			}
+			fr.End = FrameBound{Kind: CurrentRow}
+		}
+		if fr.Start.Kind == UnboundedFollowing || fr.End.Kind == UnboundedPreceding || fr.Start.Kind > fr.End.Kind {
+			return p.errf("invalid window frame")
+		}
+		w.Frame = fr
+	}
+	f.Over = w
+	return p.expectOp(")")
+}
+
+func (p *parser) parseFrameBound() (FrameBound, error) {
+	switch {
+	case p.acceptKw("UNBOUNDED", "PRECEDING"):
+		return FrameBound{Kind: UnboundedPreceding}, nil
+	case p.acceptKw("UNBOUNDED", "FOLLOWING"):
+		return FrameBound{Kind: UnboundedFollowing}, nil
+	case p.acceptKw("CURRENT", "ROW"):
+		return FrameBound{Kind: CurrentRow}, nil
+	}
+	n, err := p.parseAdditive()
+	if err != nil {
+		return FrameBound{}, err
+	}
+	switch {
+	case p.acceptKw("PRECEDING"):
+		return FrameBound{Kind: Preceding, N: n}, nil
+	case p.acceptKw("FOLLOWING"):
+		return FrameBound{Kind: Following, N: n}, nil
+	}
+	return FrameBound{}, p.errf("expected PRECEDING or FOLLOWING")
 }
 
 func (p *parser) columnRest(first string) (Expr, error) {
