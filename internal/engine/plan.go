@@ -67,8 +67,8 @@ type level struct {
 	offset  int // first slot of this table in env.row
 	left    bool
 	acc     *access
-	filters []evalFn // conditions checked once this level's row is bound
-	virtual [][]any  // rows of a derived table (FROM (SELECT ...))
+	filters []evalFn    // conditions checked once this level's row is bound
+	virtual [][]any     // rows of a derived table (FROM (SELECT ...))
 	stats   *levelStats // set by EXPLAIN ANALYZE
 }
 
