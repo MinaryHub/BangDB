@@ -153,6 +153,29 @@ sdb, _ := sql.Open("bangdb", "bangdb://app:s3cret@db.internal:7432?tls=1")
 - 인증은 비밀번호 또는 `Options.Authenticate(user, password)` 콜백, 암호화는 TLS. 루프백 왕복 지연은 단건 조회 약 44 µs.
 - CLI: `bangdb -listen :7432 -password s3cret [-tls-cert c.pem -tls-key k.pem] app.db`, 원격 셸 `bangdb -connect bangdb://app:s3cret@host:7432`.
 
+### HTTP/JSON API (다른 언어·브라우저·웹 도구용)
+
+```bash
+bangdb -http :18080 -password s3cret [-http-cors https://admin.example.com] [-http-readonly] app.db
+```
+
+```bash
+curl -H 'Authorization: Bearer s3cret' -d '{"sql":"INSERT INTO users (name) VALUES (?)","args":["kim"]}' localhost:18080/exec
+curl -H 'Authorization: Bearer s3cret' -d '{"sql":"SELECT * FROM users WHERE id = :id","args":{"id":1}}' localhost:18080/query
+curl -H 'Authorization: Bearer s3cret' -d '{"statements":[{"sql":"..."},{"sql":"..."}]}' localhost:18080/batch
+```
+
+| 엔드포인트 | 내용 |
+|---|---|
+| `POST /query` | SELECT·EXPLAIN만. `{"columns","types","rows"}`를 스트리밍으로 반환 |
+| `POST /exec` | 모든 문장. `{"rowsAffected","lastInsertId"}` (+ RETURNING이면 `columns`,`rows`) |
+| `POST /batch` | 여러 문장을 **한 트랜잭션**으로 (하나라도 실패하면 전부 취소, 실패 위치 `statement`) |
+| `GET /health`, `GET /stats` | 상태·버전, `db.Stats()` |
+
+- 인자는 배열(`?`) 또는 객체(`:name`). 값: `null`, 숫자(정수는 정확히 유지), 문자열, `true/false`(1/0), BLOB은 `{"$blob":"<base64>"}`(결과도 같은 형식).
+- 오류는 `{"error","code"}` + HTTP 상태: 400 SQL 오류, 401 인증, 403 읽기 전용, 409 제약 위반, 499 중단, 503 쓰기 락 대기 초과.
+- 요청마다 독립(세션 없음)이라 `BEGIN/COMMIT`은 쓸 수 없고 트랜잭션은 `/batch`로. 성능·세션이 필요하면 바이너리 프로토콜(`-listen`)을 쓰세요. `-tls-cert/-tls-key`를 주면 HTTPS. Go에서는 `httpapi.New(db, opts)`를 `http.Handler`로 붙일 수 있습니다.
+
 ### 저장 데이터 암호화
 
 ```go

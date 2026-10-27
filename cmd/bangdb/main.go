@@ -14,6 +14,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
 	"os/signal"
 	"sort"
@@ -24,6 +25,7 @@ import (
 
 	"github.com/knoxxr/bangdb"
 	"github.com/knoxxr/bangdb/client"
+	"github.com/knoxxr/bangdb/httpapi"
 	"github.com/knoxxr/bangdb/internal/engine"
 	"github.com/knoxxr/bangdb/internal/value"
 	"github.com/knoxxr/bangdb/replication"
@@ -39,9 +41,12 @@ func main() {
 	tlsCert := flag.String("tls-cert", "", "TLS certificate file (server mode)")
 	tlsKey := flag.String("tls-key", "", "TLS key file (server mode)")
 	showVersion := flag.Bool("version", false, "print the version and exit")
+	httpAddr := flag.String("http", "", "serve the HTTP/JSON API on this address (e.g. :18080); -password is the bearer token")
+	httpCORS := flag.String("http-cors", "", "comma-separated origins allowed to call the HTTP API from browsers (* = any)")
+	httpRO := flag.Bool("http-readonly", false, "HTTP API: allow only /query")
 	connect := flag.String("connect", "", "run the shell against a server: bangdb://user:password@host:port")
 	flag.Usage = func() {
-		fmt.Fprintln(os.Stderr, "usage: bangdb [-serve addr | -replica-of addr] [-token t] [-listen addr [-password p] [-tls-cert f -tls-key f]] [database] [sql...]")
+		fmt.Fprintln(os.Stderr, "usage: bangdb [-serve addr | -replica-of addr] [-token t] [-listen addr] [-http addr [-http-cors origins]] [-password p] [-tls-cert f -tls-key f] [database] [sql...]")
 		fmt.Fprintln(os.Stderr, "       bangdb -connect bangdb://user:password@host:port [sql...]")
 		flag.PrintDefaults()
 	}
@@ -87,6 +92,30 @@ func main() {
 		defer srv.Close()
 		fmt.Fprintf(os.Stderr, "serving clients on %s\n", *listen)
 	}
+	if *httpAddr != "" {
+		var origins []string
+		for _, o := range strings.Split(*httpCORS, ",") {
+			if o = strings.TrimSpace(o); o != "" {
+				origins = append(origins, o)
+			}
+		}
+		hs := &http.Server{Addr: *httpAddr, Handler: httpapi.New(pub, httpapi.Options{
+			Token: *password, AllowOrigins: origins, ReadOnly: *httpRO})}
+		go func() {
+			var err error
+			if *tlsCert != "" {
+				err = hs.ListenAndServeTLS(*tlsCert, *tlsKey)
+			} else {
+				err = hs.ListenAndServe()
+			}
+			if err != nil && err != http.ErrServerClosed {
+				fmt.Fprintln(os.Stderr, "http:", err)
+				os.Exit(1)
+			}
+		}()
+		defer hs.Close()
+		fmt.Fprintf(os.Stderr, "serving the HTTP API on %s\n", *httpAddr)
+	}
 	if *serve != "" {
 		p := replication.NewPrimary(pub, replication.PrimaryOptions{Token: *token})
 		go func() {
@@ -118,7 +147,7 @@ func main() {
 	}
 	sh.loop(os.Stdin, interactive)
 	sh.conn.Close()
-	if *serve != "" || *replicaOf != "" || *listen != "" {
+	if *serve != "" || *replicaOf != "" || *listen != "" || *httpAddr != "" {
 		// Keep replicating after stdin is closed until interrupted.
 		sig := make(chan os.Signal, 1)
 		signal.Notify(sig, os.Interrupt, syscall.SIGTERM)

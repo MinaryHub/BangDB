@@ -81,3 +81,18 @@ func (s *Stmt) query(ctx context.Context, args []any, maxRows int) (*Rows, error
 	}
 	return s.db.stream(ctx, s.sel, nargs, maxRows, s.src, args, &s.plans)
 }
+
+// ReadOnlySQL reports whether src parses and consists only of statements
+// that do not change the database (SELECT, EXPLAIN).
+func (db *DB) ReadOnlySQL(src string) (bool, error) {
+	pr, err := db.parse(src)
+	if err != nil {
+		return false, err
+	}
+	for _, s := range pr.stmts {
+		if !isReadOnly(s) {
+			return false, nil
+		}
+	}
+	return len(pr.stmts) > 0, nil
+}
