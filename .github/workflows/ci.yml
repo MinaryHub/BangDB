@@ -24,6 +24,11 @@ jobs:
         run: test -z "$(gofmt -l .)" || (gofmt -l . && exit 1)
       - name: vet
         run: go vet ./...
+      - name: 32-bit (armeabi-v7a and x86 Android builds are 32-bit)
+        if: runner.os == 'Linux'
+        env:
+          GOARCH: "386"
+        run: go vet ./... && go test -count=1 ./...
       - name: test
         run: go test -count=1 ./...
       - name: race

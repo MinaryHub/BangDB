@@ -32,7 +32,7 @@ func (db *DB) Migrate(ctx context.Context, steps []Migration) ([]int, error) {
 	steps = append([]Migration(nil), steps...)
 	sort.Slice(steps, func(i, j int) bool { return steps[i].Version < steps[j].Version })
 	for i, m := range steps {
-		if m.Version <= 0 || m.Version >= 1<<31 {
+		if m.Version <= 0 || int64(m.Version) >= 1<<31 {
 			return nil, fmt.Errorf("bangdb: migration %q: version %d must be between 1 and 2^31-1", m.Name, m.Version)
 		}
 		if i > 0 && steps[i-1].Version == m.Version {
