@@ -29,6 +29,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"sync"
 	"time"
@@ -311,6 +312,12 @@ func OpenEncrypted(path string, key []byte) (*Pager, error) {
 // SyncDir fsyncs the directory containing path so that a created or renamed
 // file survives power loss.
 func SyncDir(path string) error {
+	if runtime.GOOS == "windows" {
+		// Directories cannot be opened for fsync on Windows (access
+		// denied); NTFS journals metadata, so renames and creations are
+		// durable once the file itself is synced.
+		return nil
+	}
 	d, err := os.Open(filepath.Dir(path))
 	if err != nil {
 		return err

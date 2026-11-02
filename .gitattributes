@@ -1,0 +1,3 @@
+# Test data must keep its bytes (no CRLF conversion on Windows).
+testdata/** -text
+*.go text eol=lf

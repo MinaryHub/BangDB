@@ -16,7 +16,9 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
-          go-version-file: go.mod
+          # Recent macOS rejects binaries of older toolchains (missing
+          # LC_UUID); test with the current release, and the minimum below.
+          go-version: stable
       - name: gofmt
         if: runner.os == 'Linux'
         run: test -z "$(gofmt -l .)" || (gofmt -l . && exit 1)
@@ -43,6 +45,16 @@ jobs:
         env:
           BANGDB_TEST_STORE: memory
         run: go test -count=1 .
+
+  min-go:
+    # The oldest Go in go.mod must still build and pass.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - run: go test -count=1 ./...
 
   fuzz:
     runs-on: ubuntu-latest

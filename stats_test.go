@@ -4,6 +4,7 @@ import (
 	"context"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -94,6 +95,11 @@ func TestStatsLockWaits(t *testing.T) {
 }
 
 func TestSlowQueryHook(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		// The Windows clock advances in steps of up to ~1ms, so fast
+		// statements measure 0 and are not "slower than 1ns".
+		t.Skip("clock resolution too coarse for a 1ns threshold")
+	}
 	var mu sync.Mutex
 	var got []SlowQuery
 	db, err := OpenWithOptions(":memory:", &Options{SlowQueryThreshold: time.Nanosecond, OnSlowQuery: func(q SlowQuery) {
