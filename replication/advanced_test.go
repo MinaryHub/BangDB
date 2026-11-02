@@ -177,7 +177,7 @@ func TestArchiveAndPointInTimeRestore(t *testing.T) {
 		time.Sleep(15 * time.Millisecond)
 		if round == 2 {
 			// Stopping and restarting continues the chain without a new base.
-			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 			if err := a.WaitFor(ctx, db.Seq()); err != nil {
 				t.Fatal(err)
 			}
@@ -190,7 +190,7 @@ func TestArchiveAndPointInTimeRestore(t *testing.T) {
 			}
 		}
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 	if err := a.WaitFor(ctx, db.Seq()); err != nil {
 		t.Fatal(err)

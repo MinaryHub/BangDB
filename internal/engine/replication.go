@@ -332,6 +332,16 @@ func (db *DB) ReadOnly() bool { return db.readOnly.Load() }
 // ApplyFrame applies a frame from the primary. Frames at or below the local
 // sequence are ignored (idempotent re-delivery). Readers are not blocked.
 func (db *DB) ApplyFrame(f Frame) error {
+	if err := db.ApplyFrameNoSync(f); err != nil {
+		return err
+	}
+	return db.FlushFrames()
+}
+
+// ApplyFrameNoSync is ApplyFrame without making the frame durable and
+// visible: a replica applying a burst of frames calls FlushFrames once at
+// the end (one WAL fsync for all of them, as group commit does).
+func (db *DB) ApplyFrameNoSync(f Frame) error {
 	if err := db.lockWrite(context.Background()); err != nil {
 		return err
 	}
@@ -353,7 +363,17 @@ func (db *DB) ApplyFrame(f Frame) error {
 	}
 	db.p.SetPreparedMeta(c, cat)
 	db.prepared(cat)
-	return db.p.Flush(c)
+	return nil
+}
+
+// FlushFrames makes the frames applied so far durable and visible.
+func (db *DB) FlushFrames() error {
+	db.swapMu.RLock()
+	defer db.swapMu.RUnlock()
+	if db.isClosed() {
+		return pager.ErrClosed
+	}
+	return db.p.FlushAll()
 }
 
 // framePages validates f against the local sequence; nil means "already

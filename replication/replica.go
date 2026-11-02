@@ -218,6 +218,28 @@ func (r *Replica) session() error {
 			snap.Abort()
 		}
 	}()
+	// Frames applied but not yet flushed (made durable and visible).
+	var pending uint64
+	flush := func() error {
+		if pending == 0 {
+			return nil
+		}
+		if err := r.db.FlushFrames(); err != nil {
+			return err
+		}
+		seq := pending
+		pending = 0
+		r.update(func(s *ReplicaStatus) {
+			s.Seq = seq
+			s.PrimarySeq = max(s.PrimarySeq, seq)
+		})
+		return ack(seq)
+	}
+	defer func() {
+		if pending != 0 {
+			r.db.FlushFrames()
+		}
+	}()
 	install := func() error {
 		if err := r.db.InstallSnapshot(snap); err != nil {
 			return err
@@ -301,19 +323,24 @@ func (r *Replica) session() error {
 				}
 				continue
 			}
-			if err := r.db.ApplyFrame(f); err != nil {
+			// Frames that arrived together are applied together: one
+			// fsync when the received data is used up.
+			if err := r.db.ApplyFrameNoSync(f); err != nil {
 				return err
 			}
-			r.update(func(s *ReplicaStatus) {
-				s.Seq = f.Seq
-				s.PrimarySeq = max(s.PrimarySeq, f.Seq)
-			})
-			if err := ack(f.Seq); err != nil {
+			pending = f.Seq
+			if rd.Buffered() > 0 {
+				continue
+			}
+			if err := flush(); err != nil {
 				return err
 			}
 		case msgHeartbeat:
 			seq, err := readU64(rd)
 			if err != nil {
+				return err
+			}
+			if err := flush(); err != nil {
 				return err
 			}
 			r.update(func(s *ReplicaStatus) { s.PrimarySeq = seq })

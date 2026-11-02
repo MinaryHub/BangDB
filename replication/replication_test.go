@@ -76,7 +76,8 @@ func startPrimary(t *testing.T, db *bangdb.DB, opts PrimaryOptions) (*Primary, s
 
 func waitSynced(t *testing.T, r *Replica, primary *bangdb.DB) {
 	t.Helper()
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	// Generous: fsyncs on some CI disks (Windows) take tens of ms each.
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 	if err := r.WaitFor(ctx, primary.Seq()); err != nil {
 		dumpGoroutines(t)
@@ -365,7 +366,7 @@ func TestCascadeAndBackupFromReplica(t *testing.T) {
 	time.Sleep(100 * time.Millisecond)
 	stop()
 	waitSynced(t, r1, primary)
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 	if err := r2.WaitFor(ctx, primary.Seq()); err != nil {
 		t.Fatalf("leaf did not catch up: leaf %+v, mid %+v (mid seq %d, stats %+v), primary seq %d: %v",
