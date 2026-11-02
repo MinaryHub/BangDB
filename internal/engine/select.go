@@ -1189,6 +1189,11 @@ type target struct {
 }
 
 // collect finds the rows of a single table matching where.
+// collectRowsKept is the number of target rows collect keeps in memory; the
+// others keep only their rowid, so that changing millions of rows does not
+// hold them all.
+const collectRowsKept = 4096
+
 func (x *execCtx) collect(t *Table, where sql.Expr) (*scope, []target, error) {
 	sc, levels, final, err := x.buildLevels([]sql.TableRef{{Name: t.Name}}, []bool{false}, []sql.Expr{nil}, where)
 	if err != nil {
@@ -1197,7 +1202,11 @@ func (x *execCtx) collect(t *Table, where sql.Expr) (*scope, []target, error) {
 	e := &env{row: make([]any, len(sc.cols)), args: x.args}
 	var out []target
 	err = x.runJoin(levels, final, e, func() (bool, error) {
-		out = append(out, target{rowid: e.row[len(t.Columns)].(int64), row: append([]any(nil), e.row[:len(t.Columns)]...)})
+		tg := target{rowid: e.row[len(t.Columns)].(int64)}
+		if len(out) < collectRowsKept { // beyond that, read again when used
+			tg.row = append([]any(nil), e.row[:len(t.Columns)]...)
+		}
+		out = append(out, tg)
 		return true, nil
 	})
 	return sc, out, err
@@ -1227,7 +1236,7 @@ func (x *execCtx) execDelete(st *sql.Delete) (Result, error) {
 		res.Columns = ret.cols
 	}
 	for _, tg := range targets {
-		if len(t.referencedBy) > 0 || triggers {
+		if tg.row == nil || len(t.referencedBy) > 0 || triggers {
 			// Foreign key actions or triggers may have removed or changed the row.
 			row, ok, err := x.getRow(t, tg.rowid)
 			if err != nil {
@@ -1296,7 +1305,7 @@ func (x *execCtx) execUpdate(st *sql.Update) (Result, error) {
 		setCols[i] = s.col
 	}
 	for _, tg := range targets {
-		if len(t.referencedBy) > 0 || triggers {
+		if tg.row == nil || len(t.referencedBy) > 0 || triggers {
 			row, ok, err := x.getRow(t, tg.rowid)
 			if err != nil {
 				return Result{}, err

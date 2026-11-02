@@ -21,6 +21,7 @@
 package pager
 
 import (
+	"bufio"
 	"crypto/rand"
 	"encoding/binary"
 	"errors"
@@ -344,36 +345,81 @@ func (p *Pager) readFileHeader() (Header, error) {
 }
 
 // recover applies committed WAL groups newer than the database file, then
-// resets the WAL. A torn or corrupt group ends the replay.
+// resets the WAL. A torn or corrupt group ends the replay. The WAL is read
+// twice, streaming: once to find the final image of every page over the
+// applicable groups, once to copy those images in chunks, so recovery after
+// a very large commit does not need memory for it.
 func (p *Pager) recover() error {
-	data, err := io.ReadAll(io.NewSectionReader(p.wal, 0, 1<<62))
+	st, err := p.wal.Stat()
 	if err != nil {
 		return err
 	}
-	if len(data) == 0 {
+	if st.Size() == 0 {
 		return nil
 	}
-	// Collect the final image of every page over the applicable groups.
-	final := map[uint32][]byte{}
+	final := map[uint32]int64{} // page -> offset of its last applicable image
 	next := p.hdr.Seq + 1
-	for _, g := range parseWAL(data) {
-		if g.seq < next {
-			continue // already checkpointed
+	err = scanWAL(p.wal, st.Size(), func(seq uint64, frames []walFrame) bool {
+		if seq < next {
+			return true // already checkpointed
 		}
-		if g.seq != next {
-			break
+		if seq != next {
+			return false
 		}
-		for _, fr := range g.frames {
-			p.decrypt(fr.pgno, fr.data)
-			final[fr.pgno] = fr.data
+		for _, fr := range frames {
+			final[fr.pgno] = fr.off
 		}
 		next++
+		return true
+	})
+	if err != nil {
+		return err
 	}
 	if len(final) > 0 {
+		nos := make([]uint32, 0, len(final))
+		for no := range final {
+			if no != 0 {
+				nos = append(nos, no)
+			}
+		}
+		sort.Slice(nos, func(i, j int) bool { return nos[i] < nos[j] })
+		read := func(no uint32) ([]byte, error) {
+			b := make([]byte, PageSize)
+			if _, err := p.wal.ReadAt(b, final[no]); err != nil {
+				return nil, err
+			}
+			p.decrypt(no, b)
+			return b, nil
+		}
+		for i := 0; i < len(nos); i += checkpointChunk {
+			pages := map[uint32][]byte{}
+			for _, no := range nos[i:min(i+checkpointChunk, len(nos))] {
+				b, err := read(no)
+				if err != nil {
+					return err
+				}
+				pages[no] = b
+			}
+			if err := p.writePages(pages, false); err != nil {
+				return err
+			}
+		}
+		if err := p.file.Sync(); err != nil {
+			return err
+		}
 		// The header goes last: if we crash before it is durable, the next
 		// recovery replays the same groups again.
-		if err := p.writePagesHeaderLast(final); err != nil {
-			return err
+		if _, ok := final[0]; ok {
+			hdr, err := read(0)
+			if err != nil {
+				return err
+			}
+			if _, err := p.file.WriteAt(hdr, 0); err != nil {
+				return err
+			}
+			if err := p.file.Sync(); err != nil {
+				return err
+			}
 		}
 		if p.hdr, err = p.readFileHeader(); err != nil {
 			return err
@@ -385,54 +431,58 @@ func (p *Pager) recover() error {
 	return p.wal.Sync()
 }
 
-type frame struct {
+// walFrame locates one page image in the WAL.
+type walFrame struct {
 	pgno uint32
-	data []byte
+	off  int64 // offset of the page image
 }
 
-type walGroup struct {
-	seq    uint64
-	frames []frame
-}
-
-// parseWAL returns the complete, checksummed commit groups of a WAL image.
+// scanWAL reads the complete, checksummed commit groups of a WAL in order,
+// passing each to fn until fn returns false. A torn or corrupt group ends
+// the scan without error.
 //
 //	header:  "BWL2" pageSize(4)
 //	group:   (pgno(4) page)*  0xFFFFFFFF seq(8) count(4) crc32(4)
-func parseWAL(data []byte) []walGroup {
-	if len(data) < 8 || string(data[:4]) != walMagic || binary.BigEndian.Uint32(data[4:]) != PageSize {
+func scanWAL(r io.ReaderAt, size int64, fn func(seq uint64, frames []walFrame) bool) error {
+	br := bufio.NewReaderSize(io.NewSectionReader(r, 0, size), 1<<20)
+	head := make([]byte, 8)
+	if _, err := io.ReadFull(br, head); err != nil || string(head[:4]) != walMagic || binary.BigEndian.Uint32(head[4:]) != PageSize {
 		return nil
 	}
-	var groups []walGroup
-	var frames []frame
-	off := 8
+	var frames []walFrame
+	off := int64(8)
 	crc := crc32.NewIEEE()
-	for off+4 <= len(data) {
-		pgno := binary.BigEndian.Uint32(data[off:])
+	buf := make([]byte, 4+PageSize)
+	for {
+		if _, err := io.ReadFull(br, buf[:4]); err != nil {
+			return nil
+		}
+		pgno := binary.BigEndian.Uint32(buf)
 		if pgno == commitMarker {
-			if off+20 > len(data) {
-				return groups
+			if _, err := io.ReadFull(br, buf[4:20]); err != nil {
+				return nil
 			}
-			crc.Write(data[off+4 : off+12])
-			seq := binary.BigEndian.Uint64(data[off+4:])
-			n := binary.BigEndian.Uint32(data[off+12:])
-			if int(n) != len(frames) || binary.BigEndian.Uint32(data[off+16:]) != crc.Sum32() {
-				return groups
+			crc.Write(buf[4:12])
+			seq := binary.BigEndian.Uint64(buf[4:])
+			n := binary.BigEndian.Uint32(buf[12:])
+			if int(n) != len(frames) || binary.BigEndian.Uint32(buf[16:]) != crc.Sum32() {
+				return nil
 			}
-			groups = append(groups, walGroup{seq, frames})
-			frames = nil
+			if !fn(seq, frames) {
+				return nil
+			}
+			frames = frames[:0]
 			crc.Reset()
 			off += 20
 			continue
 		}
-		if off+4+PageSize > len(data) {
-			return groups
+		if _, err := io.ReadFull(br, buf[4:]); err != nil {
+			return nil
 		}
-		crc.Write(data[off : off+4+PageSize])
-		frames = append(frames, frame{pgno, data[off+4 : off+4+PageSize]})
+		crc.Write(buf)
+		frames = append(frames, walFrame{pgno, off + 4})
 		off += 4 + PageSize
 	}
-	return groups
 }
 
 // InMemory reports whether the pager has no backing file.
@@ -983,26 +1033,52 @@ func (p *Pager) Checkpoint() error {
 		p.mu.Unlock()
 		return nil
 	}
-	for i := range items {
-		vs := p.versions[items[i].no]
-		k := sort.Search(len(vs), func(j int) bool { return vs[j].seq > items[i].seq })
-		data, err := p.versionData(items[i].no, vs[k-1])
-		if err != nil {
-			p.mu.Unlock()
-			return err
-		}
-		items[i].data = data
-	}
 	p.mu.Unlock()
 
 	// No reader reads these pages from the file: each of them has a version
-	// <= target in the WAL, and every snapshot is >= target.
-	pages := make(map[uint32][]byte, len(items))
-	for _, it := range items {
-		pages[it.no] = it.data
+	// <= target in the WAL, and every snapshot is >= target. The pages are
+	// read from the WAL and written in chunks, so a large WAL (after a big
+	// transaction or VACUUM) does not have to fit in memory; the header
+	// page goes last, after the others are synced.
+	sort.Slice(items, func(i, j int) bool { return items[i].no < items[j].no })
+	var hdr []byte
+	for i := 0; i < len(items); i += checkpointChunk {
+		chunk := items[i:min(i+checkpointChunk, len(items))]
+		p.mu.Lock()
+		for j := range chunk {
+			vs := p.versions[chunk[j].no]
+			k := sort.Search(len(vs), func(x int) bool { return vs[x].seq > chunk[j].seq })
+			data, err := p.versionData(chunk[j].no, vs[k-1])
+			if err != nil {
+				p.mu.Unlock()
+				return err
+			}
+			chunk[j].data = data
+		}
+		p.mu.Unlock()
+		pages := make(map[uint32][]byte, len(chunk))
+		for j, it := range chunk {
+			if it.no == 0 {
+				hdr = it.data
+			} else {
+				pages[it.no] = it.data
+			}
+			chunk[j].data = nil
+		}
+		if err := p.writePages(pages, i <= len(items)/2 && len(items)/2 < i+len(chunk)); err != nil {
+			return err
+		}
 	}
-	if err := p.writePagesHeaderLast(pages); err != nil {
+	if err := p.file.Sync(); err != nil {
 		return err
+	}
+	if hdr != nil {
+		if _, err := p.file.WriteAt(hdr, 0); err != nil {
+			return err
+		}
+		if err := p.file.Sync(); err != nil {
+			return err
+		}
 	}
 
 	p.mu.Lock()
@@ -1010,9 +1086,7 @@ func (p *Pager) Checkpoint() error {
 	p.countCheckpoint(len(items), start)
 	for _, it := range items {
 		p.prune(it.no, it.seq)
-		if _, ok := p.cache[it.no]; ok || len(p.cache) < p.cacheMax {
-			p.cache[it.no] = it.data
-		}
+		delete(p.cache, it.no) // the file now holds the new image
 	}
 	if len(p.versions) == 0 {
 		// Everything is in the file; the file header now carries the latest
@@ -1034,11 +1108,12 @@ func (p *Pager) countCheckpoint(pages int, start time.Time) {
 	p.counters.checkpointTime += time.Since(start)
 }
 
-// writePagesHeaderLast writes pages to the database file so that a crash at
-// any point leaves a recoverable file: all pages except the header are
-// written and synced first, then the header (whose sequence number tells
-// recovery which WAL groups are already in the file).
-func (p *Pager) writePagesHeaderLast(pages map[uint32][]byte) error {
+// checkpointChunk is the number of pages a checkpoint holds in memory.
+const checkpointChunk = 4096
+
+// writePages writes pages other than the header to the database file,
+// without syncing. midway runs the checkpoint failpoint halfway through.
+func (p *Pager) writePages(pages map[uint32][]byte, midway bool) error {
 	nos := make([]uint32, 0, len(pages))
 	for no := range pages {
 		if no != 0 {
@@ -1059,21 +1134,10 @@ func (p *Pager) writePagesHeaderLast(pages map[uint32][]byte) error {
 		if _, err := p.file.WriteAt(data, int64(no)*PageSize); err != nil {
 			return err
 		}
-		if i == len(nos)/2 && p.failpoint != nil {
+		if midway && i == len(nos)/2 && p.failpoint != nil {
 			if err := p.failpoint("checkpoint-write"); err != nil {
 				return err
 			}
-		}
-	}
-	if err := p.file.Sync(); err != nil {
-		return err
-	}
-	if hdr, ok := pages[0]; ok {
-		if _, err := p.file.WriteAt(hdr, 0); err != nil {
-			return err
-		}
-		if err := p.file.Sync(); err != nil {
-			return err
 		}
 	}
 	return nil

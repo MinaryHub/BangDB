@@ -160,3 +160,69 @@ func TestChecksumDetectsCorruption(t *testing.T) {
 		t.Fatalf("corruption not detected: %v", err)
 	}
 }
+
+// Commits larger than a checkpoint chunk (and spilled ones) are checkpointed
+// and recovered in chunks, encrypted or not.
+func TestLargeCommitChunkedCheckpointAndRecovery(t *testing.T) {
+	for _, key := range [][]byte{nil, bytes.Repeat([]byte{7}, 32)} {
+		path := filepath.Join(t.TempDir(), "big.db")
+		p, err := OpenEncrypted(path, key)
+		if err != nil {
+			t.Fatal(err)
+		}
+		p.SetSpill(t.TempDir(), 100)
+		n := checkpointChunk*2 + 123
+		write := func(fill byte) {
+			v := p.NewView()
+			for i := 0; i < n; i++ {
+				pg := uint32(i + 1)
+				if pg >= v.PageCount() {
+					if got, _ := v.Alloc(); got != pg {
+						t.Fatalf("alloc %d, want %d", got, pg)
+					}
+				}
+				v.Write(pg, page(fill+byte(i%7)))
+				if err := v.SpillPoint(); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if v.Spilled() == 0 {
+				t.Fatal("no spill")
+			}
+			if err := p.Commit(v); err != nil {
+				t.Fatal(err)
+			}
+		}
+		write(10)
+		if err := p.Checkpoint(); err != nil { // chunked checkpoint
+			t.Fatal(err)
+		}
+		// The second large commit "crashes" after its WAL is durable.
+		p.failpoint = func(stage string) error {
+			if stage == "wal-synced" {
+				return nil
+			}
+			return errors.New("crash")
+		}
+		write(50)
+		p.failpoint = func(string) error { return errors.New("crash") }
+		p.Checkpoint() // fails at once: the WAL keeps the commit
+		p.mu.Lock()
+		p.err = errors.New("crashed") // Close must not checkpoint
+		p.mu.Unlock()
+		p.Close()
+
+		p, err = OpenEncrypted(path, key) // chunked recovery
+		if err != nil {
+			t.Fatal(err)
+		}
+		v := p.NewView()
+		for i := 0; i < n; i++ {
+			b, err := v.Read(uint32(i + 1))
+			if err != nil || !sameContent(b, 50+byte(i%7)) {
+				t.Fatalf("page %d after recovery: %v", i+1, err)
+			}
+		}
+		p.Close()
+	}
+}

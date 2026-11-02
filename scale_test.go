@@ -10,6 +10,7 @@ import (
 	"runtime"
 	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -96,6 +97,7 @@ func TestScale(t *testing.T) {
 	load := time.Since(start)
 	t.Logf("LOAD: %d rows in %v (%.0f rows/s), %.1f bytes/row", n, load.Round(time.Millisecond),
 		float64(n)/load.Seconds(), float64(sizeOf(path))/float64(n))
+	peakRSS(t)
 	if len(rates) >= 4 && rates[len(rates)-1] < rates[0]/4 {
 		t.Errorf("insert rate fell from %.0f to %.0f rows/s while loading", rates[0], rates[len(rates)-1])
 	}
@@ -143,6 +145,7 @@ func TestScale(t *testing.T) {
 		t.Fatalf("full scan: %d %v", total, err)
 	}
 	t.Logf("FULL SCAN + SUM: %v (%.0f rows/s)", time.Since(s).Round(time.Millisecond), float64(n)/time.Since(s).Seconds())
+	peakRSS(t)
 	s = time.Now()
 	rows, err := db.Query("SELECT status, count(*), sum(amount) FROM orders GROUP BY status")
 	if err != nil {
@@ -150,6 +153,7 @@ func TestScale(t *testing.T) {
 	}
 	rows.All()
 	t.Logf("GROUP BY status: %v", time.Since(s).Round(time.Millisecond))
+	peakRSS(t)
 
 	// Reopen and check.
 	s = time.Now()
@@ -168,6 +172,7 @@ func TestScale(t *testing.T) {
 		t.Fatalf("integrity: %v %v", err, problems)
 	}
 	t.Logf("INTEGRITY CHECK: %v", time.Since(s).Round(time.Millisecond))
+	peakRSS(t)
 
 	// Bulk changes.
 	s = time.Now()
@@ -176,18 +181,21 @@ func TestScale(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Logf("UPDATE 1%% (%d rows, indexed column): %v", r.RowsAffected, time.Since(s).Round(time.Millisecond))
+	peakRSS(t)
 	s = time.Now()
 	r, err = db.Exec("DELETE FROM orders WHERE id % 10 = 1")
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Logf("DELETE 10%% (%d rows): %v", r.RowsAffected, time.Since(s).Round(time.Millisecond))
+	peakRSS(t)
 	before := sizeOf(path)
 	s = time.Now()
 	if err := db.Vacuum(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 	t.Logf("VACUUM: %v, %.2f GB -> %.2f GB", time.Since(s).Round(time.Millisecond), float64(before)/1e9, float64(sizeOf(path))/1e9)
+	peakRSS(t)
 	want := int64(n) - r.RowsAffected
 	if err := db.QueryRow("SELECT count(*) FROM orders").Scan(&total); err != nil || total != want {
 		t.Fatalf("after changes: %d rows, want %d (%v)", total, want, err)
@@ -380,4 +388,20 @@ func sizeOf(path string) int64 {
 		return 0
 	}
 	return st.Size()
+}
+
+// peakRSS logs the process's peak resident memory since the last call and
+// resets it (Linux; elsewhere it does nothing).
+func peakRSS(t *testing.T) {
+	b, err := os.ReadFile("/proc/self/status")
+	if err != nil {
+		return
+	}
+	for _, line := range strings.Split(string(b), "\n") {
+		if f := strings.Fields(line); len(f) >= 2 && f[0] == "VmHWM:" {
+			kb, _ := strconv.Atoi(f[1])
+			t.Logf("    peak RSS %d MB", kb>>10)
+		}
+	}
+	os.WriteFile("/proc/self/clear_refs", []byte("5"), 0) // reset the peak
 }
