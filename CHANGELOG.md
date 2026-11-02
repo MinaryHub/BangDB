@@ -4,6 +4,7 @@
 
 ## 0.7 (진행 중) — 실 프로젝트 적용 보완
 
+- **안드로이드 앱 내장**: `mobile/` 래퍼(gomobile) → `.aar`, Kotlin/Java `com.knoxxr.bangdb` (`Database`, `Tx`, `Rows`, `Args`, `Migrations`). CI가 `.aar`를 만들고 예제를 컴파일. `scripts/build.sh aar`, `all`에 android/arm64 CLI 추가 (docs/ANDROID.md)
 - Windows 파일 잠금(`LockFileEx`): 두 프로세스가 같은 파일을 여는 것을 막음. 모든 OS에서 두 번째 열기는 `ErrLocked`
 - 3개 OS CI (테스트·경합 검사·크래시 토처·퍼징·빌드)
 - CLI 설정 파일·`BANGDB_*` 환경 변수·키/비밀번호 파일, `-print-config`

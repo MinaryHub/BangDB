@@ -5,6 +5,9 @@
 #   scripts/build.sh                 build for this machine into dist/
 #   scripts/build.sh all             also cross-build Windows, macOS, Linux
 #   scripts/build.sh install         go install with the version stamped
+#   scripts/build.sh aar             Android library dist/bangdb-<version>.aar
+#                                    (needs gomobile, the Android SDK and NDK;
+#                                    see docs/ANDROID.md)
 set -eu
 cd "$(dirname "$0")/.."
 
@@ -33,8 +36,15 @@ install)
 	go install -trimpath -ldflags "$ldflags" ./cmd/bangdb
 	echo "installed bangdb $version"
 	;;
+aar)
+	# Version stamping uses -ldflags without -s -w (gomobile adds its own).
+	(cd mobile && gomobile bind -target=android -androidapi 21 -javapkg=com.knoxxr \
+		-ldflags "-X $pkg.Version=$version -X $pkg.Commit=$commit -X $pkg.BuildTime=$built" \
+		-o "../dist/bangdb-$version.aar" .)
+	echo "dist/bangdb-$version.aar"
+	;;
 all)
-	for t in windows/amd64 windows/arm64 darwin/arm64 darwin/amd64 linux/amd64 linux/arm64; do
+	for t in windows/amd64 windows/arm64 darwin/arm64 darwin/amd64 linux/amd64 linux/arm64 android/arm64; do
 		build "${t%/*}" "${t#*/}"
 	done
 	;;

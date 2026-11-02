@@ -27,6 +27,8 @@ Go로 작성된 **경량 임베디드 관계형 데이터베이스**입니다. �
 go get github.com/knoxxr/bangdb
 ```
 
+안드로이드 앱에 내장: [docs/ANDROID.md](docs/ANDROID.md) (`.aar`, Kotlin/Java API `com.knoxxr.bangdb`).
+
 ## 사용법
 
 ### 네이티브 API
@@ -440,6 +442,7 @@ INSERT INTO emp (dept_id, email, salary) VALUES (1, 'kim@example.com', 100)
 - [보완 검토와 개발 계획 (ROADMAP)](docs/ROADMAP.md)
 - [아키텍처](docs/ARCHITECTURE.md)
 - [백업과 미러링](docs/REPLICATION.md)
+- [안드로이드 앱에 내장하기](docs/ANDROID.md)
 - [시계열·인메모리 DB 확장 적합성 검토](docs/REVIEW-timeseries-inmemory.md)
 
 ## 빌드와 버전

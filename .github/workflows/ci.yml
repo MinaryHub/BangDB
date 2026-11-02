@@ -82,3 +82,39 @@ jobs:
         with:
           name: bangdb-binaries
           path: dist/
+
+  android:
+    # The Android library (gomobile bind -> .aar). GitHub's Ubuntu runners
+    # carry the Android SDK and NDK.
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # the version counts commits
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: mobile/go.mod
+          cache-dependency-path: mobile/go.sum
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+      - name: mobile wrapper tests
+        working-directory: mobile
+        run: go vet ./... && go test -count=1 ./...
+      - name: gomobile
+        working-directory: mobile
+        run: |
+          go install golang.org/x/mobile/cmd/gomobile golang.org/x/mobile/cmd/gobind
+          gomobile init
+      - name: build .aar
+        env:
+          ANDROID_NDK_HOME: ${{ env.ANDROID_NDK_LATEST_HOME }}
+        run: scripts/build.sh aar
+      - name: compile the Kotlin sample against the .aar
+        run: scripts/check-android-sample.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bangdb-android
+          path: dist/*.aar
