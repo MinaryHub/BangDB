@@ -5,8 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"sort"
 	"runtime"
+	"sort"
 	"sync"
 	"time"
 
