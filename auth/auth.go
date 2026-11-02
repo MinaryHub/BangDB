@@ -171,7 +171,9 @@ type account struct {
 }
 
 // NewUsers returns an empty set of accounts.
-func NewUsers() *Users { return &Users{accounts: map[string]account{}, verified: map[[32]byte]time.Time{}} }
+func NewUsers() *Users {
+	return &Users{accounts: map[string]account{}, verified: map[[32]byte]time.Time{}}
+}
 
 // Add adds or replaces an account.
 func (u *Users) Add(name string, role Role, passwordHash string) {
