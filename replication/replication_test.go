@@ -1,11 +1,13 @@
 package replication
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
 	"net"
 	"path/filepath"
+	"runtime/pprof"
 	"sort"
 	"strings"
 	"sync"
@@ -77,8 +79,17 @@ func waitSynced(t *testing.T, r *Replica, primary *bangdb.DB) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	if err := r.WaitFor(ctx, primary.Seq()); err != nil {
+		dumpGoroutines(t)
 		t.Fatalf("replica did not catch up (status %+v, primary seq %d): %v", r.Status(), primary.Seq(), err)
 	}
+}
+
+// dumpGoroutines logs every goroutine's stack, to see what a stuck test
+// waits for.
+func dumpGoroutines(t *testing.T) {
+	var buf bytes.Buffer
+	pprof.Lookup("goroutine").WriteTo(&buf, 2)
+	t.Log(buf.String())
 }
 
 // writer inserts rows in two tables per transaction until stopped, so any

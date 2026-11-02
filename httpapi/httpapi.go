@@ -36,22 +36,31 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"math"
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/knoxxr/bangdb"
+	"github.com/knoxxr/bangdb/auth"
 	"github.com/knoxxr/bangdb/internal/engine"
 	"github.com/knoxxr/bangdb/internal/value"
 )
 
 // Options configures the handler.
 type Options struct {
-	// Token, if set, must be sent as "Authorization: Bearer <token>".
+	// Token, if set, admits "Authorization: Bearer <token>" as admin.
 	Token string
-	// Authenticate, if set, decides instead of Token.
+	// Users admits "Authorization: Basic" (user:password) accounts, each
+	// limited by its role (see package auth).
+	Users *auth.Users
+	// Authenticate, if set, decides instead of Token and Users (as admin).
 	Authenticate func(r *http.Request) bool
+	// Logger receives one line per request and authentication failures.
+	// Nil: no logging.
+	Logger *slog.Logger
 	// AllowOrigins lists the origins browsers may call from (CORS); "*"
 	// allows any. Empty: no CORS headers (same-origin or non-browser use).
 	AllowOrigins []string
@@ -62,6 +71,11 @@ type Options struct {
 	// MaxConcurrent bounds the requests run at once; others wait for a
 	// slot (or until they are canceled). 0: unlimited.
 	MaxConcurrent int
+	// NoConsole turns off the web console served at /.
+	NoConsole bool
+	// ExtraMetrics, if set, appends Prometheus text lines (e.g. server or
+	// replication figures) to /metrics.
+	ExtraMetrics func(w io.Writer)
 }
 
 // Handler is an http.Handler serving one database.
@@ -90,10 +104,18 @@ func New(db *bangdb.DB, opts Options) *Handler {
 	h.mux.HandleFunc("/stats", h.get(func(w http.ResponseWriter, r *http.Request) error {
 		return writeJSON(w, http.StatusOK, h.db.Stats())
 	}))
+	h.mux.HandleFunc("/metrics", h.get(h.metrics))
 	return h
 }
 
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path == "/" && r.Method == http.MethodGet && !h.opts.NoConsole {
+		// The console page holds no data; its requests carry credentials.
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.Header().Set("Content-Security-Policy", "default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'")
+		w.Write(consolePage)
+		return
+	}
 	if origin := r.Header.Get("Origin"); origin != "" && h.allowed(origin) {
 		w.Header().Set("Access-Control-Allow-Origin", origin)
 		w.Header().Set("Vary", "Origin")
@@ -105,10 +127,24 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	if !h.authorized(r) {
-		w.Header().Set("WWW-Authenticate", `Bearer realm="bangdb"`)
+	role, ok := h.authorize(r)
+	if !ok {
+		if h.opts.Logger != nil {
+			h.opts.Logger.Warn("authentication failed", "remote", r.RemoteAddr, "path", r.URL.Path)
+		}
+		if r.Header.Get("X-BangDB-Console") == "" { // the console asks for credentials itself
+			w.Header().Set("WWW-Authenticate", `Basic realm="bangdb", charset="UTF-8"`)
+		}
 		writeError(w, http.StatusUnauthorized, "unauthorized", "bangdb: authentication required")
 		return
+	}
+	r = r.WithContext(context.WithValue(r.Context(), roleKey{}, role))
+	if h.opts.Logger != nil {
+		start := time.Now()
+		defer func() {
+			h.opts.Logger.Info("request", "remote", r.RemoteAddr, "method", r.Method, "path", r.URL.Path,
+				"role", role.String(), "duration", time.Since(start))
+		}()
 	}
 	if h.slots != nil {
 		select {
@@ -131,15 +167,38 @@ func (h *Handler) allowed(origin string) bool {
 	return false
 }
 
-func (h *Handler) authorized(r *http.Request) bool {
+type roleKey struct{}
+
+func requestRole(r *http.Request) auth.Role {
+	if role, ok := r.Context().Value(roleKey{}).(auth.Role); ok {
+		return role
+	}
+	return auth.RoleRead
+}
+
+// authorize returns the role of the request's credentials.
+func (h *Handler) authorize(r *http.Request) (auth.Role, bool) {
 	if h.opts.Authenticate != nil {
-		return h.opts.Authenticate(r)
+		return auth.RoleAdmin, h.opts.Authenticate(r)
 	}
-	if h.opts.Token == "" {
-		return true
+	if h.opts.Token == "" && h.opts.Users == nil {
+		return auth.RoleAdmin, true
 	}
-	tok, ok := strings.CutPrefix(r.Header.Get("Authorization"), "Bearer ")
-	return ok && subtle.ConstantTimeCompare([]byte(tok), []byte(h.opts.Token)) == 1
+	if tok, ok := strings.CutPrefix(r.Header.Get("Authorization"), "Bearer "); ok && h.opts.Token != "" {
+		return auth.RoleAdmin, subtle.ConstantTimeCompare([]byte(tok), []byte(h.opts.Token)) == 1
+	}
+	if user, pass, ok := r.BasicAuth(); ok && h.opts.Users != nil {
+		return h.opts.Users.Authenticate(user, pass)
+	}
+	return auth.RoleRead, false
+}
+
+// permit checks that the request's role may run src.
+func (h *Handler) permit(r *http.Request, src string) error {
+	if err := auth.Check(h.db, requestRole(r), src); err != nil {
+		return &apiError{http.StatusForbidden, "forbidden", err.Error()}
+	}
+	return nil
 }
 
 type handlerFunc func(w http.ResponseWriter, r *http.Request) error
@@ -346,6 +405,9 @@ func (h *Handler) exec(w http.ResponseWriter, r *http.Request) error {
 	if err := decode(r, &st); err != nil {
 		return err
 	}
+	if err := h.permit(r, st.SQL); err != nil {
+		return err
+	}
 	args, err := st.args()
 	if err != nil {
 		return err
@@ -366,6 +428,11 @@ func (h *Handler) batch(w http.ResponseWriter, r *http.Request) error {
 	}
 	if err := decode(r, &req); err != nil {
 		return err
+	}
+	for i, st := range req.Statements {
+		if err := h.permit(r, st.SQL); err != nil {
+			return &batchError{i, err}
+		}
 	}
 	tx, err := h.db.BeginContext(r.Context())
 	if err != nil {
@@ -413,13 +480,11 @@ func (e *batchError) Error() string { return fmt.Sprintf("statement %d: %v", e.i
 func (e *batchError) Unwrap() error { return e.err }
 
 func writeEngineError(w http.ResponseWriter, err error) {
-	var ae *apiError
-	if errors.As(err, &ae) {
-		writeError(w, ae.status, ae.code, ae.msg)
-		return
-	}
 	status, code := http.StatusBadRequest, "sql"
+	var ae *apiError
 	switch {
+	case errors.As(err, &ae):
+		status, code = ae.status, ae.code
 	case errors.Is(err, bangdb.ErrConstraint):
 		status, code = http.StatusConflict, "constraint"
 	case errors.Is(err, bangdb.ErrBusy):

@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/knoxxr/bangdb"
+	"github.com/knoxxr/bangdb/auth"
 	"github.com/knoxxr/bangdb/httpapi"
 )
 
@@ -152,5 +153,82 @@ func TestHTTPAPICORSAndReadOnly(t *testing.T) {
 	}
 	if code, out := call(t, srv, "POST", "/query", "", `{"sql": "SELECT 1 + ?", "args": [2]}`); code != 200 || js(out["rows"]) != "[[3]]" {
 		t.Fatalf("read-only query: %d %v", code, out)
+	}
+}
+
+func TestHTTPAPIUsersMetricsConsole(t *testing.T) {
+	users := auth.NewUsers()
+	for name, role := range map[string]auth.Role{"ann": auth.RoleAdmin, "wes": auth.RoleWrite, "rex": auth.RoleRead} {
+		h, _ := auth.HashPassword(name + "-pw")
+		users.Add(name, role, h)
+	}
+	_, srv := setup(t, httpapi.Options{Users: users, Token: "admintok"})
+	as := func(user, method, path, body string) (int, map[string]any) {
+		req, _ := http.NewRequest(method, srv.URL+path, strings.NewReader(body))
+		if user != "" {
+			req.SetBasicAuth(user, user+"-pw")
+		}
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		var out map[string]any
+		json.NewDecoder(resp.Body).Decode(&out)
+		return resp.StatusCode, out
+	}
+	if code, _ := as("wes", "POST", "/exec", `{"sql": "CREATE TABLE t (x INT)"}`); code != 403 {
+		t.Fatalf("writer created a table: %d", code)
+	}
+	if code, out := as("ann", "POST", "/exec", `{"sql": "CREATE TABLE t (x INT)"}`); code != 200 {
+		t.Fatalf("admin: %d %v", code, out)
+	}
+	if code, out := as("wes", "POST", "/exec", `{"sql": "INSERT INTO t VALUES (1)"}`); code != 200 {
+		t.Fatalf("writer insert: %d %v", code, out)
+	}
+	if code, out := as("rex", "POST", "/exec", `{"sql": "DELETE FROM t"}`); code != 403 || out["code"] != "forbidden" {
+		t.Fatalf("reader delete: %d %v", code, out)
+	}
+	if code, out := as("rex", "POST", "/batch", `{"statements": [{"sql": "SELECT 1"}, {"sql": "UPDATE t SET x = 2"}]}`); code != 403 || out["statement"] != 1.0 {
+		t.Fatalf("reader batch: %d %v", code, out)
+	}
+	if code, out := as("rex", "POST", "/query", `{"sql": "SELECT count(*) FROM t"}`); code != 200 || js(out["rows"]) != "[[1]]" {
+		t.Fatalf("reader query: %d %v", code, out)
+	}
+	if code, _ := as("rex", "POST", "/exec", `{"sql": "PRAGMA user_version = 3"}`); code != 403 {
+		t.Fatal("reader changed a setting")
+	}
+	if code, _ := as("", "GET", "/health", ""); code != 401 {
+		t.Fatal("anonymous request accepted")
+	}
+	req, _ := http.NewRequest("GET", srv.URL+"/health", nil)
+	req.SetBasicAuth("rex", "wrong")
+	if resp, _ := http.DefaultClient.Do(req); resp.StatusCode != 401 || resp.Header.Get("WWW-Authenticate") == "" {
+		t.Fatal("wrong password accepted")
+	}
+
+	// Prometheus metrics.
+	req, _ = http.NewRequest("GET", srv.URL+"/metrics", nil)
+	req.Header.Set("Authorization", "Bearer admintok")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	for _, want := range []string{"# TYPE bangdb_tx_commits_total counter", "bangdb_statements_total ", "bangdb_info{version="} {
+		if !strings.Contains(string(body), want) {
+			t.Errorf("metrics lack %q:\n%s", want, body)
+		}
+	}
+	// The console page needs no credentials (it holds no data).
+	resp, err = http.Get(srv.URL + "/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	page, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != 200 || !strings.Contains(string(page), "BangDB 콘솔") {
+		t.Fatalf("console: %d", resp.StatusCode)
 	}
 }

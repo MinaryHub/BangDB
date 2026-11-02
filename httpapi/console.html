@@ -1,0 +1,196 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>BangDB 콘솔</title>
+<style>
+:root { --bg:#f7f8fa; --panel:#fff; --line:#dde1e6; --text:#1d2433; --muted:#6b7385; --accent:#2f6fde; --err:#c62828; --ok:#2e7d32; }
+@media (prefers-color-scheme: dark) { :root { --bg:#14171c; --panel:#1c2027; --line:#2c323c; --text:#e3e6eb; --muted:#9097a3; --accent:#6c9dff; --err:#ff6b6b; --ok:#7bd88f; } }
+* { box-sizing: border-box; }
+body { margin:0; font:14px/1.45 system-ui, -apple-system, "Segoe UI", "Malgun Gothic", sans-serif; background:var(--bg); color:var(--text); }
+header { display:flex; align-items:center; gap:12px; padding:10px 16px; border-bottom:1px solid var(--line); background:var(--panel); }
+header h1 { font-size:16px; margin:0; }
+header .info { color:var(--muted); font-size:12px; margin-left:auto; }
+button { font:inherit; padding:6px 12px; border:1px solid var(--line); border-radius:6px; background:var(--panel); color:var(--text); cursor:pointer; }
+button.primary { background:var(--accent); border-color:var(--accent); color:#fff; }
+input, select, textarea { font:inherit; color:var(--text); background:var(--panel); border:1px solid var(--line); border-radius:6px; padding:6px 8px; }
+main { display:grid; grid-template-columns: 220px 1fr; min-height: calc(100vh - 49px); }
+aside { border-right:1px solid var(--line); padding:12px; overflow:auto; background:var(--panel); }
+aside h2 { font-size:12px; text-transform:uppercase; color:var(--muted); margin:8px 0; }
+aside ul { list-style:none; padding:0; margin:0; }
+aside li { padding:4px 6px; border-radius:4px; cursor:pointer; display:flex; justify-content:space-between; gap:6px; }
+aside li:hover { background:var(--bg); }
+aside li small { color:var(--muted); }
+section { padding:12px 16px; overflow:auto; min-width:0; }
+textarea { width:100%; height:140px; font-family:ui-monospace, Consolas, monospace; resize:vertical; }
+.bar { display:flex; gap:8px; align-items:center; margin:8px 0; flex-wrap:wrap; }
+.status { color:var(--muted); font-size:12px; }
+.status.err { color:var(--err); }
+.status.ok { color:var(--ok); }
+.result { overflow:auto; max-height:60vh; border:1px solid var(--line); border-radius:6px; background:var(--panel); }
+table { border-collapse:collapse; width:100%; font-family:ui-monospace, Consolas, monospace; font-size:13px; }
+th, td { border-bottom:1px solid var(--line); padding:4px 8px; text-align:left; white-space:nowrap; max-width:420px; overflow:hidden; text-overflow:ellipsis; }
+th { position:sticky; top:0; background:var(--panel); font-weight:600; }
+th small { color:var(--muted); font-weight:400; }
+td.null { color:var(--muted); font-style:italic; }
+td.num { text-align:right; }
+#login { max-width:360px; margin:12vh auto; background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:20px; display:grid; gap:10px; }
+#login h1 { margin:0 0 4px; font-size:18px; }
+#login p { margin:0; color:var(--muted); font-size:12px; }
+.hidden { display:none !important; }
+@media (max-width: 720px) { main { grid-template-columns: 1fr; } aside { border-right:0; border-bottom:1px solid var(--line); max-height:30vh; } }
+</style>
+</head>
+<body>
+<form id="login" autocomplete="on">
+  <h1>BangDB 콘솔</h1>
+  <p>서버의 사용자 계정(또는 관리자 토큰)으로 접속합니다. 인증 정보는 이 탭에만 보관됩니다.</p>
+  <select id="mode"><option value="basic">사용자 / 비밀번호</option><option value="token">토큰</option><option value="none">인증 없음</option></select>
+  <input id="user" placeholder="사용자" autocomplete="username">
+  <input id="pass" type="password" placeholder="비밀번호 또는 토큰" autocomplete="current-password">
+  <button class="primary" type="submit">접속</button>
+  <div id="loginStatus" class="status"></div>
+</form>
+
+<div id="app" class="hidden">
+  <header>
+    <h1>BangDB 콘솔</h1>
+    <span class="info" id="info"></span>
+    <button id="logout" type="button">로그아웃</button>
+  </header>
+  <main>
+    <aside>
+      <h2>테이블</h2>
+      <ul id="tables"></ul>
+      <h2>상태</h2>
+      <div id="stats" class="status"></div>
+    </aside>
+    <section>
+      <textarea id="sql" spellcheck="false" placeholder="SQL 입력 — Ctrl+Enter로 실행">SELECT 1;</textarea>
+      <div class="bar">
+        <button class="primary" id="run" type="button">실행 (Ctrl+Enter)</button>
+        <label class="status"><input type="checkbox" id="limit" checked> 결과 최대 1,000행 표시</label>
+        <span id="status" class="status"></span>
+      </div>
+      <div class="result" id="result"></div>
+    </section>
+  </main>
+</div>
+
+<script>
+"use strict";
+const $ = id => document.getElementById(id);
+let auth = null;
+try { auth = JSON.parse(sessionStorage.getItem("bangdb-auth") || "null"); } catch (e) {}
+
+function headers() {
+  const h = { "Content-Type": "application/json", "X-BangDB-Console": "1" };
+  if (auth && auth.mode === "basic") h["Authorization"] = "Basic " + btoa(unescape(encodeURIComponent(auth.user + ":" + auth.pass)));
+  if (auth && auth.mode === "token") h["Authorization"] = "Bearer " + auth.pass;
+  return h;
+}
+async function call(method, path, body) {
+  const res = await fetch(path, { method, headers: headers(), body: body ? JSON.stringify(body) : undefined });
+  let data = null;
+  try { data = await res.json(); } catch (e) { data = { error: "응답을 해석할 수 없습니다 (" + res.status + ")" }; }
+  if (!res.ok) { const err = new Error(data.error || res.statusText); err.status = res.status; err.code = data.code; throw err; }
+  return data;
+}
+function cell(v) {
+  const td = document.createElement("td");
+  if (v === null) { td.textContent = "NULL"; td.className = "null"; }
+  else if (typeof v === "object" && v.$blob !== undefined) { td.textContent = "x'" + Array.from(atob(v.$blob), c => c.charCodeAt(0).toString(16).padStart(2, "0")).join("") + "'"; }
+  else { td.textContent = String(v); if (typeof v === "number") td.className = "num"; }
+  td.title = td.textContent;
+  return td;
+}
+function renderTable(columns, types, rows) {
+  const box = $("result"); box.textContent = "";
+  if (!columns || columns.length === 0) return;
+  const t = document.createElement("table"), head = document.createElement("tr");
+  columns.forEach((c, i) => { const th = document.createElement("th"); th.textContent = c; if (types && types[i]) { const s = document.createElement("small"); s.textContent = " " + types[i]; th.appendChild(s); } head.appendChild(th); });
+  const thead = document.createElement("thead"); thead.appendChild(head); t.appendChild(thead);
+  const body = document.createElement("tbody");
+  const max = $("limit").checked ? 1000 : rows.length;
+  rows.slice(0, max).forEach(r => { const tr = document.createElement("tr"); r.forEach(v => tr.appendChild(cell(v))); body.appendChild(tr); });
+  t.appendChild(body); box.appendChild(t);
+}
+function setStatus(text, kind) { const s = $("status"); s.textContent = text; s.className = "status" + (kind ? " " + kind : ""); }
+
+async function run() {
+  const sql = $("sql").value.trim();
+  if (!sql) return;
+  setStatus("실행 중…");
+  const start = performance.now();
+  try {
+    let data, isQuery = true;
+    try { data = await call("POST", "/query", { sql }); }
+    catch (e) { if (e.code !== "request") throw e; isQuery = false; data = await call("POST", "/exec", { sql }); }
+    const ms = (performance.now() - start).toFixed(1);
+    if (data.error) throw new Error(data.error);
+    if (isQuery || data.columns) {
+      renderTable(data.columns, data.types, data.rows || []);
+      const n = (data.rows || []).length;
+      setStatus(n.toLocaleString() + "행 · " + ms + " ms" + ($("limit").checked && n > 1000 ? " (1,000행만 표시)" : ""), "ok");
+    } else {
+      $("result").textContent = "";
+      setStatus("완료: " + data.rowsAffected + "행 변경" + (data.lastInsertId ? " · 마지막 ID " + data.lastInsertId : "") + " · " + ms + " ms", "ok");
+    }
+    if (!isQuery) loadTables();
+  } catch (e) {
+    setStatus((e.status === 403 ? "권한 없음: " : "오류: ") + e.message, "err");
+  }
+}
+
+async function loadTables() {
+  try {
+    const data = await call("POST", "/query", { sql: "PRAGMA table_list" });
+    const ul = $("tables"); ul.textContent = "";
+    data.rows.forEach(([name, type, kind]) => {
+      const li = document.createElement("li");
+      const a = document.createElement("span"); a.textContent = name;
+      const s = document.createElement("small"); s.textContent = type === "view" ? "view" : (kind || "");
+      li.append(a, s);
+      li.onclick = () => { $("sql").value = 'SELECT * FROM "' + name.replace(/"/g, '""') + '" LIMIT 100;'; run(); };
+      ul.appendChild(li);
+    });
+  } catch (e) { $("tables").textContent = e.message; }
+}
+
+async function loadStats() {
+  try {
+    const [h, s] = await Promise.all([call("GET", "/health"), call("GET", "/stats")]);
+    $("info").textContent = "v" + h.version + (h.readOnly ? " · 읽기 전용" : "") + (auth && auth.user ? " · " + auth.user : "");
+    $("stats").textContent = "커밋 " + s.TxCommits.toLocaleString() + " · 문장 " + s.Statements.toLocaleString() +
+      " · 오류 " + s.Errors.toLocaleString() + " · WAL " + s.WALPages + "p · 페이지 " + s.PageCount.toLocaleString();
+  } catch (e) {}
+}
+
+async function enter() {
+  try {
+    await call("GET", "/health");
+  } catch (e) {
+    $("loginStatus").textContent = e.status === 401 ? "인증에 실패했습니다." : "서버에 연결할 수 없습니다: " + e.message;
+    $("loginStatus").className = "status err";
+    $("login").classList.remove("hidden"); $("app").classList.add("hidden");
+    return;
+  }
+  $("login").classList.add("hidden"); $("app").classList.remove("hidden");
+  loadTables(); loadStats(); setInterval(loadStats, 10000);
+}
+
+$("login").onsubmit = ev => {
+  ev.preventDefault();
+  auth = { mode: $("mode").value, user: $("user").value, pass: $("pass").value };
+  sessionStorage.setItem("bangdb-auth", JSON.stringify(auth));
+  enter();
+};
+$("mode").onchange = () => { $("user").classList.toggle("hidden", $("mode").value !== "basic"); $("pass").classList.toggle("hidden", $("mode").value === "none"); };
+$("logout").onclick = () => { sessionStorage.removeItem("bangdb-auth"); location.reload(); };
+$("run").onclick = run;
+$("sql").addEventListener("keydown", ev => { if ((ev.ctrlKey || ev.metaKey) && ev.key === "Enter") { ev.preventDefault(); run(); } });
+if (auth) enter();
+</script>
+</body>
+</html>

@@ -37,9 +37,16 @@ type config struct {
 	cacheSize, sortMemory            int64
 	tempDir                          string
 
+	usersFile           string
+	logFormat, logLevel string
+	backupDir           string
+	backupInterval      time.Duration
+	backupKeep          int
+
 	connect     string
 	configFile  string
 	showVersion bool
+	addUser     string
 }
 
 type setting struct {
@@ -73,6 +80,12 @@ func (c *config) settings() []setting {
 		{"cache_size", "page and node cache, e.g. 64MB", &c.cacheSize},
 		{"sort_memory", "memory per query for sorting before spilling to disk, e.g. 128MB", &c.sortMemory},
 		{"temp_dir", "directory for spill files", &c.tempDir},
+		{"users_file", "accounts with roles for the server and HTTP API (see -add-user)", &c.usersFile},
+		{"log_format", "server log format: text or json", &c.logFormat},
+		{"log_level", "server log level: debug, info, warn or error", &c.logLevel},
+		{"backup_dir", "take scheduled, verified backups into this directory", &c.backupDir},
+		{"backup_interval", "time between scheduled backups (default 24h)", &c.backupInterval},
+		{"backup_keep", "number of scheduled backups kept (0 = all)", &c.backupKeep},
 	}
 }
 
@@ -130,6 +143,7 @@ func (c *config) register(fs *flag.FlagSet) {
 	fs.StringVar(&c.configFile, "config", os.Getenv("BANGDB_CONFIG"), "configuration file (name = value lines)")
 	fs.StringVar(&c.connect, "connect", "", "run the shell against a server: bangdb://user:password@host:port")
 	fs.BoolVar(&c.showVersion, "version", false, "print the version and exit")
+	fs.StringVar(&c.addUser, "add-user", "", "name:role — read a password and print (or append to users_file) an account line")
 }
 
 func setValue(ptr any, v string) error {

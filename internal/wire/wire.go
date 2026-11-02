@@ -61,6 +61,7 @@ const (
 	CodeInterrupted  = 5
 	CodeUnauthorized = 6
 	CodeTooMany      = 7
+	CodeForbidden    = 8
 )
 
 // MaxMessage bounds a message's payload.

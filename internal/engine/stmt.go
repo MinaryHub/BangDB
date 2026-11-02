@@ -96,3 +96,45 @@ func (db *DB) ReadOnlySQL(src string) (bool, error) {
 	}
 	return len(pr.stmts) > 0, nil
 }
+
+// Access is the privilege a statement needs.
+type Access int
+
+const (
+	AccessRead  Access = iota // SELECT, EXPLAIN, PRAGMA reads
+	AccessWrite               // INSERT, UPDATE, DELETE and transaction control
+	AccessAdmin               // schema changes, VACUUM, ANALYZE, PRAGMA settings
+)
+
+// SQLAccess returns the privilege needed by every statement of src.
+func (db *DB) SQLAccess(src string) (Access, error) {
+	pr, err := db.parse(src)
+	if err != nil {
+		return AccessAdmin, err
+	}
+	need := AccessRead
+	for _, s := range pr.stmts {
+		need = max(need, stmtAccess(s))
+	}
+	return need, nil
+}
+
+func stmtAccess(s sql.Stmt) Access {
+	switch st := s.(type) {
+	case *sql.Select:
+		return AccessRead
+	case *sql.Explain:
+		if st.Analyze {
+			return stmtAccess(st.Stmt) // it runs the statement
+		}
+		return AccessRead
+	case *sql.Pragma:
+		if st.Value == nil || st.Call {
+			return AccessRead
+		}
+		return AccessAdmin
+	case *sql.Insert, *sql.Update, *sql.Delete, *sql.Begin, *sql.Commit, *sql.Rollback:
+		return AccessWrite
+	}
+	return AccessAdmin
+}

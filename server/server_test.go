@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/knoxxr/bangdb"
+	"github.com/knoxxr/bangdb/auth"
 	"github.com/knoxxr/bangdb/client"
 	_ "github.com/knoxxr/bangdb/driver"
 	"github.com/knoxxr/bangdb/server"
@@ -308,4 +309,29 @@ func selfSigned(t *testing.T) tls.Certificate {
 		t.Fatal(err)
 	}
 	return tls.Certificate{Certificate: [][]byte{der}, PrivateKey: key}
+}
+
+func TestServerUserRoles(t *testing.T) {
+	users := auth.NewUsers()
+	hw, _ := auth.HashPassword("w")
+	hr, _ := auth.HashPassword("r")
+	users.Add("writer", auth.RoleWrite, hw)
+	users.Add("reader", auth.RoleRead, hr)
+	db, _, addr := start(t, server.Options{Users: users})
+	db.Exec("CREATE TABLE t (x INT)")
+	w := dial(t, addr, &client.Options{User: "writer", Password: "w"})
+	r := dial(t, addr, &client.Options{User: "reader", Password: "r"})
+	if _, err := client.Dial(context.Background(), addr, &client.Options{User: "reader", Password: "w"}); !errors.Is(err, client.ErrUnauthorized) {
+		t.Fatalf("wrong password: %v", err)
+	}
+	mustExec(t, w, "BEGIN; INSERT INTO t VALUES (1); COMMIT")
+	if _, err := w.Exec(context.Background(), "DROP TABLE t"); !errors.Is(err, client.ErrForbidden) {
+		t.Fatalf("writer dropped a table: %v", err)
+	}
+	if _, err := r.Exec(context.Background(), "INSERT INTO t VALUES (2)"); !errors.Is(err, client.ErrForbidden) {
+		t.Fatalf("reader inserted: %v", err)
+	}
+	if res := mustExec(t, r, "SELECT count(*) FROM t"); res.Rows[0][0] != int64(1) {
+		t.Fatalf("reader query: %v", res.Rows)
+	}
 }

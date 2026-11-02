@@ -20,12 +20,14 @@ import (
 	"crypto/tls"
 	"encoding/binary"
 	"errors"
+	"log/slog"
 	"net"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/knoxxr/bangdb"
+	"github.com/knoxxr/bangdb/auth"
 	"github.com/knoxxr/bangdb/internal/engine"
 	"github.com/knoxxr/bangdb/internal/value"
 	"github.com/knoxxr/bangdb/internal/wire"
@@ -33,11 +35,18 @@ import (
 
 // Options configures a server.
 type Options struct {
-	// Authenticate checks the user and password of a connection. If nil
-	// and Password is set, any user with that password is accepted; with
-	// neither, every connection is accepted (bind to localhost then).
+	// Users are the accounts allowed to connect, each limited by its role
+	// (see package auth). Password, if also set, admits any user name
+	// with that password as admin.
+	Users *auth.Users
+	// Authenticate checks the user and password of a connection (as
+	// admin), instead of Users and Password. With none of the three,
+	// every connection is accepted as admin (bind to localhost then).
 	Authenticate func(user, password string) bool
 	Password     string
+	// Logger receives connection events (opened, closed, refused). Nil:
+	// no logging.
+	Logger *slog.Logger
 	// MaxConns limits concurrent connections (0: unlimited).
 	MaxConns int
 	// IdleTimeout closes connections idle for this long (0: never).
@@ -157,6 +166,8 @@ type session struct {
 	msgs   chan message
 	done   chan struct{}
 	once   sync.Once
+	role   auth.Role // what the account may do
+	user   string
 }
 
 type message struct {
@@ -193,12 +204,15 @@ func (s *Server) handle(c net.Conn) {
 		ss.fail(wire.CodeGeneric, "server: bad hello (or a client of another version)")
 		return
 	}
-	if !s.authenticate(user, password) {
+	role, ok := s.authenticate(user, password)
+	if !ok {
 		s.rejected.Add(1)
+		s.log(slog.LevelWarn, "authentication failed", "remote", c.RemoteAddr().String(), "user", user)
 		time.Sleep(100 * time.Millisecond) // slow down guessing
 		ss.fail(wire.CodeUnauthorized, "server: authentication failed")
 		return
 	}
+	ss.role, ss.user = role, user
 	s.mu.Lock()
 	if s.closed || s.opts.MaxConns > 0 && len(s.conns) >= s.opts.MaxConns {
 		s.mu.Unlock()
@@ -209,6 +223,8 @@ func (s *Server) handle(c net.Conn) {
 	s.conns[ss] = struct{}{}
 	s.mu.Unlock()
 	s.accepted.Add(1)
+	s.log(slog.LevelInfo, "connection opened", "remote", c.RemoteAddr().String(), "user", user, "role", role.String())
+	defer s.log(slog.LevelInfo, "connection closed", "remote", c.RemoteAddr().String(), "user", user)
 	ss.conn = s.db.Conn()
 	defer func() {
 		ss.conn.Close() // rolls back an open transaction
@@ -251,14 +267,25 @@ func (s *Server) handle(c net.Conn) {
 	}
 }
 
-func (s *Server) authenticate(user, password string) bool {
-	switch {
-	case s.opts.Authenticate != nil:
-		return s.opts.Authenticate(user, password)
-	case s.opts.Password != "":
-		return subtle.ConstantTimeCompare([]byte(password), []byte(s.opts.Password)) == 1
+func (s *Server) authenticate(user, password string) (auth.Role, bool) {
+	if s.opts.Authenticate != nil {
+		return auth.RoleAdmin, s.opts.Authenticate(user, password)
 	}
-	return true
+	if s.opts.Users != nil {
+		if role, ok := s.opts.Users.Authenticate(user, password); ok {
+			return role, true
+		}
+	}
+	if s.opts.Password != "" && subtle.ConstantTimeCompare([]byte(password), []byte(s.opts.Password)) == 1 {
+		return auth.RoleAdmin, true
+	}
+	return auth.RoleAdmin, s.opts.Users == nil && s.opts.Password == ""
+}
+
+func (s *Server) log(level slog.Level, msg string, args ...any) {
+	if s.opts.Logger != nil {
+		s.opts.Logger.Log(context.Background(), level, msg, args...)
+	}
 }
 
 // readLoop reads client messages; a cancel stops the running statement
@@ -320,6 +347,9 @@ func (ss *session) query(payload []byte) error {
 		} else {
 			args[i] = v
 		}
+	}
+	if err := auth.Check(ss.s.db, ss.role, src); err != nil {
+		return ss.writeErr(err)
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -403,6 +433,8 @@ func (ss *session) writeErr(err error) error {
 		code = wire.CodeTxDone
 	case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
 		code = wire.CodeInterrupted
+	case errors.Is(err, auth.ErrForbidden):
+		code = wire.CodeForbidden
 	}
 	return wire.WriteMsg(ss.w, wire.Error, append([]byte{code}, err.Error()...))
 }

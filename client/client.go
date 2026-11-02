@@ -41,6 +41,10 @@ type Options struct {
 // ErrUnauthorized is returned when the server rejects the credentials.
 var ErrUnauthorized = errors.New("bangdb: authentication failed")
 
+// ErrForbidden is returned when the account's role may not run a
+// statement (e.g. a read-only account and an INSERT).
+var ErrForbidden = errors.New("bangdb: permission denied")
+
 // Error is an error reported by the server.
 type Error struct {
 	Code    byte
@@ -64,6 +68,8 @@ func (e *Error) Is(target error) bool {
 		return target == context.Canceled
 	case wire.CodeUnauthorized:
 		return target == ErrUnauthorized
+	case wire.CodeForbidden:
+		return target == ErrForbidden
 	}
 	return false
 }

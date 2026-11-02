@@ -16,6 +16,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
@@ -26,6 +27,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/knoxxr/bangdb"
+	"github.com/knoxxr/bangdb/auth"
 	"github.com/knoxxr/bangdb/client"
 	"github.com/knoxxr/bangdb/httpapi"
 	"github.com/knoxxr/bangdb/internal/engine"
@@ -68,6 +70,22 @@ options:`)
 	if cfg.connect != "" {
 		os.Exit(remoteShell(cfg.connect, fs.Args()))
 	}
+	if cfg.addUser != "" {
+		if err := addUser(cfg.addUser, cfg.usersFile); err != nil {
+			fatal(err)
+		}
+		return
+	}
+	logger, err := newLogger(cfg.logFormat, cfg.logLevel)
+	if err != nil {
+		fatal(err)
+	}
+	var users *auth.Users
+	if cfg.usersFile != "" {
+		if users, err = auth.LoadUsers(cfg.usersFile); err != nil {
+			fatal(err)
+		}
+	}
 	args := fs.Args()
 	if cfg.database == "" && len(args) > 0 {
 		cfg.database, args = args[0], args[1:]
@@ -97,6 +115,9 @@ options:`)
 	pub, err := bangdb.OpenWithOptions(path, &bangdb.Options{
 		BusyTimeout: cfg.busyTimeout, QueryTimeout: cfg.queryTimeout, SlowQueryThreshold: cfg.slowQuery,
 		CacheSize: int(cfg.cacheSize), SortMemory: int(cfg.sortMemory), TempDir: cfg.tempDir, EncryptionKey: key,
+		OnSlowQuery: func(q bangdb.SlowQuery) {
+			logger.Warn("slow query", "duration", q.Duration, "sql", q.SQL, "error", q.Err)
+		},
 	})
 	if err != nil {
 		fatal(err)
@@ -104,9 +125,22 @@ options:`)
 	defer pub.Close()
 	db := pub.Engine()
 	sh := &shell{db: db, conn: localSession{db.Conn()}, out: os.Stdout}
-	if serving && password == "" {
-		fmt.Fprintln(os.Stderr, "warning: serving without a password; anyone who can reach the port has full access")
+	if serving && password == "" && users == nil {
+		logger.Warn("serving without a password or users file: anyone who can reach the port has full access")
 	}
+	if cfg.backupDir != "" {
+		stop, err := pub.StartBackups(bangdb.BackupSchedule{Dir: cfg.backupDir, Interval: cfg.backupInterval, Keep: cfg.backupKeep,
+			OnBackup: func(p string, took time.Duration) {
+				logger.Info("backup written and verified", "path", p, "took", took)
+			},
+			OnError: func(err error) { logger.Error("backup failed", "error", err) },
+		})
+		if err != nil {
+			fatal(err)
+		}
+		defer stop()
+	}
+	srvStats := func(w io.Writer) {}
 	var tlsConfig *tls.Config
 	if cfg.tlsCert != "" {
 		cert, err := tls.LoadX509KeyPair(cfg.tlsCert, cfg.tlsKey)
@@ -116,7 +150,14 @@ options:`)
 		tlsConfig = &tls.Config{Certificates: []tls.Certificate{cert}, MinVersion: tls.VersionTLS12}
 	}
 	if cfg.listen != "" {
-		srv := server.New(pub, server.Options{Password: password, MaxConns: cfg.maxConns, IdleTimeout: cfg.idleTimeout})
+		srv := server.New(pub, server.Options{Password: password, Users: users, MaxConns: cfg.maxConns,
+			IdleTimeout: cfg.idleTimeout, Logger: logger})
+		srvStats = func(w io.Writer) {
+			st := srv.Stats()
+			httpapi.WriteMetric(w, "bangdb_server_connections", "gauge", "Open client connections.", float64(st.Connections))
+			httpapi.WriteMetric(w, "bangdb_server_accepted_total", "counter", "Accepted client connections.", float64(st.Accepted))
+			httpapi.WriteMetric(w, "bangdb_server_rejected_total", "counter", "Refused client connections.", float64(st.Rejected))
+		}
 		go func() {
 			var err error
 			if tlsConfig != nil {
@@ -129,7 +170,7 @@ options:`)
 			}
 		}()
 		defer srv.Close()
-		fmt.Fprintf(os.Stderr, "serving clients on %s\n", cfg.listen)
+		logger.Info("serving clients", "address", cfg.listen, "tls", tlsConfig != nil)
 	}
 	if cfg.httpAddr != "" {
 		var origins []string
@@ -140,8 +181,9 @@ options:`)
 		}
 		hs := &http.Server{
 			Addr: cfg.httpAddr, TLSConfig: tlsConfig,
-			Handler: httpapi.New(pub, httpapi.Options{Token: password, AllowOrigins: origins,
-				ReadOnly: cfg.httpReadOnly, MaxConcurrent: cfg.httpMaxConcurrent}),
+			Handler: httpapi.New(pub, httpapi.Options{Token: password, Users: users, AllowOrigins: origins,
+				ReadOnly: cfg.httpReadOnly, MaxConcurrent: cfg.httpMaxConcurrent, Logger: logger,
+				ExtraMetrics: func(w io.Writer) { srvStats(w) }}),
 			// Slow or idle clients must not hold connections forever.
 			ReadHeaderTimeout: 10 * time.Second,
 			ReadTimeout:       60 * time.Second,
@@ -159,7 +201,7 @@ options:`)
 			}
 		}()
 		defer hs.Close()
-		fmt.Fprintf(os.Stderr, "serving the HTTP API on %s\n", cfg.httpAddr)
+		logger.Info("serving the HTTP API and web console", "address", cfg.httpAddr, "tls", tlsConfig != nil)
 	}
 	if cfg.serve != "" {
 		p := replication.NewPrimary(pub, replication.PrimaryOptions{Token: cfg.token})
@@ -561,4 +603,63 @@ func isSet(fs *flag.FlagSet, file map[string]string, name string) bool {
 	_, inEnv := os.LookupEnv("BANGDB_" + strings.ToUpper(name))
 	_, inFile := file[name]
 	return set || inEnv || inFile
+}
+
+// newLogger returns the server's structured logger (stderr).
+func newLogger(format, level string) (*slog.Logger, error) {
+	var lv slog.Level
+	if level != "" {
+		if err := lv.UnmarshalText([]byte(level)); err != nil {
+			return nil, fmt.Errorf("log_level: %w", err)
+		}
+	}
+	opts := &slog.HandlerOptions{Level: lv}
+	switch strings.ToLower(format) {
+	case "", "text":
+		return slog.New(slog.NewTextHandler(os.Stderr, opts)), nil
+	case "json":
+		return slog.New(slog.NewJSONHandler(os.Stderr, opts)), nil
+	}
+	return nil, fmt.Errorf("log_format must be text or json, not %q", format)
+}
+
+// addUser reads a password (twice on a terminal) and prints the account
+// line for name:role, or appends it to the users file.
+func addUser(spec, usersFile string) error {
+	name, roleName, ok := strings.Cut(spec, ":")
+	if !ok || name == "" || strings.ContainsAny(name, " \t") {
+		return fmt.Errorf("-add-user wants name:role, e.g. app:write")
+	}
+	role, err := auth.ParseRole(roleName)
+	if err != nil {
+		return err
+	}
+	in := bufio.NewReader(os.Stdin)
+	if isTerminal() {
+		fmt.Fprint(os.Stderr, "password (shown as typed): ")
+	}
+	pw, _ := in.ReadString('\n')
+	pw = strings.TrimRight(pw, "\r\n")
+	if len(pw) < 8 {
+		return fmt.Errorf("the password must have at least 8 characters")
+	}
+	hash, err := auth.HashPassword(pw)
+	if err != nil {
+		return err
+	}
+	line := fmt.Sprintf("%s %s %s\n", name, role, hash)
+	if usersFile == "" {
+		fmt.Print(line)
+		return nil
+	}
+	f, err := os.OpenFile(usersFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
+	if err != nil {
+		return err
+	}
+	if _, err := f.WriteString(line); err != nil {
+		f.Close()
+		return err
+	}
+	fmt.Fprintf(os.Stderr, "added %s (%s) to %s\n", name, role, usersFile)
+	return f.Close()
 }

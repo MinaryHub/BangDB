@@ -591,3 +591,14 @@ func renameFile(from, to string) error {
 		time.Sleep(delay)
 	}
 }
+
+// VerifyBackup opens the database file at path (a backup of this
+// database, so with its encryption key) and runs the integrity check.
+func (db *DB) VerifyBackup(ctx context.Context, path string) ([]string, error) {
+	b, err := Open(path, &Options{EncryptionKey: db.key})
+	if err != nil {
+		return nil, err
+	}
+	defer b.Close()
+	return b.IntegrityCheck(ctx)
+}
