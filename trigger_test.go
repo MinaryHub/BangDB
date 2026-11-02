@@ -29,7 +29,7 @@ func TestTriggers(t *testing.T) {
 	exec(t, db, "INSERT INTO acct (id, owner, balance) VALUES (1, 'kim', 10), (2, 'lee', 0), (3, 'bad', -5)")
 	expect(t, db, "SELECT id FROM acct ORDER BY id", "1;2") // RAISE(IGNORE) skipped the negative row
 	exec(t, db, "UPDATE acct SET balance = balance + 5 WHERE id = 1")
-	exec(t, db, "UPDATE acct SET owner = 'KIM' WHERE id = 1")      // not OF balance: no trigger
+	exec(t, db, "UPDATE acct SET owner = 'KIM' WHERE id = 1")     // not OF balance: no trigger
 	exec(t, db, "UPDATE acct SET balance = balance WHERE id = 2") // WHEN is false
 	expect(t, db, "SELECT updated FROM acct ORDER BY id", "1;0")
 	if _, err := db.Exec("DELETE FROM acct WHERE id = 1"); err == nil || !strings.Contains(err.Error(), "cannot delete an account with money") {
@@ -59,14 +59,14 @@ func TestTriggers(t *testing.T) {
 	exec(t, db, "INSERT INTO acct (id, owner, balance) VALUES (4, 'p', 1)")
 	expect(t, db, "SELECT count(*) FROM audit WHERE acct = 4", "0")
 	for q, want := range map[string]string{
-		"CREATE TRIGGER acct_upd AFTER INSERT ON acct BEGIN SELECT 1; END":     "already exists",
-		"CREATE TRIGGER x AFTER INSERT ON nope BEGIN SELECT 1; END":            "no such table",
-		"CREATE TRIGGER x INSTEAD OF INSERT ON acct BEGIN SELECT 1; END":       "not supported",
-		"CREATE TRIGGER x AFTER INSERT ON acct BEGIN CREATE TABLE y (a); END":  "trigger body",
-		"CREATE TRIGGER x AFTER UPDATE OF nope ON acct BEGIN SELECT 1; END":    "no such column",
-		"DROP TRIGGER nope":                                                    "no such trigger",
-		"ALTER TABLE acct RENAME TO accounts":                                  "has triggers",
-		"SELECT RAISE(ABORT)":                                                  "needs a message",
+		"CREATE TRIGGER acct_upd AFTER INSERT ON acct BEGIN SELECT 1; END":    "already exists",
+		"CREATE TRIGGER x AFTER INSERT ON nope BEGIN SELECT 1; END":           "no such table",
+		"CREATE TRIGGER x INSTEAD OF INSERT ON acct BEGIN SELECT 1; END":      "not supported",
+		"CREATE TRIGGER x AFTER INSERT ON acct BEGIN CREATE TABLE y (a); END": "trigger body",
+		"CREATE TRIGGER x AFTER UPDATE OF nope ON acct BEGIN SELECT 1; END":   "no such column",
+		"DROP TRIGGER nope":                   "no such trigger",
+		"ALTER TABLE acct RENAME TO accounts": "has triggers",
+		"SELECT RAISE(ABORT)":                 "needs a message",
 	} {
 		if _, err := db.Exec(q); err == nil || !strings.Contains(err.Error(), want) {
 			t.Errorf("%s: %v, want %q", q, err, want)
