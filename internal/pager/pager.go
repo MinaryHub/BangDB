@@ -69,6 +69,9 @@ var (
 	ErrCorrupt = errors.New("bangdb: database file is corrupt or not a BangDB file")
 	// ErrClosed is returned when using a closed pager.
 	ErrClosed = errors.New("bangdb: database is closed")
+	// ErrLocked is returned when another process (or another handle in
+	// this process) has the database open.
+	ErrLocked = errors.New("bangdb: database is already opened by another process")
 )
 
 // Header is the content of page 0.

@@ -204,6 +204,38 @@ n, err = db.ExportCSV(ctx, w, nil, "SELECT * FROM people WHERE age > ?", 30)
 - `ImportSQL`은 SQLite 덤프를 그대로 받습니다: `PRAGMA`/`BEGIN`/`COMMIT` 무시, `sqlite_sequence`로 AUTOINCREMENT 값 복원, 부모보다 먼저 만든 자식 테이블은 부모가 생길 때까지 대기, `WITHOUT ROWID`/`STRICT` 제거, 트리거는 건너뛰고 결과에 표시. 외래 키는 마지막에 한 번 검사하며, 실패하면 아무것도 반영하지 않습니다.
 - CLI: `.dump [FILE]`, `.read FILE`, `.import FILE TABLE`, `.export FILE QUERY`.
 
+### 설정 파일·환경 변수 (CLI·서버 운영)
+
+모든 옵션은 명령줄 플래그(`-cache-size`), 환경 변수(`BANGDB_CACHE_SIZE`), 설정 파일(`-config bangdb.conf` 또는 `BANGDB_CONFIG`) 중 어디서든 줄 수 있습니다. 우선순위는 **플래그 > 환경 변수 > 설정 파일 > 기본값**.
+
+```ini
+# bangdb.conf
+database            = /var/lib/bangdb/app.db
+listen              = :7432
+http                = :18080
+http_cors           = https://admin.example.com
+password_file       = /etc/bangdb/password       # 비밀번호를 프로세스 목록에 노출하지 않음
+encryption_key_file = /etc/bangdb/db.key         # 32바이트 키(원시 또는 hex)
+tls_cert            = /etc/bangdb/cert.pem
+tls_key             = /etc/bangdb/key.pem
+query_timeout       = 30s                        # 서버 모드 기본 60s, 0이면 제한 없음
+busy_timeout        = 5s
+slow_query          = 500ms                      # 느린 문장을 stderr에 기록
+cache_size          = 256MB
+max_conns           = 200
+idle_timeout        = 10m
+http_max_concurrent = 64
+```
+
+```bash
+bangdb -config bangdb.conf                # 서버 실행
+bangdb -config bangdb.conf -print-config  # 적용된 설정 확인 (비밀 값은 가림)
+```
+
+- 서버 모드(`listen`/`http`)에서는 `query_timeout`을 지정하지 않으면 **60초**가 적용되어, 폭주 쿼리 하나가 서버를 붙잡지 못합니다. HTTP 서버는 헤더 10초·요청 60초·유휴 2분 제한이 기본입니다.
+- 비밀번호 없이 서버를 띄우면 경고를 출력합니다.
+- 같은 DB 파일은 한 프로세스만 열 수 있습니다(리눅스·macOS·**Windows** 모두 파일 잠금, 두 번째 열기는 `bangdb.ErrLocked`).
+
 ### 관측성
 
 ```go

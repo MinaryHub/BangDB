@@ -58,13 +58,17 @@ type Options struct {
 	ReadOnly bool
 	// MaxBodyBytes bounds a request body. Default: 16 MiB.
 	MaxBodyBytes int64
+	// MaxConcurrent bounds the requests run at once; others wait for a
+	// slot (or until they are canceled). 0: unlimited.
+	MaxConcurrent int
 }
 
 // Handler is an http.Handler serving one database.
 type Handler struct {
-	db   *engine.DB
-	opts Options
-	mux  *http.ServeMux
+	db    *engine.DB
+	opts  Options
+	mux   *http.ServeMux
+	slots chan struct{} // MaxConcurrent
 }
 
 // New returns a handler for db.
@@ -73,6 +77,9 @@ func New(db *bangdb.DB, opts Options) *Handler {
 		opts.MaxBodyBytes = 16 << 20
 	}
 	h := &Handler{db: db.Engine(), opts: opts, mux: http.NewServeMux()}
+	if opts.MaxConcurrent > 0 {
+		h.slots = make(chan struct{}, opts.MaxConcurrent)
+	}
 	h.mux.HandleFunc("/query", h.post(h.query))
 	h.mux.HandleFunc("/exec", h.post(h.exec))
 	h.mux.HandleFunc("/batch", h.post(h.batch))
@@ -101,6 +108,15 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("WWW-Authenticate", `Bearer realm="bangdb"`)
 		writeError(w, http.StatusUnauthorized, "unauthorized", "bangdb: authentication required")
 		return
+	}
+	if h.slots != nil {
+		select {
+		case h.slots <- struct{}{}:
+			defer func() { <-h.slots }()
+		case <-r.Context().Done():
+			writeError(w, http.StatusServiceUnavailable, "busy", "bangdb: too many concurrent requests")
+			return
+		}
 	}
 	h.mux.ServeHTTP(w, r)
 }

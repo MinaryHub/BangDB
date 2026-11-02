@@ -1,4 +1,6 @@
-// Command bangdb is an interactive SQL shell for BangDB databases.
+// Command bangdb is an interactive SQL shell for BangDB databases, and
+// runs them as servers. Settings come from flags, BANGDB_* environment
+// variables or a configuration file (see config.go and -help).
 //
 //	bangdb app.db                         # interactive shell
 //	bangdb app.db "SELECT 1"              # run SQL and exit
@@ -33,108 +35,151 @@ import (
 )
 
 func main() {
-	serve := flag.String("serve", "", "serve replicas on this address (primary mode)")
-	replicaOf := flag.String("replica-of", "", "mirror the primary at this address (read-only replica)")
-	token := flag.String("token", "", "replication token")
-	listen := flag.String("listen", "", "serve the database to clients on this address (server mode)")
-	password := flag.String("password", "", "password clients must present (server mode)")
-	tlsCert := flag.String("tls-cert", "", "TLS certificate file (server mode)")
-	tlsKey := flag.String("tls-key", "", "TLS key file (server mode)")
-	showVersion := flag.Bool("version", false, "print the version and exit")
-	httpAddr := flag.String("http", "", "serve the HTTP/JSON API on this address (e.g. :18080); -password is the bearer token")
-	httpCORS := flag.String("http-cors", "", "comma-separated origins allowed to call the HTTP API from browsers (* = any)")
-	httpRO := flag.Bool("http-readonly", false, "HTTP API: allow only /query")
-	connect := flag.String("connect", "", "run the shell against a server: bangdb://user:password@host:port")
-	flag.Usage = func() {
-		fmt.Fprintln(os.Stderr, "usage: bangdb [-serve addr | -replica-of addr] [-token t] [-listen addr] [-http addr [-http-cors origins]] [-password p] [-tls-cert f -tls-key f] [database] [sql...]")
-		fmt.Fprintln(os.Stderr, "       bangdb -connect bangdb://user:password@host:port [sql...]")
-		flag.PrintDefaults()
+	var cfg config
+	fs := flag.CommandLine
+	cfg.register(fs)
+	printConfig := fs.Bool("print-config", false, "print the effective settings and exit")
+	fs.Usage = func() {
+		fmt.Fprintln(os.Stderr, `usage: bangdb [options] [database] [sql...]
+       bangdb -connect bangdb://user:password@host:port [sql...]
+
+Every option can also be set in a configuration file (-config file, lines
+"name = value" with underscores) or an environment variable BANGDB_<NAME>,
+e.g. BANGDB_ENCRYPTION_KEY_FILE. Priority: flag > environment > file.
+
+options:`)
+		fs.PrintDefaults()
 	}
-	flag.Parse()
-	if *showVersion {
+	fs.Parse(os.Args[1:])
+	var fileValues map[string]string
+	if cfg.configFile != "" {
+		var err error
+		if fileValues, err = readConfigFile(cfg.configFile); err != nil {
+			fatal(err)
+		}
+	}
+	if err := cfg.load(fs, fileValues); err != nil {
+		fatal(err)
+	}
+	if cfg.showVersion {
 		fmt.Println("bangdb", bangdb.VersionString())
 		return
 	}
-	if *connect != "" {
-		os.Exit(remoteShell(*connect, flag.Args()))
+	if cfg.connect != "" {
+		os.Exit(remoteShell(cfg.connect, fs.Args()))
 	}
-	path := ":memory:"
-	if flag.NArg() > 0 {
-		path = flag.Arg(0)
+	args := fs.Args()
+	if cfg.database == "" && len(args) > 0 {
+		cfg.database, args = args[0], args[1:]
+	} else if len(args) > 0 && args[0] == cfg.database {
+		args = args[1:]
 	}
-	pub, err := bangdb.Open(path)
+	if cfg.database == "" {
+		cfg.database = ":memory:"
+	}
+	serving := cfg.listen != "" || cfg.httpAddr != ""
+	if serving && !isSet(fs, fileValues, "query_timeout") {
+		cfg.queryTimeout = 60 * time.Second // one runaway query must not hold a server
+	}
+	if *printConfig {
+		fmt.Println(cfg.describe())
+		return
+	}
+	password, err := secret(cfg.password, cfg.passwordFile)
 	if err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		os.Exit(1)
+		fatal(err)
+	}
+	key, err := cfg.key()
+	if err != nil {
+		fatal(err)
+	}
+	path := cfg.database
+	pub, err := bangdb.OpenWithOptions(path, &bangdb.Options{
+		BusyTimeout: cfg.busyTimeout, QueryTimeout: cfg.queryTimeout, SlowQueryThreshold: cfg.slowQuery,
+		CacheSize: int(cfg.cacheSize), SortMemory: int(cfg.sortMemory), TempDir: cfg.tempDir, EncryptionKey: key,
+	})
+	if err != nil {
+		fatal(err)
 	}
 	defer pub.Close()
 	db := pub.Engine()
 	sh := &shell{db: db, conn: localSession{db.Conn()}, out: os.Stdout}
-	if *listen != "" {
-		srv := server.New(pub, server.Options{Password: *password})
+	if serving && password == "" {
+		fmt.Fprintln(os.Stderr, "warning: serving without a password; anyone who can reach the port has full access")
+	}
+	var tlsConfig *tls.Config
+	if cfg.tlsCert != "" {
+		cert, err := tls.LoadX509KeyPair(cfg.tlsCert, cfg.tlsKey)
+		if err != nil {
+			fatal(err)
+		}
+		tlsConfig = &tls.Config{Certificates: []tls.Certificate{cert}, MinVersion: tls.VersionTLS12}
+	}
+	if cfg.listen != "" {
+		srv := server.New(pub, server.Options{Password: password, MaxConns: cfg.maxConns, IdleTimeout: cfg.idleTimeout})
 		go func() {
 			var err error
-			if *tlsCert != "" {
-				cert, cerr := tls.LoadX509KeyPair(*tlsCert, *tlsKey)
-				if cerr != nil {
-					fmt.Fprintln(os.Stderr, "server:", cerr)
-					os.Exit(1)
-				}
-				err = srv.ListenAndServeTLS(*listen, &tls.Config{Certificates: []tls.Certificate{cert}})
+			if tlsConfig != nil {
+				err = srv.ListenAndServeTLS(cfg.listen, tlsConfig)
 			} else {
-				err = srv.ListenAndServe(*listen)
+				err = srv.ListenAndServe(cfg.listen)
 			}
 			if err != nil {
-				fmt.Fprintln(os.Stderr, "server:", err)
-				os.Exit(1)
+				fatal(fmt.Errorf("server: %w", err))
 			}
 		}()
 		defer srv.Close()
-		fmt.Fprintf(os.Stderr, "serving clients on %s\n", *listen)
+		fmt.Fprintf(os.Stderr, "serving clients on %s\n", cfg.listen)
 	}
-	if *httpAddr != "" {
+	if cfg.httpAddr != "" {
 		var origins []string
-		for _, o := range strings.Split(*httpCORS, ",") {
+		for _, o := range strings.Split(cfg.httpCORS, ",") {
 			if o = strings.TrimSpace(o); o != "" {
 				origins = append(origins, o)
 			}
 		}
-		hs := &http.Server{Addr: *httpAddr, Handler: httpapi.New(pub, httpapi.Options{
-			Token: *password, AllowOrigins: origins, ReadOnly: *httpRO})}
+		hs := &http.Server{
+			Addr: cfg.httpAddr, TLSConfig: tlsConfig,
+			Handler: httpapi.New(pub, httpapi.Options{Token: password, AllowOrigins: origins,
+				ReadOnly: cfg.httpReadOnly, MaxConcurrent: cfg.httpMaxConcurrent}),
+			// Slow or idle clients must not hold connections forever.
+			ReadHeaderTimeout: 10 * time.Second,
+			ReadTimeout:       60 * time.Second,
+			IdleTimeout:       2 * time.Minute,
+		}
 		go func() {
 			var err error
-			if *tlsCert != "" {
-				err = hs.ListenAndServeTLS(*tlsCert, *tlsKey)
+			if tlsConfig != nil {
+				err = hs.ListenAndServeTLS("", "")
 			} else {
 				err = hs.ListenAndServe()
 			}
 			if err != nil && err != http.ErrServerClosed {
-				fmt.Fprintln(os.Stderr, "http:", err)
-				os.Exit(1)
+				fatal(fmt.Errorf("http: %w", err))
 			}
 		}()
 		defer hs.Close()
-		fmt.Fprintf(os.Stderr, "serving the HTTP API on %s\n", *httpAddr)
+		fmt.Fprintf(os.Stderr, "serving the HTTP API on %s\n", cfg.httpAddr)
 	}
-	if *serve != "" {
-		p := replication.NewPrimary(pub, replication.PrimaryOptions{Token: *token})
+	if cfg.serve != "" {
+		p := replication.NewPrimary(pub, replication.PrimaryOptions{Token: cfg.token})
 		go func() {
-			if err := p.ListenAndServe(*serve); err != nil {
+			if err := p.ListenAndServe(cfg.serve); err != nil {
 				fmt.Fprintln(os.Stderr, "replication:", err)
 			}
 		}()
 		defer p.Close()
 		sh.primary = p
-		fmt.Fprintf(os.Stderr, "serving replicas on %s\n", *serve)
+		fmt.Fprintf(os.Stderr, "serving replicas on %s\n", cfg.serve)
 	}
-	if *replicaOf != "" {
-		r := replication.StartReplica(pub, *replicaOf, replication.ReplicaOptions{Token: *token})
+	if cfg.replicaOf != "" {
+		r := replication.StartReplica(pub, cfg.replicaOf, replication.ReplicaOptions{Token: cfg.token})
 		defer r.Stop()
 		sh.replica = r
-		fmt.Fprintf(os.Stderr, "replicating from %s (read-only)\n", *replicaOf)
+		fmt.Fprintf(os.Stderr, "replicating from %s (read-only)\n", cfg.replicaOf)
 	}
-	if flag.NArg() > 1 {
-		ok := sh.run(strings.Join(flag.Args()[1:], " "))
+	if len(args) > 0 {
+		ok := sh.run(strings.Join(args, " "))
 		sh.conn.Close()
 		if !ok {
 			os.Exit(1)
@@ -147,7 +192,7 @@ func main() {
 	}
 	sh.loop(os.Stdin, interactive)
 	sh.conn.Close()
-	if *serve != "" || *replicaOf != "" || *listen != "" || *httpAddr != "" {
+	if serving || cfg.serve != "" || cfg.replicaOf != "" {
 		// Keep replicating after stdin is closed until interrupted.
 		sig := make(chan os.Signal, 1)
 		signal.Notify(sig, os.Interrupt, syscall.SIGTERM)
@@ -498,4 +543,22 @@ func printTable(w io.Writer, res engine.Result) {
 		line(row)
 	}
 	fmt.Fprintf(w, "(%d row%s)\n", len(res.Rows), map[bool]string{true: "", false: "s"}[len(res.Rows) == 1])
+}
+
+func fatal(err error) {
+	msg := err.Error()
+	if !strings.HasPrefix(msg, "bangdb:") {
+		msg = "bangdb: " + msg
+	}
+	fmt.Fprintln(os.Stderr, msg)
+	os.Exit(1)
+}
+
+// isSet reports whether a setting was given by flag, environment or file.
+func isSet(fs *flag.FlagSet, file map[string]string, name string) bool {
+	set := false
+	fs.Visit(func(f *flag.Flag) { set = set || f.Name == strings.ReplaceAll(name, "_", "-") })
+	_, inEnv := os.LookupEnv("BANGDB_" + strings.ToUpper(name))
+	_, inFile := file[name]
+	return set || inEnv || inFile
 }

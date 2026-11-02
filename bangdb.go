@@ -284,6 +284,10 @@ var (
 	ErrNotEncrypted = pager.ErrNotEncrypted // a key was given for a plaintext file
 )
 
+// ErrLocked is returned by Open when another process (or another open
+// handle) is using the database file.
+var ErrLocked = pager.ErrLocked
+
 // BackupWithKey writes a backup like Backup, encrypted with key (nil: a
 // plaintext copy). Use it to encrypt, decrypt or re-key a database.
 func (db *DB) BackupWithKey(ctx context.Context, path string, key []byte) error {
