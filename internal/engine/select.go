@@ -904,6 +904,11 @@ func (x *execCtx) conflicts(t *Table, row []any) ([]conflict, error) {
 		if !ix.Unique || ix.hasNull(row) {
 			continue
 		}
+		if ok, err := ix.covers(row); err != nil {
+			return nil, err
+		} else if !ok {
+			continue
+		}
 		id, found, err := x.findKey(t, ix, row, math.MinInt64)
 		if err != nil {
 			return nil, err
@@ -1362,7 +1367,7 @@ func (x *execCtx) updateRow(t *Table, oldID int64, old, newRow []any) (int64, er
 		}
 	}
 	for _, ix := range t.indexes {
-		if newID == oldID && bytes.Equal(ix.fullKey(old), ix.fullKey(newRow)) {
+		if newID == oldID && ix.pred == nil && bytes.Equal(ix.fullKey(old), ix.fullKey(newRow)) {
 			continue
 		}
 		if err := x.checkUnique(t, ix, newRow, oldID); err != nil {
@@ -1393,6 +1398,9 @@ func (x *execCtx) writeRow(t *Table, rowid int64, row []any) error {
 		k, err := indexEntry(ix, row, rowid)
 		if err != nil {
 			return err
+		}
+		if k == nil {
+			continue
 		}
 		if err := x.index(ix).Put(k); err != nil {
 			return err
@@ -1646,7 +1654,7 @@ func (p *selectPlan) useScanOrder(st *sql.Select) bool {
 			return false
 		}
 		for _, ix := range l.t.indexes {
-			if matches(ix, 0, cols) {
+			if ix.Where == "" && matches(ix, 0, cols) {
 				l.acc = &access{kind: accIndex, ix: ix, reverse: desc,
 					desc: fmt.Sprintf("SCAN %s USING INDEX %s (ordered by index)", l.t.Name, ix.Name)}
 				return true

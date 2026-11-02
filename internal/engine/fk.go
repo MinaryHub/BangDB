@@ -160,7 +160,7 @@ func (t *Table) isKey(cols []string) bool {
 
 func (t *Table) uniqueIndex(cols []string) *Index {
 	for _, ix := range t.indexes {
-		if ix.Unique && sameColumns(cols, ix.Columns) {
+		if ix.Unique && ix.Where == "" && sameColumns(cols, ix.Columns) {
 			return ix
 		}
 	}
@@ -275,7 +275,7 @@ func (x *execCtx) children(child *Table, fk *ForeignKey, vals []any) ([]target, 
 	}
 	// An index whose leading columns are the foreign key columns.
 	for _, ix := range child.indexes {
-		if len(ix.cols) < len(fk.cols) || !sameColumns(ix.Columns[:len(fk.cols)], fk.Columns) {
+		if ix.Where != "" || len(ix.cols) < len(fk.cols) || !sameColumns(ix.Columns[:len(fk.cols)], fk.Columns) {
 			continue
 		}
 		var prefix []byte
@@ -481,6 +481,11 @@ func columnInUse(t *Table, i int) string {
 			return "it is used by a CHECK constraint"
 		}
 	}
+	for _, ix := range t.indexes {
+		if e, err := sql.ParseExpr(ix.Where); ix.Where != "" && err == nil && refersTo(e, name) {
+			return "it is used by the WHERE of index " + ix.Name
+		}
+	}
 	return ""
 }
 
@@ -497,17 +502,22 @@ func refersTo(e sql.Expr, col string) bool {
 // renameInChecks rewrites column references in the CHECK constraints of t.
 func renameInChecks(t *Table, old, new string) {
 	for i, src := range t.Checks {
-		e, err := sql.ParseExpr(src)
-		if err != nil {
-			continue
-		}
-		walk(e, func(n sql.Expr) {
-			if r, ok := n.(*sql.ColumnRef); ok && strings.EqualFold(r.Name, old) {
-				r.Name = new
-			}
-		})
-		t.Checks[i] = sql.FormatExpr(e)
+		t.Checks[i] = renameInExpr(src, old, new)
 	}
+}
+
+// renameInExpr rewrites column references in a stored SQL expression.
+func renameInExpr(src, old, new string) string {
+	e, err := sql.ParseExpr(src)
+	if err != nil {
+		return src
+	}
+	walk(e, func(n sql.Expr) {
+		if r, ok := n.(*sql.ColumnRef); ok && strings.EqualFold(r.Name, old) {
+			r.Name = new
+		}
+	})
+	return sql.FormatExpr(e)
 }
 
 func renameIn(names []string, old, new string) {

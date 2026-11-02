@@ -273,6 +273,9 @@ func (db *DB) restoreMemory(data []byte) error {
 				if err != nil {
 					return err
 				}
+				if k == nil {
+					continue
+				}
 				if err := x.index(ix).Put(k); err != nil {
 					return err
 				}

@@ -106,6 +106,7 @@ type CreateIndex struct {
 	Columns     []string
 	Unique      bool
 	IfNotExists bool
+	Where       Expr // partial index condition, or nil
 }
 
 type DropIndex struct {

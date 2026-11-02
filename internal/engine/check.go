@@ -205,6 +205,9 @@ func (x *execCtx) checkIndex(t *Table, ix *Index, rows int, add func(string, ...
 			add("index %s points to missing row %d of %s", ix.Name, rowid, t.Name)
 			continue
 		}
+		if ok, err := ix.covers(row); err != nil || !ok {
+			add("index %s has an entry for row %d of %s, which its WHERE excludes", ix.Name, rowid, t.Name)
+		}
 		if want := ix.key(row); !bytes.Equal(want, valPart) {
 			add("index %s entry for row %d does not match the row's %s", ix.Name, rowid, ix.columnList())
 		}
@@ -222,6 +225,19 @@ func (x *execCtx) checkIndex(t *Table, ix *Index, rows int, add func(string, ...
 	}
 	if err := c.Err(); err != nil {
 		add("index %s: %v", ix.Name, err)
+	}
+	if ix.pred != nil { // a partial index has entries for the covered rows only
+		rows = 0
+		err := x.scanAll(t, func(_ int64, row []any) (bool, error) {
+			if ok, _ := ix.covers(row); ok {
+				rows++
+			}
+			return true, nil
+		})
+		if err != nil {
+			add("table %s: %v", t.Name, err)
+			return
+		}
 	}
 	if entries != rows {
 		add("index %s has %d entries but table %s has %d rows", ix.Name, entries, t.Name, rows)

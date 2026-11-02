@@ -213,8 +213,30 @@ func (x *execCtx) scanAll(t *Table, fn func(rowid int64, row []any) (bool, error
 	return x.scanRows(t, store.MinRowid, store.MaxRowid, false, fn)
 }
 
+// indexEntry returns the entry of row in ix, or nil when ix is partial and
+// does not cover the row.
 func indexEntry(ix *Index, row []any, rowid int64) ([]byte, error) {
+	if ok, err := ix.covers(row); !ok || err != nil {
+		return nil, err
+	}
 	return append(ix.key(row), value.EncodeRowID(rowid)...), nil
+}
+
+// covers reports whether a partial index has an entry for row (a NULL
+// condition counts as false); a full index covers every row.
+func (ix *Index) covers(row []any) (bool, error) {
+	if ix.pred == nil {
+		return true, nil
+	}
+	r := make([]any, len(ix.defs)+1) // hidden rowid unknown
+	copy(r[len(row):], ix.defs[min(len(row), len(ix.defs)):])
+	copy(r, row)
+	v, err := ix.pred(&env{row: r})
+	if err != nil || v == nil {
+		return false, err
+	}
+	ok, _ := value.Truthy(v)
+	return ok, nil
 }
 
 // findKey returns a row other than self whose values in ix equal those of
@@ -246,6 +268,9 @@ func (x *execCtx) findKey(t *Table, ix *Index, row []any, self int64) (int64, bo
 func (x *execCtx) checkUnique(t *Table, ix *Index, row []any, self int64) error {
 	if !ix.Unique || ix.hasNull(row) {
 		return nil
+	}
+	if ok, err := ix.covers(row); !ok || err != nil {
+		return err
 	}
 	if _, found, err := x.findKey(t, ix, row, self); err != nil || !found {
 		return err
@@ -398,6 +423,9 @@ func (x *execCtx) insertRow(t *Table, row []any) (int64, error) {
 		if err != nil {
 			return 0, err
 		}
+		if k == nil {
+			continue
+		}
 		if err := x.index(ix).Put(k); err != nil {
 			return 0, err
 		}
@@ -410,6 +438,9 @@ func (x *execCtx) deleteRow(t *Table, rowid int64, row []any) error {
 		k, err := indexEntry(ix, row, rowid)
 		if err != nil {
 			return err
+		}
+		if k == nil {
+			continue
 		}
 		if _, err := x.index(ix).Delete(k); err != nil {
 			return err
@@ -697,8 +728,18 @@ func (x *execCtx) createIndex(st *sql.CreateIndex) error {
 		}
 		cols = append(cols, t.Columns[i].Name)
 	}
+	where := ""
+	if st.Where != nil {
+		if err := validateCheck(st.Where); err != nil {
+			return fmt.Errorf("bangdb: WHERE of index %s: %s", st.Name, strings.Replace(err.Error(), "CHECK constraints", "index conditions", 1))
+		}
+		where = sql.FormatExpr(st.Where)
+		if _, err := compileCheck(t, where); err != nil {
+			return fmt.Errorf("bangdb: WHERE of index %s: %w", st.Name, err)
+		}
+	}
 	x.mutableCatalog()
-	if err := x.addIndex(&Index{Name: st.Name, Table: t.Name, Columns: cols, Unique: st.Unique}); err != nil {
+	if err := x.addIndex(&Index{Name: st.Name, Table: t.Name, Columns: cols, Unique: st.Unique, Where: where}); err != nil {
 		return err
 	}
 	x.cat.link()
@@ -721,8 +762,8 @@ func (x *execCtx) addIndex(ix *Index) error {
 			return false, err
 		}
 		k, err := indexEntry(ix, row, rowid)
-		if err != nil {
-			return false, err
+		if err != nil || k == nil {
+			return err == nil, err
 		}
 		return true, entries.Put(k)
 	})
@@ -893,6 +934,9 @@ func (x *execCtx) renameColumn(st *sql.AlterTableRenameColumn) error {
 			if strings.EqualFold(c, old) {
 				ix.Columns[k] = st.New
 			}
+		}
+		if ix.Where != "" {
+			ix.Where = renameInExpr(ix.Where, old, st.New)
 		}
 	}
 	for k := range t.ForeignKeys {

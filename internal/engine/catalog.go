@@ -74,7 +74,12 @@ type Index struct {
 	// Stats (from ANALYZE): Stats[k] is the average number of entries
 	// sharing the values of the first k+1 indexed columns.
 	Stats []float64 `json:"stats,omitempty"`
+	// Where makes a partial index: only rows for which it is true have
+	// entries.
+	Where string `json:"where,omitempty"`
 
+	pred  evalFn // compiled Where
+	defs  []any  // the table's column defaults, for rows shorter than it
 	cols  []int
 	colls []string   // collation per column: keys of collated text are folded
 	kind  store.Kind // the table's storage kind, which also stores its indexes
@@ -357,6 +362,18 @@ func (ix *Index) resolve(t *Table) {
 		ix.Columns, ix.Column = []string{ix.Column}, ""
 	}
 	ix.kind = t.kind
+	ix.defs, ix.pred = nil, nil
+	if ix.Where != "" {
+		for _, c := range t.Columns {
+			ix.defs = append(ix.defs, c.defConst)
+		}
+		f, err := compileCheck(t, ix.Where)
+		if err != nil {
+			err := fmt.Errorf("bangdb: WHERE of index %s: %w", ix.Name, err)
+			f = func(*env) (any, error) { return nil, err }
+		}
+		ix.pred = f
+	}
 	ix.cols, ix.colls = ix.cols[:0], ix.colls[:0]
 	for _, c := range ix.Columns {
 		i := t.ColIndex(c)
@@ -609,7 +626,11 @@ func (ix *Index) createSQL() string {
 	if ix.Unique {
 		u = "UNIQUE "
 	}
-	return fmt.Sprintf("CREATE %sINDEX %s ON %s (%s);", u, sql.QuoteIdent(ix.Name), sql.QuoteIdent(ix.Table), ix.columnList())
+	where := ""
+	if ix.Where != "" {
+		where = " WHERE " + ix.Where
+	}
+	return fmt.Sprintf("CREATE %sINDEX %s ON %s (%s)%s;", u, sql.QuoteIdent(ix.Name), sql.QuoteIdent(ix.Table), ix.columnList(), where)
 }
 
 func isIdent(s string) bool {

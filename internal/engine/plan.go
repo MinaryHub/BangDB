@@ -251,6 +251,9 @@ func chooseAccess(sc *scope, l *level, li int, conds []sql.Expr, c *compiler) (*
 	}
 	var best *plan
 	for _, ix := range l.t.indexes {
+		if ix.Where != "" && !impliesIndexWhere(ix, conds, sc, l, li) {
+			continue // a partial index lacks the rows its WHERE excludes
+		}
 		p := &plan{ix: ix}
 		for _, col := range ix.cols {
 			if l.t.Columns[col].Type == value.Any || find(col, "=") == nil {
@@ -1330,4 +1333,60 @@ func (o *keyOrder) flush() (bool, error) {
 		}
 	}
 	return true, nil
+}
+
+// impliesIndexWhere reports whether conds (ANDed) imply the WHERE of a
+// partial index: each of its terms must appear among them, written the same
+// way (column references may carry this table's name or alias).
+func impliesIndexWhere(ix *Index, conds []sql.Expr, sc *scope, l *level, li int) bool {
+	where, err := sql.ParseExpr(ix.Where)
+	if err != nil {
+		return false
+	}
+	have := map[string]bool{}
+	for _, e := range conds {
+		if s, ok := unqualified(e, sc, l, li); ok {
+			have[s] = true
+		}
+	}
+	for _, term := range conjuncts(where) {
+		if !have[sql.FormatExpr(term)] {
+			return false
+		}
+	}
+	return true
+}
+
+// unqualified formats e with the table names of its column references
+// removed, if they all name columns of level l (and nothing else).
+func unqualified(e sql.Expr, sc *scope, l *level, li int) (string, bool) {
+	ok := true
+	walk(e, func(n sql.Expr) {
+		switch r := n.(type) {
+		case *sql.ColumnRef:
+			if _, mine := columnOf(r, sc, l, li); !mine {
+				ok = false
+			}
+		case *sql.Subquery, *sql.Exists, *sql.Param:
+			ok = false
+		}
+	})
+	if !ok {
+		return "", false
+	}
+	var refs []*sql.ColumnRef
+	walk(e, func(n sql.Expr) {
+		if r, ok := n.(*sql.ColumnRef); ok {
+			refs = append(refs, r)
+		}
+	})
+	saved := make([]string, len(refs))
+	for i, r := range refs {
+		saved[i], r.Table = r.Table, ""
+	}
+	s := sql.FormatExpr(e)
+	for i, r := range refs {
+		r.Table = saved[i]
+	}
+	return s, true
 }

@@ -15,6 +15,7 @@
 - `/metrics`(Prometheus), 구조화 로그(`log_format`, `log_level`), 웹 콘솔(`/`)
 - 정기 백업 + 백업 검증(`StartBackups`, `VerifyBackup`, `backup_dir`/`backup_interval`/`backup_keep`)
 - 트리거(BEFORE/AFTER, INSERT/UPDATE OF/DELETE, WHEN, NEW/OLD, RAISE), 덤프·SQLite 덤프 가져오기에 포함
+- 부분 인덱스 `CREATE [UNIQUE] INDEX ... WHERE 조건` (예: 삭제되지 않은 행만 이메일 유일). 질의 조건이 인덱스 조건을 포함할 때만 플래너가 사용
 - 복제본이 받은 프레임을 묶어 fsync 1회로 적용(느린 디스크에서 지연 감소)
 - 대용량·장시간 시험(`TestScale`, `TestSoak`)
 - Windows: 데이터 밖 1바이트 잠금(다른 프로그램이 파일을 읽을 수 있음), 디렉터리 fsync 생략, 파일 교체 재시도

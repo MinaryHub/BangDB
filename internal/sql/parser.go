@@ -405,6 +405,11 @@ func (p *parser) parseCreate() (Stmt, error) {
 		if ci.Columns, err = p.parseColumnList(); err != nil {
 			return nil, err
 		}
+		if p.acceptKw("WHERE") {
+			if ci.Where, err = p.parseExpr(); err != nil {
+				return nil, err
+			}
+		}
 		return ci, nil
 	}
 	return nil, p.errf("expected TABLE or INDEX")
