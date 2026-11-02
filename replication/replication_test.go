@@ -354,7 +354,12 @@ func TestCascadeAndBackupFromReplica(t *testing.T) {
 	time.Sleep(100 * time.Millisecond)
 	stop()
 	waitSynced(t, r1, primary)
-	waitSynced(t, r2, primary)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := r2.WaitFor(ctx, primary.Seq()); err != nil {
+		t.Fatalf("leaf did not catch up: leaf %+v, mid %+v (mid seq %d, stats %+v), primary seq %d: %v",
+			r2.Status(), r1.Status(), mid.Seq(), mid.Stats(), primary.Seq(), err)
+	}
 	want := dump(t, primary)
 	if dump(t, mid) != want || dump(t, leaf) != want {
 		t.Fatal("cascaded replicas differ from primary")

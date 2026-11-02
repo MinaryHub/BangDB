@@ -143,6 +143,8 @@ func sqlLiteral(v any) string {
 		return "'" + strings.ReplaceAll(x, "'", "''") + "'"
 	case []byte:
 		return "X'" + hex.EncodeToString(x) + "'"
+	case value.Decimal:
+		return "'" + x.String() + "'" // text keeps every digit; the column type converts it
 	}
 	return "'" + strings.ReplaceAll(value.Format(v), "'", "''") + "'"
 }

@@ -238,6 +238,9 @@ func (r *rows) Next(dest []driver.Value) error {
 		return io.EOF
 	}
 	for i, v := range r.r.Row() {
+		if d, ok := v.(value.Decimal); ok {
+			v = d.String() // database/sql values: exact text, scannable into string or float64
+		}
 		dest[i] = v
 	}
 	return nil

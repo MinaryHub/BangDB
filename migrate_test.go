@@ -3,6 +3,7 @@ package bangdb
 import (
 	"bytes"
 	"context"
+	"os"
 	"path/filepath"
 	"reflect"
 	"strings"
@@ -17,7 +18,9 @@ func TestPragmas(t *testing.T) {
 	expect(t, db, "PRAGMA table_info(users)", "0|id|INTEGER|0|NULL|1;1|name|TEXT|1|NULL|0;2|email|TEXT|0|NULL|0;3|age|INT|0|30|0")
 	expect(t, db, "PRAGMA index_list(orders)", "0|idx_orders_user|0|c|0")
 	expect(t, db, "PRAGMA index_info('idx_orders_user')", "0|1|user_id")
-	expect(t, db, "PRAGMA table_list", "orders|table|btree|4;users|table|btree|4")
+	if os.Getenv("BANGDB_TEST_STORE") == "" { // the kind column names the default store
+		expect(t, db, "PRAGMA table_list", "orders|table|btree|4;users|table|btree|4")
+	}
 	expect(t, db, "PRAGMA integrity_check", "ok")
 	expect(t, db, "PRAGMA foreign_keys = ON", "1")
 	expect(t, db, "PRAGMA journal_mode", "wal")

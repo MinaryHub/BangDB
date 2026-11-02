@@ -11,6 +11,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/knoxxr/bangdb/internal/sql"
+	"github.com/knoxxr/bangdb/internal/value"
 )
 
 // JSON functions. JSON documents are TEXT values; they are parsed for each
@@ -182,6 +183,8 @@ func toJSON(v any) (any, error) {
 		return parseJSON(string(x))
 	case int64:
 		return json.Number(strconv.FormatInt(x, 10)), nil
+	case value.Decimal:
+		return json.Number(x.String()), nil
 	case float64:
 		switch {
 		case math.IsNaN(x):

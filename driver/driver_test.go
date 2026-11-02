@@ -141,3 +141,23 @@ func TestDriverNamedParamsAndColumnTypes(t *testing.T) {
 		t.Fatalf("column types %q, want %q", s, want)
 	}
 }
+
+func TestDecimalThroughDatabaseSQL(t *testing.T) {
+	db, err := sql.Open("bangdb", ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	db.Exec(`CREATE TABLE m (amount DECIMAL(10,2))`)
+	if _, err := db.Exec(`INSERT INTO m VALUES (?), (?)`, "0.10", 0.2); err != nil {
+		t.Fatal(err)
+	}
+	var s string
+	var f float64
+	if err := db.QueryRow(`SELECT sum(amount), sum(amount) FROM m`).Scan(&s, &f); err != nil {
+		t.Fatal(err)
+	}
+	if s != "0.30" || f != 0.3 {
+		t.Fatalf("sum: %q %v", s, f)
+	}
+}

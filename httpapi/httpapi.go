@@ -43,6 +43,7 @@ import (
 
 	"github.com/knoxxr/bangdb"
 	"github.com/knoxxr/bangdb/internal/engine"
+	"github.com/knoxxr/bangdb/internal/value"
 )
 
 // Options configures the handler.
@@ -255,6 +256,8 @@ func toJSON(v any) any {
 	switch x := v.(type) {
 	case []byte:
 		return map[string]string{"$blob": base64.StdEncoding.EncodeToString(x)}
+	case value.Decimal:
+		return json.Number(x.String()) // exact digits
 	case float64:
 		if math.IsNaN(x) || math.IsInf(x, 0) {
 			return nil

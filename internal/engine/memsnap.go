@@ -164,7 +164,7 @@ func (db *DB) saveMemoryTables() error {
 	if err := f.Close(); err != nil {
 		return err
 	}
-	if err := os.Rename(tmp, path); err != nil {
+	if err := renameFile(tmp, path); err != nil {
 		return err
 	}
 	return pager.SyncDir(path)

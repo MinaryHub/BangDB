@@ -1,7 +1,8 @@
 // Package value defines SQL values, their comparison rules and their binary
 // encodings (row records and order-preserving index keys).
 //
-// A value is one of the Go types: nil (NULL), int64, float64, string, []byte.
+// A value is one of the Go types: nil (NULL), int64, float64, string, []byte,
+// or Decimal (exact decimals of DECIMAL(p,s) columns).
 package value
 
 import (
@@ -10,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"math/big"
 	"strconv"
 	"strings"
 	"time"
@@ -30,6 +32,9 @@ const (
 // SQLite-like name rules (e.g. VARCHAR(20) -> TEXT, BIGINT -> INTEGER).
 func ParseType(name string) Type {
 	n := strings.ToUpper(name)
+	if t, ok := parseDecimalDecl(n); ok {
+		return t
+	}
 	switch {
 	case n == "":
 		return Any
@@ -50,7 +55,7 @@ func ParseType(name string) Type {
 // Normalize converts common Go types to canonical value types.
 func Normalize(v any) (any, error) {
 	switch x := v.(type) {
-	case nil, int64, float64, string, []byte:
+	case nil, int64, float64, string, []byte, Decimal:
 		return x, nil
 	case int:
 		return int64(x), nil
@@ -98,11 +103,18 @@ func Coerce(v any, t Type) (any, error) {
 	if v == nil || t == Any {
 		return v, nil
 	}
+	if p, sc, ok := DecimalSpec(t); ok {
+		return coerceDecimal(v, p, sc)
+	}
 	switch t {
 	case Integer:
 		switch x := v.(type) {
 		case int64:
 			return x, nil
+		case Decimal:
+			if d, err := x.Rescale(0); err == nil && d.Cmp(x) == 0 {
+				return d.Unscaled, nil
+			}
 		case float64:
 			if x == math.Trunc(x) && x >= math.MinInt64 && x < math.MaxInt64 {
 				return int64(x), nil
@@ -114,6 +126,8 @@ func Coerce(v any, t Type) (any, error) {
 		}
 	case Real:
 		switch x := v.(type) {
+		case Decimal:
+			return x.Float64(), nil
 		case int64:
 			return float64(x), nil
 		case float64:
@@ -127,7 +141,7 @@ func Coerce(v any, t Type) (any, error) {
 		switch x := v.(type) {
 		case string:
 			return x, nil
-		case int64, float64:
+		case int64, float64, Decimal:
 			return Format(x), nil
 		}
 	case Blob:
@@ -154,6 +168,8 @@ func TypeOf(v any) string {
 		return "TEXT"
 	case []byte:
 		return "BLOB"
+	case Decimal:
+		return "DECIMAL"
 	}
 	return fmt.Sprintf("%T", v)
 }
@@ -175,6 +191,8 @@ func Format(v any) string {
 		return x
 	case []byte:
 		return fmt.Sprintf("x'%x'", x)
+	case Decimal:
+		return x.String()
 	}
 	return fmt.Sprint(v)
 }
@@ -183,7 +201,7 @@ func rank(v any) int {
 	switch v.(type) {
 	case nil:
 		return 0
-	case int64, float64:
+	case int64, float64, Decimal:
 		return 1
 	case string:
 		return 2
@@ -198,6 +216,12 @@ func Compare(a, b any) int {
 	ra, rb := rank(a), rank(b)
 	if ra != rb {
 		return cmpInt(ra, rb)
+	}
+	if da, ok := a.(Decimal); ok {
+		return cmpDecimal(da, b)
+	}
+	if db, ok := b.(Decimal); ok {
+		return -cmpDecimal(db, a)
 	}
 	switch x := a.(type) {
 	case nil:
@@ -216,6 +240,30 @@ func Compare(a, b any) int {
 		return strings.Compare(x, b.(string))
 	case []byte:
 		return bytes.Compare(x, b.([]byte))
+	}
+	return 0
+}
+
+// cmpDecimal compares a decimal with another number, exactly.
+func cmpDecimal(d Decimal, b any) int {
+	switch y := b.(type) {
+	case Decimal:
+		return d.Cmp(y)
+	case int64:
+		return d.Cmp(DecimalFromInt(y))
+	case float64:
+		if math.IsNaN(y) {
+			return 1
+		}
+		if math.IsInf(y, 0) {
+			return -int(math.Copysign(1, y))
+		}
+		// Through the float's shortest decimal form, so that a literal
+		// 0.1 (a float) equals DECIMAL 0.10.
+		if f, err := DecimalFromFloat(y); err == nil {
+			return d.Cmp(f)
+		}
+		return d.rat().Cmp(new(big.Rat).SetFloat64(y))
 	}
 	return 0
 }
@@ -259,6 +307,8 @@ func Truthy(v any) (bool, bool) {
 		return x != 0, true
 	case float64:
 		return x != 0, true
+	case Decimal:
+		return x.Unscaled != 0, true
 	case string:
 		f, err := strconv.ParseFloat(strings.TrimSpace(x), 64)
 		return err == nil && f != 0, true
@@ -276,6 +326,7 @@ const (
 	tagFloat = 2
 	tagText  = 3
 	tagBlob  = 4
+	tagDec   = 5 // varint unscaled, scale byte
 )
 
 // EncodeRow serializes a row of values.
@@ -299,6 +350,10 @@ func EncodeRow(vals []any) []byte {
 			b = append(b, tagBlob)
 			b = binary.AppendUvarint(b, uint64(len(x)))
 			b = append(b, x...)
+		case Decimal:
+			b = append(b, tagDec)
+			b = binary.AppendVarint(b, x.Unscaled)
+			b = append(b, x.Scale)
 		default:
 			panic(fmt.Sprintf("value: cannot encode %T", v))
 		}
@@ -335,6 +390,13 @@ func DecodeRow(b []byte) ([]any, error) {
 			}
 			vals = append(vals, x)
 			b = b[k:]
+		case tagDec:
+			x, k := binary.Varint(b)
+			if k <= 0 || len(b) <= k || b[k] > MaxDecimalScale {
+				return nil, errBadRow
+			}
+			vals = append(vals, Decimal{x, b[k]})
+			b = b[k+1:]
 		case tagFloat:
 			if len(b) < 8 {
 				return nil, errBadRow
@@ -368,6 +430,7 @@ const (
 	keyNull  = 0x05
 	keyInt   = 0x10
 	keyFloat = 0x11
+	keyDec   = 0x12 // 16-byte value at scale 18 (order), then the scale
 	keyText  = 0x20
 	keyBlob  = 0x30
 )
@@ -401,6 +464,16 @@ func AppendKey(b []byte, v any) []byte {
 	case []byte:
 		b = append(b, keyBlob)
 		return appendEscaped(b, x)
+	case Decimal:
+		// value * 10^(18-scale) fits 128 bits; offset by 2^127 so that
+		// bytes order as numbers, whatever the scale.
+		n := new(big.Int).Mul(big.NewInt(x.Unscaled), big.NewInt(pow10[MaxDecimalScale-int(x.Scale)]))
+		n.Add(n, new(big.Int).Lsh(big.NewInt(1), 127))
+		var buf [16]byte
+		n.FillBytes(buf[:])
+		b = append(b, keyDec)
+		b = append(b, buf[:]...)
+		return append(b, x.Scale)
 	}
 	panic(fmt.Sprintf("value: cannot key-encode %T", v))
 }
@@ -447,6 +520,15 @@ func DecodeKey(b []byte, n int) (vals []any, ok bool) {
 			}
 			vals = append(vals, int64(binary.BigEndian.Uint64(b)^(1<<63)))
 			b = b[8:]
+		case keyDec:
+			if len(b) < 17 || b[16] > MaxDecimalScale {
+				return nil, false
+			}
+			n := new(big.Int).SetBytes(b[:16])
+			n.Sub(n, new(big.Int).Lsh(big.NewInt(1), 127))
+			n.Quo(n, big.NewInt(pow10[MaxDecimalScale-int(b[16])]))
+			vals = append(vals, Decimal{n.Int64(), b[16]})
+			b = b[17:]
 		case keyFloat:
 			if len(b) < 8 {
 				return nil, false

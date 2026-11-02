@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"sort"
+	"runtime"
 	"sync"
 	"time"
 
@@ -466,7 +467,7 @@ func (w *SnapshotWriter) Close() error {
 		return nil
 	}
 	os.Remove(w.tmp + "-wal")
-	if err := os.Rename(w.tmp, w.path); err != nil {
+	if err := renameFile(w.tmp, w.path); err != nil {
 		return err
 	}
 	return pager.SyncDir(w.path)
@@ -506,15 +507,22 @@ func (db *DB) installLocked(w *SnapshotWriter) error {
 		}
 		os.Remove(w.tmp + "-wal")
 		os.Remove(db.path + "-wal")
-		if err := os.Rename(w.tmp, db.path); err != nil {
-			return err
+		renameErr := renameFile(w.tmp, db.path)
+		if renameErr == nil {
+			renameErr = pager.SyncDir(db.path)
 		}
-		if err := pager.SyncDir(db.path); err != nil {
-			return err
-		}
+		// Reopen the file: the new copy, or the old data if the swap
+		// failed (then the copy is dropped and the error reported).
 		p, err := pager.OpenEncrypted(db.path, db.key)
 		if err != nil {
-			return err // db.p stays closed: later calls fail with ErrClosed
+			return errors.Join(renameErr, err) // db.p stays closed: later calls fail with ErrClosed
+		}
+		if renameErr != nil {
+			removeDBFiles(w.tmp)
+			db.p = p
+			db.p.SetOnCommit(db.repl.onCommit)
+			db.p.SetCacheSize(db.cacheSize)
+			return fmt.Errorf("bangdb: installing the new copy: %w", renameErr)
 		}
 		p.SetObjects(slots)
 		db.p = p
@@ -569,4 +577,17 @@ func (db *DB) BackupWithKey(ctx context.Context, path string, key []byte) error 
 		return err
 	}
 	return w.Close()
+}
+
+// renameFile replaces to with from. On Windows a just-written file can be
+// held briefly by another program (indexer, antivirus), which makes the
+// rename fail with "access denied": retry for a while.
+func renameFile(from, to string) error {
+	var err error
+	for delay := 10 * time.Millisecond; ; delay *= 2 {
+		if err = os.Rename(from, to); err == nil || runtime.GOOS != "windows" || delay > 2*time.Second {
+			return err
+		}
+		time.Sleep(delay)
+	}
 }

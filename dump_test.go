@@ -25,7 +25,7 @@ func TestImportSQLiteDump(t *testing.T) {
 	}
 	expect(t, db, `SELECT id, customer, note, hex(data), "group" FROM orders ORDER BY id`,
 		"1|Kim|it's; fine|00FF|a;2|lee|multi\nline||NULL") // hex(NULL) is ''
-	expect(t, db, `SELECT * FROM totals ORDER BY order_id`, "1|119")
+	expect(t, db, `SELECT * FROM totals ORDER BY order_id`, "1|119.00") // DECIMAL(10,2) is exact
 	expect(t, db, `SELECT k, typeof(v) FROM kv ORDER BY k`, "x|real;y|text;z|null")
 	expect(t, db, `SELECT customer FROM orders WHERE customer = 'KIM'`, "Kim") // COLLATE NOCASE kept
 	// The foreign key, the CHECK and the AUTOINCREMENT high-water mark came along.

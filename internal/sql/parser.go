@@ -1342,15 +1342,18 @@ func (p *parser) parsePrimary() (Expr, error) {
 			for p.peek().kind == tIdent {
 				typ = append(typ, p.next().text)
 			}
-			if p.acceptOp("(") {
+			name := strings.Join(typ, " ")
+			if p.acceptOp("(") { // type arguments: DECIMAL(10,2), VARCHAR(20)
+				var args []string
 				for !p.acceptOp(")") && p.peek().kind != tEOF {
-					p.next()
+					args = append(args, p.next().text)
 				}
+				name += "(" + strings.Join(args, "") + ")"
 			}
 			if err := p.expectOp(")"); err != nil {
 				return nil, err
 			}
-			return &Func{Name: "CAST", Args: []Expr{e, &Literal{strings.Join(typ, " ")}}}, nil
+			return &Func{Name: "CAST", Args: []Expr{e, &Literal{name}}}, nil
 		}
 		if reserved[up] {
 			return nil, p.errf("unexpected keyword")

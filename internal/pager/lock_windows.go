@@ -20,15 +20,18 @@ const (
 	errorLockViolation      = syscall.Errno(33)
 )
 
-// lockFile takes an exclusive lock on the whole file (LockFileEx) so that
-// only one process opens the database at a time. Unlike flock, the lock is
-// mandatory on Windows: it also stops other processes from writing the
-// locked range, which only this process does anyway.
+// lockOffset is the byte locked to claim the database: far beyond any data
+// (Windows locks are mandatory, so locking the data itself would stop
+// other programs, e.g. backup tools, from reading the file).
+const lockOffset = 0x7FFFFFFF_00000000
+
+// lockFile takes an exclusive lock (LockFileEx) on one byte past the data
+// so that only one process opens the database at a time.
 func lockFile(f *os.File) (func(), error) {
-	var ol syscall.Overlapped
+	ol := syscall.Overlapped{Offset: uint32(lockOffset & 0xFFFFFFFF), OffsetHigh: uint32(lockOffset >> 32)}
 	h := syscall.Handle(f.Fd())
 	r, _, err := procLockFileEx.Call(uintptr(h), lockfileExclusiveLock|lockfileFailImmediately, 0,
-		0xFFFFFFFF, 0xFFFFFFFF, uintptr(unsafe.Pointer(&ol)))
+		1, 0, uintptr(unsafe.Pointer(&ol)))
 	if r == 0 {
 		if err == errorLockViolation || err == syscall.ERROR_IO_PENDING {
 			return nil, ErrLocked
@@ -36,7 +39,7 @@ func lockFile(f *os.File) (func(), error) {
 		return nil, err
 	}
 	return func() {
-		var ol syscall.Overlapped
-		procUnlockFileEx.Call(uintptr(h), 0, 0xFFFFFFFF, 0xFFFFFFFF, uintptr(unsafe.Pointer(&ol)))
+		ol := syscall.Overlapped{Offset: uint32(lockOffset & 0xFFFFFFFF), OffsetHigh: uint32(lockOffset >> 32)}
+		procUnlockFileEx.Call(uintptr(h), 0, 1, 0, uintptr(unsafe.Pointer(&ol)))
 	}, nil
 }

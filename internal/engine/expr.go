@@ -483,7 +483,7 @@ func (c *compiler) compileBinary(x *sql.Binary) (evalFn, error) {
 
 func toNumber(v any) (any, error) {
 	switch x := v.(type) {
-	case int64, float64:
+	case int64, float64, value.Decimal:
 		return x, nil
 	case string:
 		s := strings.TrimSpace(x)
@@ -508,6 +508,30 @@ func arith(op string, a, b any) (any, error) {
 	b, err = toNumber(b)
 	if err != nil {
 		return nil, err
+	}
+	// Decimals stay exact with decimals, integers and (short) floats.
+	_, aDec := a.(value.Decimal)
+	_, bDec := b.(value.Decimal)
+	_, aF := a.(float64)
+	_, bF := b.(float64)
+	if aDec || bDec {
+		// A float operand is taken at its shortest decimal form, so that
+		// "amount * 1.5" stays exact; if that does not fit, compute in
+		// floating point.
+		da, okA := value.ToDecimal(a)
+		db, okB := value.ToDecimal(b)
+		if okA && okB {
+			r, ok, err := value.DecimalOp(op, da, db)
+			if err == nil {
+				if !ok {
+					return nil, nil // division by zero
+				}
+				return r, nil
+			}
+			if !aF && !bF {
+				return nil, err
+			}
+		}
 	}
 	ai, aInt := a.(int64)
 	bi, bInt := b.(int64)
@@ -577,6 +601,8 @@ func toFloat(v any) float64 {
 		return float64(x)
 	case float64:
 		return x
+	case value.Decimal:
+		return x.Float64()
 	}
 	return 0
 }
@@ -939,6 +965,11 @@ func fnAbs(a []any) (any, error) {
 		return x, nil
 	case float64:
 		return math.Abs(x), nil
+	case value.Decimal:
+		if x.Unscaled < 0 {
+			x.Unscaled = -x.Unscaled
+		}
+		return x, nil
 	}
 	n, err := toNumber(a[0])
 	if err != nil {
@@ -962,6 +993,9 @@ func fnRound(a []any) (any, error) {
 			return nil, err
 		}
 		digits = int64(toFloat(d))
+	}
+	if dv, ok := n.(value.Decimal); ok {
+		return dv.Rescale(int(max(0, min(digits, value.MaxDecimalScale))))
 	}
 	p := math.Pow(10, float64(digits))
 	return math.Round(toFloat(n)*p) / p, nil
@@ -1006,11 +1040,20 @@ func fnCast(a []any) (any, error) {
 		return nil, nil
 	}
 	t := value.ParseType(a[1].(string))
+	if _, _, ok := value.DecimalSpec(t); ok {
+		v := a[0]
+		if b, isB := v.([]byte); isB {
+			v = string(b)
+		}
+		return value.Coerce(v, t)
+	}
 	switch t {
 	case value.Integer:
 		switch x := a[0].(type) {
 		case float64:
 			return int64(x), nil
+		case value.Decimal:
+			return x.Unscaled / pow10i(x.Scale), nil // truncates, as for reals
 		case string:
 			n, err := toNumber(x)
 			if err != nil {
@@ -1051,17 +1094,20 @@ func fnCast(a []any) (any, error) {
 // ---- aggregate state ----
 
 type aggState struct {
-	spec  *aggSpec
-	count int64
-	sumI  int64
-	sumF  float64
-	float bool
-	ovf   bool
-	best  any
-	parts []string
-	seen  map[string]bool
-	items []any    // JSON_GROUP_ARRAY
-	obj   *jsonObj // JSON_GROUP_OBJECT
+	spec       *aggSpec
+	count      int64
+	sumI       int64
+	sumF       float64
+	sumD       value.Decimal // exact sum while every value is a decimal or an integer
+	dec        bool          // a decimal was seen
+	decStarted bool          // sumD holds the sum so far
+	float      bool
+	ovf        bool
+	best       any
+	parts      []string
+	seen       map[string]bool
+	items      []any    // JSON_GROUP_ARRAY
+	obj        *jsonObj // JSON_GROUP_OBJECT
 }
 
 func newAggState(s *aggSpec) *aggState {
@@ -1109,6 +1155,14 @@ func (st *aggState) step(e *env) error {
 		case float64:
 			st.float = true
 			st.sumF += x
+		case value.Decimal:
+			st.dec = true
+			st.sumF += x.Float64()
+		}
+		if st.dec && !st.float {
+			if err := st.addDecimal(n); err != nil {
+				return err
+			}
 		}
 	case "MIN":
 		if st.best == nil || value.Compare(v, st.best) < 0 {
@@ -1137,6 +1191,9 @@ func (st *aggState) result() (any, error) {
 		if st.float {
 			return st.sumF, nil
 		}
+		if st.dec {
+			return st.sumD, nil
+		}
 		if st.ovf {
 			return nil, fmt.Errorf("bangdb: integer overflow in SUM()")
 		}
@@ -1146,6 +1203,10 @@ func (st *aggState) result() (any, error) {
 	case "AVG":
 		if st.count == 0 {
 			return nil, nil
+		}
+		if st.dec && !st.float {
+			r, _, err := value.DecimalOp("/", st.sumD, value.DecimalFromInt(st.count))
+			return r, err
 		}
 		return st.sumF / float64(st.count), nil
 	case "MIN", "MAX":
@@ -1159,4 +1220,35 @@ func (st *aggState) result() (any, error) {
 		return st.resultJSON(), nil
 	}
 	return nil, nil
+}
+
+// addDecimal adds n to the exact decimal sum. The first decimal starts it
+// from the exact sum of the integers seen before.
+func (st *aggState) addDecimal(n any) error {
+	if !st.decStarted {
+		if st.ovf {
+			return fmt.Errorf("bangdb: integer overflow in SUM()")
+		}
+		st.decStarted = true
+		if _, isInt := n.(int64); isInt {
+			st.sumD = value.DecimalFromInt(st.sumI) // sumI already includes n
+			return nil
+		}
+		st.sumD = value.DecimalFromInt(st.sumI)
+	}
+	d, _ := value.ToDecimal(n)
+	r, _, err := value.DecimalOp("+", st.sumD, d)
+	if err != nil {
+		return fmt.Errorf("bangdb: decimal overflow in SUM(): %w", err)
+	}
+	st.sumD = r
+	return nil
+}
+
+func pow10i(n uint8) int64 {
+	p := int64(1)
+	for ; n > 0; n-- {
+		p *= 10
+	}
+	return p
 }

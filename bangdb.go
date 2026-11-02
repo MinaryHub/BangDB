@@ -131,6 +131,14 @@ func (db *DB) QueryRowContext(ctx context.Context, query string, args ...any) *R
 	return &Row{rows: Rows{r: r}}
 }
 
+// Decimal is an exact decimal value, returned for DECIMAL(p,s) /
+// NUMERIC(p,s) columns. Scan it into a *Decimal, *string (exact text) or
+// *float64; pass a Decimal or a string such as "12.50" as an argument.
+type Decimal = value.Decimal
+
+// ParseDecimal parses a decimal number such as "12.50".
+func ParseDecimal(s string) (Decimal, error) { return value.ParseDecimal(s) }
+
 // Stmt is a prepared statement (see Prepare). It is safe for concurrent
 // use; each call runs outside any transaction, like DB.Exec and DB.Query.
 type Stmt struct{ s *engine.Stmt }
@@ -465,6 +473,12 @@ func convertAssign(dest, v any) error {
 			n = x
 		case float64:
 			n = int64(x)
+		case value.Decimal:
+			d, err := x.Rescale(0)
+			if err != nil || d.Cmp(x) != 0 {
+				return fmt.Errorf("cannot convert decimal %s to integer without losing digits", x)
+			}
+			n = d.Unscaled
 		case string:
 			var err error
 			if n, err = strconv.ParseInt(x, 10, 64); err != nil {
@@ -482,8 +496,17 @@ func convertAssign(dest, v any) error {
 			*d = int32(n)
 		}
 		return nil
+	case *Decimal:
+		dv, ok := value.ToDecimal(v)
+		if !ok {
+			return fmt.Errorf("cannot scan %s into *bangdb.Decimal", value.TypeOf(v))
+		}
+		*d = dv
+		return nil
 	case *float64:
 		switch x := v.(type) {
+		case value.Decimal:
+			*d = x.Float64()
 		case int64:
 			*d = float64(x)
 		case float64:

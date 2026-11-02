@@ -252,7 +252,7 @@ func TestArchiveAndPointInTimeRestore(t *testing.T) {
 	}
 	mustExec(t, db, "INSERT INTO ev (v) VALUES ('after vacuum')")
 	if err := a.WaitFor(ctx, db.Seq()); err != nil {
-		t.Fatal(err)
+		t.Fatalf("archiver after VACUUM: %v (status %+v, db seq %d)", err, a.Status(), db.Seq())
 	}
 	if st := a.Status(); st.Bases != 1 {
 		t.Fatalf("after VACUUM: %+v", st)

@@ -522,6 +522,19 @@ func refsBelow(e sql.Expr, sc *scope, li int) bool {
 // no stored value can compare equal / in range using the index ordering, so
 // the bound must be handled differently by the caller.
 func keyValue(v any, t value.Type) (any, bool) {
+	if _, scale, ok := value.DecimalSpec(t); ok {
+		// Stored keys carry the column's scale: search with it. A value
+		// with more digits than the column keeps equals no stored value.
+		d, ok := value.ToDecimal(v)
+		if !ok {
+			return nil, false
+		}
+		r, err := d.Rescale(scale)
+		if err != nil || r.Cmp(d) != 0 {
+			return nil, false
+		}
+		return r, true
+	}
 	switch t {
 	case value.Integer:
 		switch x := v.(type) {
@@ -538,6 +551,8 @@ func keyValue(v any, t value.Type) (any, bool) {
 			return float64(x), true
 		case float64:
 			return x, true
+		case value.Decimal:
+			return x.Float64(), true
 		}
 	case value.Text:
 		if s, ok := v.(string); ok {
@@ -565,6 +580,30 @@ func rangeBound(v any, t value.Type, lower bool, inc bool) (any, bool, bool) {
 			return nil, false, inc
 		}
 		return int64(f), true, true
+	}
+	if _, scale, isDec := value.DecimalSpec(t); isDec {
+		// A bound with more digits than the column: round toward the
+		// inside of the range (stored values cannot fall in between).
+		if d, ok := value.ToDecimal(v); ok {
+			r, err := d.Rescale(scale)
+			if err != nil {
+				return nil, false, inc
+			}
+			switch c := r.Cmp(d); {
+			case c == 0:
+				return r, true, inc
+			case lower && c < 0, !lower && c > 0: // rounded outward: step back in
+				one := value.Decimal{Unscaled: 1, Scale: uint8(scale)}
+				op := "+"
+				if !lower {
+					op = "-"
+				}
+				if r, _, err = value.DecimalOp(op, r, one); err != nil {
+					return nil, false, inc
+				}
+			}
+			return r, true, true
+		}
 	}
 	k, ok := keyValue(v, t)
 	return k, ok, inc

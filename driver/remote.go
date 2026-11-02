@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/knoxxr/bangdb/client"
+	"github.com/knoxxr/bangdb/internal/value"
 )
 
 // Connections to a server (DSN "bangdb://...").
@@ -138,6 +139,9 @@ func (r *remoteRows) Next(dest []driver.Value) error {
 		return io.EOF
 	}
 	for i, v := range r.r.Values() {
+		if d, ok := v.(value.Decimal); ok {
+			v = d.String()
+		}
 		dest[i] = v
 	}
 	return nil
