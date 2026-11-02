@@ -10,6 +10,8 @@
 - 서버 모드 기본 쿼리 타임아웃 60초, HTTP 타임아웃·동시 실행 제한, 비밀번호 없는 서버 경고
 - `PRAGMA` (`user_version`, `table_info`, `index_list`, `index_info`, `table_list`, `integrity_check`, `foreign_keys`, `journal_mode`, `page_count`, `page_size`), `DB.Migrate`
 - 파일 포맷 호환 픽스처 테스트, 호환성 정책 문서
+- **정확한 `DECIMAL(p,s)`/`NUMERIC(p,s)`** (최대 18자리, 반올림·자릿수 검사, 정확한 합계·평균, 인덱스 지원), `CAST(x AS DECIMAL(p,s))`
+- Windows: 데이터 밖 1바이트 잠금(다른 프로그램이 파일을 읽을 수 있음), 디렉터리 fsync 생략, 파일 교체 재시도
 
 ## 0.6 — 운영·분산
 

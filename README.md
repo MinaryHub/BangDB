@@ -320,7 +320,8 @@ GROUP BY t, host ORDER BY t;
 | 선언 타입 (예)                                  | 저장 타입 |
 |-------------------------------------------------|-----------|
 | `INTEGER`, `INT`, `BIGINT`, `BOOLEAN`           | INTEGER (int64) |
-| `REAL`, `FLOAT`, `DOUBLE`, `NUMERIC`, `DECIMAL` | REAL (float64) |
+| `DECIMAL(p,s)`, `NUMERIC(p,s)` (자릿수 명시)     | **DECIMAL** (정확한 십진수, 최대 18자리) |
+| `REAL`, `FLOAT`, `DOUBLE`, `NUMERIC`, `DECIMAL` (자릿수 없음) | REAL (float64) |
 | `TEXT`, `VARCHAR(n)`, `CHAR`, `DATE`, `TIMESTAMP`, `JSON`, `UUID` | TEXT |
 | `BLOB`, `BINARY`, `BYTEA`                       | BLOB |
 | (타입 생략)                                     | ANY (변환 없음) |
@@ -329,6 +330,7 @@ GROUP BY t, host ORDER BY t;
 - `INTEGER PRIMARY KEY`는 rowid 자체입니다 (생략 시 자동 증가). 그 외 PK는 자동 UNIQUE 인덱스가 생성됩니다.
 - 모든 테이블에 숨은 `rowid` 컬럼이 있습니다.
 - Go `time.Time`은 TEXT(RFC3339) 로 저장되고 `Scan(&t)`로 다시 읽을 수 있습니다.
+- **금액은 `DECIMAL(p,s)`로**: `0.1 + 0.2`가 정확히 `0.30`이 됩니다(REAL은 `0.30000000000000004`). 저장 시 소수 `s`자리로 반올림(0.5는 0에서 먼 쪽)하고, 전체 `p`자리를 넘으면 오류입니다. DECIMAL끼리·정수·짧은 실수 리터럴과의 연산과 `SUM`/`AVG`는 정확하게 계산되고, 나눗셈은 소수 6자리를 더해 반올림합니다. Go에서는 `bangdb.Decimal`(`Scan(&d)`, `ParseDecimal("12.50")`), `database/sql`에서는 정확한 문자열로 읽힙니다. 이전 버전에서 만든 `DECIMAL(p,s)` 컬럼은 REAL 그대로입니다.
 
 ## 함수
 
