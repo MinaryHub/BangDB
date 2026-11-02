@@ -11,6 +11,9 @@
 - `PRAGMA` (`user_version`, `table_info`, `index_list`, `index_info`, `table_list`, `integrity_check`, `foreign_keys`, `journal_mode`, `page_count`, `page_size`), `DB.Migrate`
 - 파일 포맷 호환 픽스처 테스트, 호환성 정책 문서
 - **정확한 `DECIMAL(p,s)`/`NUMERIC(p,s)`** (최대 18자리, 반올림·자릿수 검사, 정확한 합계·평균, 인덱스 지원), `CAST(x AS DECIMAL(p,s))`
+- 계정·역할(read/write/admin, PBKDF2 해시 계정 파일, `-add-user`)을 서버·HTTP에 적용
+- `/metrics`(Prometheus), 구조화 로그(`log_format`, `log_level`), 웹 콘솔(`/`)
+- 정기 백업 + 백업 검증(`StartBackups`, `VerifyBackup`, `backup_dir`/`backup_interval`/`backup_keep`)
 - Windows: 데이터 밖 1바이트 잠금(다른 프로그램이 파일을 읽을 수 있음), 디렉터리 fsync 생략, 파일 교체 재시도
 
 ## 0.6 — 운영·분산

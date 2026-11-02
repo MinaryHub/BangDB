@@ -599,6 +599,13 @@ func (db *DB) VerifyBackup(ctx context.Context, path string) ([]string, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer b.Close()
-	return b.IntegrityCheck(ctx)
+	problems, err := b.IntegrityCheck(ctx)
+	if cerr := b.Close(); err == nil {
+		err = cerr
+	}
+	// Opening created an (empty) WAL: keep the backup a single file.
+	if st, serr := os.Stat(path + "-wal"); serr == nil && st.Size() == 0 {
+		os.Remove(path + "-wal")
+	}
+	return problems, err
 }

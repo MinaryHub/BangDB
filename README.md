@@ -248,6 +248,34 @@ bangdb -config bangdb.conf -print-config  # 적용된 설정 확인 (비밀 값�
 - 비밀번호 없이 서버를 띄우면 경고를 출력합니다.
 - 같은 DB 파일은 한 프로세스만 열 수 있습니다(리눅스·macOS·**Windows** 모두 파일 잠금, 두 번째 열기는 `bangdb.ErrLocked`).
 
+### 계정·권한, 모니터링, 정기 백업, 웹 콘솔 (서버 운영)
+
+```bash
+bangdb -add-user app:write -users-file users      # 비밀번호를 입력받아 해시로 저장 (역할: read / write / admin)
+bangdb -add-user report:read -users-file users
+```
+
+```ini
+# bangdb.conf
+users_file      = /etc/bangdb/users      # 서버(-listen)와 HTTP API 모두 적용
+http            = :18080                 # 브라우저로 http://서버:18080/ → 웹 콘솔
+backup_dir      = /var/backups/bangdb    # 시작 시 1회 + 주기적으로 백업, 열어서 무결성 검사까지
+backup_interval = 6h
+backup_keep     = 28
+log_format      = json                   # 접속·인증 실패·요청·느린 쿼리·백업 결과를 stderr로
+```
+
+| 역할 | 허용 |
+|---|---|
+| `read` | SELECT, EXPLAIN, PRAGMA 조회 |
+| `write` | + INSERT/UPDATE/DELETE, 트랜잭션 |
+| `admin` | + CREATE/DROP/ALTER, VACUUM, ANALYZE, PRAGMA 설정 |
+
+- 계정 파일에는 비밀번호 대신 PBKDF2-SHA256 해시만 저장됩니다. 클라이언트는 `bangdb://app:비밀번호@host:7432`, HTTP는 Basic 인증(`curl -u app:비밀번호`). `password`(토큰)는 관리자 권한으로 함께 쓸 수 있습니다.
+- `GET /metrics`: Prometheus 형식(커밋·오류·락 대기·WAL·체크포인트·캐시·스냅샷 지연·서버 연결 수 등).
+- 웹 콘솔(`/`): SQL 실행(Ctrl+Enter), 테이블 목록, 상태. 콘솔 페이지 자체는 데이터가 없고, 실행은 로그인한 계정의 권한으로만 됩니다. 끄려면 Go에서 `httpapi.Options{NoConsole: true}`.
+- Go에서는 `db.StartBackups(bangdb.BackupSchedule{...})`, `db.VerifyBackup(ctx, path)`.
+
 ### 관측성
 
 ```go

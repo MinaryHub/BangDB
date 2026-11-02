@@ -12,8 +12,8 @@
 | | 3개 OS(Linux·macOS·Windows) CI: vet·테스트·경합 검사·크래시 토처(일반·암호화)·퍼징·빌드 산출물 (`.github/workflows/ci.yml`) | ✅ |
 | | CLI 설정 파일·환경 변수(`BANGDB_*`)·키/비밀번호 파일 — 서버 모드에서 암호화 키·타임아웃·캐시를 지정할 수 없던 문제 | ✅ |
 | | 서버 기본 쿼리 타임아웃 60s, HTTP 헤더·요청·유휴 타임아웃, HTTP 동시 실행 제한, 비밀번호 없는 서버 경고 | ✅ |
-| 7-2 배포 기반 | 파일 포맷 호환 정책과 업그레이드 테스트, 버전 태그·LICENSE·CHANGELOG, `PRAGMA user_version`·마이그레이션 실행기, 정확한 십진수(DECIMAL) | |
-| 7-3 운영 | 사용자별 계정·권한, `/metrics`·구조화 로그, `bangdb backup` 명령·백업 검증, 웹 콘솔 | |
+| 7-2 배포 기반 | 파일 포맷 호환 정책(`docs/COMPATIBILITY.md`)과 고정 픽스처 테스트, CHANGELOG, `PRAGMA`·`DB.Migrate`, 정확한 `DECIMAL(p,s)` | ✅ (LICENSE·릴리스 태그는 소유자 결정 대기) |
+| 7-3 운영 | 계정·역할(read/write/admin), `/metrics`·구조화 로그, 정기 백업·검증, 웹 콘솔 | ✅ |
 | 7-4 확장 | 대용량·장시간 시험, 트리거·식 인덱스 등 | |
 
 ## 0. 진행 현황 — 6단계(운영·분산) 및 이월 항목 완료
