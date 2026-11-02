@@ -56,9 +56,10 @@ func TestLongReadDoesNotBlockCommits(t *testing.T) {
 	if readTime < 200*time.Millisecond {
 		t.Skipf("join finished too fast (%v) to test overlap", readTime)
 	}
-	// Blocked commits would wait for the whole read; allow for slow
-	// fsyncs of shared CI machines, but not for anything near the read.
-	if worst > max(150*time.Millisecond, readTime/5) {
+	// A blocked commit would wait for (most of) the whole read; allow for
+	// slow fsyncs and pauses on shared CI machines, which have reached a
+	// fifth of the read on Windows.
+	if worst > max(150*time.Millisecond, readTime/2) {
 		t.Fatalf("a commit waited %v while the long read (%v) ran", worst, readTime)
 	}
 	t.Logf("read %v, %d commits during it, worst commit %v", readTime, commits, worst)
