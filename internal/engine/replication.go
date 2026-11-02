@@ -95,6 +95,13 @@ func (l *replLog) onCommit(seq uint64, pages map[uint32][]byte) {
 	l.notify = make(chan struct{})
 }
 
+// wantsPages reports whether onCommit keeps page images (for replicas).
+func (l *replLog) wantsPages() bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return len(l.subs) > 0 || l.retain > 0
+}
+
 func (l *replLog) trim() {
 	hard := max(4*l.retain, minHardLog)
 	for len(l.frames) > 0 {
@@ -514,6 +521,12 @@ func (db *DB) installLocked(w *SnapshotWriter) error {
 	if db.isClosed() {
 		return pager.ErrClosed
 	}
+	old := db.p // its counters carry over to the new file's pager
+	defer func() {
+		if db.p != old {
+			db.p.CarryCounters(old)
+		}
+	}()
 	if w.tmp == "" {
 		db.p.Close()
 		db.p = w.p
@@ -540,15 +553,13 @@ func (db *DB) installLocked(w *SnapshotWriter) error {
 		if renameErr != nil {
 			removeDBFiles(w.tmp)
 			db.p = p
-			db.p.SetOnCommit(db.repl.onCommit)
-			db.p.SetCacheSize(db.cacheSize)
+			db.configurePager()
 			return fmt.Errorf("bangdb: installing the new copy: %w", renameErr)
 		}
 		p.SetObjects(slots)
 		db.p = p
 	}
-	db.p.SetOnCommit(db.repl.onCommit)
-	db.p.SetCacheSize(db.cacheSize)
+	db.configurePager()
 	db.repl.mu.Lock()
 	db.repl.lastSeq = db.p.Header().Seq
 	db.repl.frames, db.repl.bytes = nil, 0

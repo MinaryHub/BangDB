@@ -216,10 +216,16 @@ type Pager struct {
 	// onCommit, if set, receives every published page set (including the
 	// header page 0) while the pager lock is held. Used for replication.
 	onCommit func(seq uint64, pages map[uint32][]byte)
+	// wantPages, if set, tells whether onCommit needs the images of pages
+	// a transaction spilled (spill.go).
+	wantPages func() bool
+
+	spillDir   string // spill files of large transactions (spill.go)
+	spillPages int    // changed pages a view keeps in memory; <= 0: never spill
 }
 
 func newPager() *Pager {
-	p := &Pager{versions: map[uint32][]version{}, readers: map[uint64]int{}}
+	p := &Pager{versions: map[uint32][]version{}, readers: map[uint64]int{}, spillPages: DefaultSpillPages}
 	p.objs.setSize(defaultCache)
 	return p
 }
@@ -643,9 +649,10 @@ func (p *Pager) PreparedHeader() Header {
 // Prepared is a commit written to the WAL but not yet durable or visible to
 // readers; Flush makes it both.
 type Prepared struct {
-	pages map[uint32][]byte
-	hdr   Header
-	slots map[uint32]any // object slots after this commit; nil = unchanged
+	pages   map[uint32][]byte
+	spilled []uint32 // pages written to the WAL from a spill file, not in pages
+	hdr     Header
+	slots   map[uint32]any // object slots after this commit; nil = unchanged
 	// Meta is published together with the commit (Snapshot.Meta). It is
 	// read under the pager lock; see PrepareCommit and SetPreparedMeta.
 	Meta any
@@ -660,6 +667,7 @@ func (c *Prepared) Seq() uint64 { return c.hdr.Seq }
 // and visible to readers, together with meta (nil keeps the previous
 // commit's). Writer-side.
 func (p *Pager) PrepareCommit(v *View, meta any) (*Prepared, error) {
+	defer v.Discard()
 	p.mu.Lock()
 	cur, err := p.prepHdr, p.usable()
 	p.mu.Unlock()
@@ -667,7 +675,7 @@ func (p *Pager) PrepareCommit(v *View, meta any) (*Prepared, error) {
 		return nil, err
 	}
 	slots := v.mergedObjs()
-	if len(v.dirty) == 0 && v.hdr == cur && slots == nil {
+	if v.Dirty() == 0 && v.hdr == cur && slots == nil {
 		return nil, nil
 	}
 	v.hdr.Seq = cur.Seq + 1
@@ -677,7 +685,7 @@ func (p *Pager) PrepareCommit(v *View, meta any) (*Prepared, error) {
 	v.dirty = map[uint32][]byte{}
 	v.dirtyObjs = nil
 	p.publishOwned(v, pages)
-	return p.prepare(pages, v.hdr, meta, slots)
+	return p.prepareSpilled(pages, v.sp, v.hdr, meta, slots)
 }
 
 // PrepareRaw prepares a page set received from a primary. It must contain
@@ -697,7 +705,7 @@ func (p *Pager) PrepareRaw(pages map[uint32][]byte) (*Prepared, error) {
 	if p.adopt(&hdr); hdr.KeyCheck != kc {
 		pages[0] = hdr.encode() // the primary's header carries its own key check
 	}
-	return p.prepare(pages, hdr, nil, nil)
+	return p.prepareSpilled(pages, nil, hdr, nil, nil)
 }
 
 // SetPreparedMeta sets the meta published with c, which must not have been
@@ -715,7 +723,9 @@ func (p *Pager) usable() error {
 	return p.err
 }
 
-func (p *Pager) prepare(pages map[uint32][]byte, hdr Header, meta any, slots map[uint32]any) (*Prepared, error) {
+// prepareSpilled is prepare for a commit whose pages are partly in a spill
+// file (sp may be nil): those are copied into the WAL and not kept in memory.
+func (p *Pager) prepareSpilled(pages map[uint32][]byte, sp *spillFile, hdr Header, meta any, slots map[uint32]any) (*Prepared, error) {
 	for _, b := range pages {
 		seal(b) // the pages are owned by the commit and not yet visible
 	}
@@ -729,38 +739,68 @@ func (p *Pager) prepare(pages map[uint32][]byte, hdr Header, meta any, slots map
 		for no := range pages {
 			nos = append(nos, no)
 		}
+		if sp != nil {
+			for no := range sp.offs {
+				if _, ok := pages[no]; !ok {
+					nos = append(nos, no)
+					c.spilled = append(c.spilled, no)
+				}
+			}
+		}
 		sort.Slice(nos, func(i, j int) bool { return nos[i] < nos[j] })
 		start := p.walSize
-		buf := make([]byte, 0, 8+len(pages)*(4+PageSize)+20)
+		pos := start // where buf goes in the WAL
+		buf := make([]byte, 0, min(8+len(nos)*(4+PageSize)+20, spillChunk+PageSize+64))
 		if start == 0 {
 			buf = append(buf, walMagic...)
 			buf = binary.BigEndian.AppendUint32(buf, PageSize)
 		}
-		offs = make(map[uint32]int64, len(pages))
+		fail := func(err error) (*Prepared, error) {
+			p.wal.Truncate(start)
+			return nil, err
+		}
+		offs = make(map[uint32]int64, len(nos))
 		crc := crc32.NewIEEE()
 		for _, no := range nos {
 			frameStart := len(buf)
 			buf = binary.BigEndian.AppendUint32(buf, no)
-			offs[no] = start + int64(len(buf))
-			buf = append(buf, p.encrypt(no, pages[no])...)
+			offs[no] = pos + int64(len(buf))
+			if b, ok := pages[no]; ok {
+				buf = append(buf, p.encrypt(no, b)...)
+			} else {
+				var err error
+				if buf, err = sp.rawSpilled(buf, no); err != nil {
+					return fail(err)
+				}
+			}
 			crc.Write(buf[frameStart:])
+			if len(buf) >= spillChunk {
+				if _, err := p.wal.WriteAt(buf, pos); err != nil {
+					return fail(err)
+				}
+				pos += int64(len(buf))
+				buf = buf[:0]
+			}
 		}
 		buf = binary.BigEndian.AppendUint32(buf, commitMarker)
 		tail := len(buf)
 		buf = binary.BigEndian.AppendUint64(buf, hdr.Seq)
 		crc.Write(buf[tail:])
-		buf = binary.BigEndian.AppendUint32(buf, uint32(len(pages)))
+		buf = binary.BigEndian.AppendUint32(buf, uint32(len(nos)))
 		buf = binary.BigEndian.AppendUint32(buf, crc.Sum32())
-		if _, err := p.wal.WriteAt(buf, start); err != nil {
-			p.wal.Truncate(start)
-			return nil, err
+		if _, err := p.wal.WriteAt(buf, pos); err != nil {
+			return fail(err)
 		}
-		end = start + int64(len(buf))
+		end = pos + int64(len(buf))
 	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	// Register the versions now: the next writer reads them; readers do not
 	// see them until the commit is published (their snapshots are older).
+	for _, no := range c.spilled {
+		p.versions[no] = append(p.versions[no], version{seq: hdr.Seq, off: offs[no]})
+		p.walPages++
+	}
 	for no, data := range pages {
 		v := version{seq: hdr.Seq, data: data}
 		if p.file != nil {
@@ -850,7 +890,11 @@ func (p *Pager) flushLocked() error {
 			p.slots = c.slots
 		}
 		if p.onCommit != nil {
-			p.onCommit(c.hdr.Seq, c.pages)
+			pages := c.pages
+			if len(c.spilled) > 0 && (p.wantPages == nil || p.wantPages()) {
+				pages = p.loadSpilled(c)
+			}
+			p.onCommit(c.hdr.Seq, pages)
 		}
 	}
 	// Drop references so the page images can be collected.
@@ -1132,6 +1176,8 @@ type View struct {
 	token     *Token
 
 	owned map[uint32]ownedObj // see SetOwned
+
+	sp *spillFile // changed pages moved out of memory (spill.go)
 }
 
 type ownedObj struct {
@@ -1144,6 +1190,9 @@ type undoEntry struct {
 	prev []byte
 	had  bool
 	lazy Lazy // the page was lazy: a copy of its state
+	// The page's spill file entry (spill.go) at the savepoint.
+	spOff int64
+	spHad bool
 }
 
 // put sets a dirty page, creating the map of read views on first use.
@@ -1165,6 +1214,9 @@ func (v *View) track(pg uint32) {
 	v.undoSeen[pg] = struct{}{}
 	prev, had := v.dirty[pg]
 	u := undoEntry{pg: pg, prev: prev, had: had}
+	if v.sp != nil {
+		u.spOff, u.spHad = v.sp.offs[pg]
+	}
 	if l, ok := v.lazy[pg]; ok {
 		u.lazy = l.Clone()
 	}
@@ -1182,6 +1234,9 @@ func (v *View) Read(pgno uint32) ([]byte, error) {
 	}
 	if b, ok := v.dirty[pgno]; ok {
 		return b, nil
+	}
+	if b, ok, err := v.readSpilled(pgno); ok || err != nil {
+		return b, err
 	}
 	if pgno >= v.hdr.PageCount {
 		return nil, fmt.Errorf("bangdb: page %d out of range", pgno)
@@ -1252,7 +1307,7 @@ func (v *View) FreeHead() uint32 { return v.hdr.FreeHead }
 func (v *View) PageCount() uint32 { return v.hdr.PageCount }
 
 // Dirty returns the number of modified pages in the view.
-func (v *View) Dirty() int { return len(v.dirty) }
+func (v *View) Dirty() int { return len(v.dirty) + v.Spilled() }
 
 // Savepoint marks the current view state. Only the most recent savepoint
 // can be restored; taking a new one releases the previous one. The cost is
@@ -1283,6 +1338,14 @@ func (v *View) Restore(sp Savepoint) {
 	}
 	for i := len(v.undo) - 1; i >= 0; i-- {
 		u := v.undo[i]
+		if v.sp != nil {
+			if u.spHad {
+				v.sp.offs[u.pg] = u.spOff
+			} else {
+				delete(v.sp.offs, u.pg)
+			}
+			delete(v.sp.cache, u.pg)
+		}
 		switch {
 		case u.lazy != nil:
 			v.WriteLazyNoTrack(u.pg, u.lazy)
@@ -1297,4 +1360,25 @@ func (v *View) Restore(sp Savepoint) {
 	clear(v.undoSeen)
 	v.objRestore()
 	v.hdr = sp.hdr
+}
+
+// loadSpilled returns the full page set of a commit that spilled pages,
+// reading them back from the WAL. p.mu must be held.
+func (p *Pager) loadSpilled(c *Prepared) map[uint32][]byte {
+	pages := make(map[uint32][]byte, len(c.pages)+len(c.spilled))
+	for no, b := range c.pages {
+		pages[no] = b
+	}
+	for _, no := range c.spilled {
+		for _, v := range p.versions[no] {
+			if v.seq == c.hdr.Seq {
+				if b, err := p.versionData(no, v); err == nil {
+					pages[no] = b
+				} else {
+					p.err = fmt.Errorf("bangdb: re-reading a large commit for replication: %w", err)
+				}
+			}
+		}
+	}
+	return pages
 }

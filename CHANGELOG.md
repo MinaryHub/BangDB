@@ -17,6 +17,8 @@
 - 트리거(BEFORE/AFTER, INSERT/UPDATE OF/DELETE, WHEN, NEW/OLD, RAISE), 덤프·SQLite 덤프 가져오기에 포함
 - 부분 인덱스 `CREATE [UNIQUE] INDEX ... WHERE 조건` (예: 삭제되지 않은 행만 이메일 유일). 질의 조건이 인덱스 조건을 포함할 때만 플래너가 사용
 - 복제본이 받은 프레임을 묶어 fsync 1회로 적용(느린 디스크에서 지연 감소)
+- **메모리보다 큰 트랜잭션**: 쓰기 트랜잭션이 바꾼 페이지가 `Options.TxMemory`(CLI `tx_memory`, 기본 64 MiB)를 넘으면 임시 파일로 옮기고 커밋 때 WAL로 스트리밍. 이전에는 1천만 행 표에서 `DELETE` 10%(100만 행) 한 문장이 메모리 14 GB를 써 OOM으로 종료됐음. `/metrics`에 `tx_spills_total`
+- VACUUM 후에도 누적 통계(커밋·체크포인트·페이지 읽기 수)가 0으로 돌아가지 않음
 - 대용량·장시간 시험(`TestScale`, `TestSoak`)
 - Windows: 데이터 밖 1바이트 잠금(다른 프로그램이 파일을 읽을 수 있음), 디렉터리 fsync 생략, 파일 교체 재시도
 

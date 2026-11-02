@@ -34,7 +34,7 @@ type config struct {
 	encryptionKey, encryptionKeyFile string
 	busyTimeout, queryTimeout        time.Duration
 	slowQuery                        time.Duration
-	cacheSize, sortMemory            int64
+	cacheSize, sortMemory, txMemory  int64
 	tempDir                          string
 
 	usersFile           string
@@ -79,6 +79,7 @@ func (c *config) settings() []setting {
 		{"slow_query", "log statements slower than this to stderr (0 = off)", &c.slowQuery},
 		{"cache_size", "page and node cache, e.g. 64MB", &c.cacheSize},
 		{"sort_memory", "memory per query for sorting before spilling to disk, e.g. 128MB", &c.sortMemory},
+		{"tx_memory", "memory per write transaction for changed pages before they spill to disk, e.g. 64MB", &c.txMemory},
 		{"temp_dir", "directory for spill files", &c.tempDir},
 		{"users_file", "accounts with roles for the server and HTTP API (see -add-user)", &c.usersFile},
 		{"log_format", "server log format: text or json", &c.logFormat},

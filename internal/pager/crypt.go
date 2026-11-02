@@ -97,6 +97,14 @@ func (p *Pager) encrypt(pgno uint32, b []byte) []byte {
 }
 
 // decrypt turns a page read from disk into plaintext, in place.
+// encryptInPlace encrypts a page image in place (a no-op without a key).
+func (p *Pager) encryptInPlace(pgno uint32, b []byte) {
+	if p.crypt == nil || pgno == 0 {
+		return
+	}
+	xts(p.crypt.data, p.crypt.tweak, b, b, uint64(pgno), true)
+}
+
 func (p *Pager) decrypt(pgno uint32, b []byte) {
 	if p.crypt == nil || pgno == 0 {
 		return

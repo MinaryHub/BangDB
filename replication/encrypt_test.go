@@ -74,3 +74,39 @@ func TestEncryptedReplication(t *testing.T) {
 		db.Close()
 	}
 }
+
+// A transaction that spilled its pages to a temporary file (Options.TxMemory)
+// still reaches the replicas whole.
+func TestReplicationOfSpilledTransaction(t *testing.T) {
+	dir := t.TempDir()
+	primary, err := bangdb.OpenWithOptions(filepath.Join(dir, "p.db"), &bangdb.Options{TxMemory: 64 << 10, EncryptionKey: bytes.Repeat([]byte{3}, 32)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { primary.Close() })
+	setup(t, primary)
+	_, addr := startPrimary(t, primary, PrimaryOptions{})
+	replica := openDB(t, filepath.Join(dir, "r.db"))
+	r := StartReplica(replica, addr, ReplicaOptions{})
+	defer r.Stop()
+	waitSynced(t, r, primary)
+	tx, err := primary.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 3000; i++ {
+		if _, err := tx.Exec(`INSERT INTO b (v) VALUES (?)`, 100000+i); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	if primary.Stats().TxSpills == 0 {
+		t.Fatal("the transaction did not spill")
+	}
+	waitSynced(t, r, primary)
+	if dump(t, replica) != dump(t, primary) {
+		t.Fatal("replica differs from the primary")
+	}
+}

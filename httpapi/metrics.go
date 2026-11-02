@@ -34,6 +34,7 @@ func (h *Handler) metrics(w http.ResponseWriter, r *http.Request) error {
 	m("page_reads_total", "counter", "Pages read from disk.", float64(s.PageReads))
 	m("page_cache_hits_total", "counter", "Page reads served from memory.", float64(s.PageCacheHits))
 	m("node_cache_hits_total", "counter", "Decoded node cache hits.", float64(s.NodeHits))
+	m("tx_spills_total", "counter", "Transactions whose changed pages moved to a temporary file.", float64(s.TxSpills))
 	m("node_cache_misses_total", "counter", "Decoded node cache misses.", float64(s.NodeMisses))
 	m("snapshots", "gauge", "Open read snapshots.", float64(s.Snapshots))
 	m("snapshot_lag_commits", "gauge", "Commits since the oldest open snapshot.", float64(s.SnapshotLag))

@@ -430,7 +430,10 @@ func (x *execCtx) insertRow(t *Table, row []any) (int64, error) {
 			return 0, err
 		}
 	}
-	return rowid, rows.Put(rowid, row)
+	if err := rows.Put(rowid, row); err != nil {
+		return 0, err
+	}
+	return rowid, x.v.SpillPoint()
 }
 
 func (x *execCtx) deleteRow(t *Table, rowid int64, row []any) error {
@@ -446,8 +449,10 @@ func (x *execCtx) deleteRow(t *Table, rowid int64, row []any) error {
 			return err
 		}
 	}
-	_, err := x.rows(t).Delete(rowid)
-	return err
+	if _, err := x.rows(t).Delete(rowid); err != nil {
+		return err
+	}
+	return x.v.SpillPoint()
 }
 
 // ---- DDL ----
@@ -765,7 +770,10 @@ func (x *execCtx) addIndex(ix *Index) error {
 		if err != nil || k == nil {
 			return err == nil, err
 		}
-		return true, entries.Put(k)
+		if err := entries.Put(k); err != nil {
+			return false, err
+		}
+		return true, x.v.SpillPoint()
 	})
 	if err != nil {
 		return err

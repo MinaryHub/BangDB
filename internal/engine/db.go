@@ -39,6 +39,11 @@ type Options struct {
 	SortMemory int
 	// TempDir holds the spill files. Default: os.TempDir().
 	TempDir string
+	// TxMemory is the memory a write transaction may use for the pages it
+	// changed; beyond it they move to a temporary file in TempDir, so one
+	// transaction can change more data than fits in memory. Default:
+	// 64 MiB; negative: never spill.
+	TxMemory int
 	// CacheSize is the memory for cached file pages and decoded B+tree
 	// nodes. Default: 32 MiB.
 	CacheSize int
@@ -89,6 +94,7 @@ type DB struct {
 	busyTimeout  time.Duration
 	queryTimeout time.Duration
 	spill        *spillConfig
+	txSpillPages int // pager spill limit (Options.TxMemory)
 	cacheSize    int
 	plans        planCache
 
@@ -137,7 +143,6 @@ func Open(path string, opts *Options) (*DB, error) {
 	db := &DB{p: p, writeSem: make(chan struct{}, 1), busyTimeout: 5 * time.Second,
 		stmtCache: map[string]parsed{}, closed: make(chan struct{}), path: path, key: key}
 	db.repl = newReplLog(p.Header().Seq)
-	p.SetOnCommit(db.repl.onCommit)
 	if opts != nil && opts.BusyTimeout > 0 {
 		db.busyTimeout = opts.BusyTimeout
 	}
@@ -146,7 +151,6 @@ func Open(path string, opts *Options) (*DB, error) {
 	if opts != nil && opts.CacheSize > 0 {
 		db.cacheSize = opts.CacheSize
 	}
-	p.SetCacheSize(db.cacheSize)
 	if opts != nil {
 		db.queryTimeout = opts.QueryTimeout
 		db.slowThreshold, db.onSlow = opts.SlowQueryThreshold, opts.OnSlowQuery
@@ -154,7 +158,9 @@ func Open(path string, opts *Options) (*DB, error) {
 		if opts.SortMemory != 0 {
 			db.spill.limit = opts.SortMemory
 		}
+		db.txSpillPages = txSpillPages(opts.TxMemory)
 	}
+	db.configurePager()
 	cat, err := loadCatalog(p.NewView())
 	if err != nil {
 		p.Close()
@@ -587,6 +593,7 @@ func (tx *Tx) Rollback() error {
 	}
 	tx.done = true
 	tx.db.counters.rollbacks.Add(1)
+	tx.v.Discard()
 	tx.db.unlockWrite()
 	return nil
 }
@@ -734,3 +741,23 @@ func (db *DB) PageCount() uint32 {
 
 // WALPages returns the number of page versions not yet checkpointed.
 func (db *DB) WALPages() int { return db.p.WALPages() }
+
+// txSpillPages converts Options.TxMemory to the pager's spill limit.
+func txSpillPages(mem int) int {
+	switch {
+	case mem == 0:
+		return 0 // the default
+	case mem < 0:
+		return -1
+	}
+	return max(mem/pager.PageSize, 16)
+}
+
+// configurePager applies the database's settings to db.p (after Open, and
+// when VACUUM or a replica snapshot installs a new file).
+func (db *DB) configurePager() {
+	db.p.SetOnCommit(db.repl.onCommit)
+	db.p.SetCommitWantsPages(db.repl.wantsPages)
+	db.p.SetCacheSize(db.cacheSize)
+	db.p.SetSpill(db.spill.dir, db.txSpillPages)
+}

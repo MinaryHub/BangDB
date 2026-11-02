@@ -114,7 +114,7 @@ options:`)
 	path := cfg.database
 	pub, err := bangdb.OpenWithOptions(path, &bangdb.Options{
 		BusyTimeout: cfg.busyTimeout, QueryTimeout: cfg.queryTimeout, SlowQueryThreshold: cfg.slowQuery,
-		CacheSize: int(cfg.cacheSize), SortMemory: int(cfg.sortMemory), TempDir: cfg.tempDir, EncryptionKey: key,
+		CacheSize: int(cfg.cacheSize), SortMemory: int(cfg.sortMemory), TxMemory: int(cfg.txMemory), TempDir: cfg.tempDir, EncryptionKey: key,
 		OnSlowQuery: func(q bangdb.SlowQuery) {
 			logger.Warn("slow query", "duration", q.Duration, "sql", q.SQL, "error", q.Err)
 		},

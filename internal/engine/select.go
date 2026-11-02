@@ -1406,7 +1406,10 @@ func (x *execCtx) writeRow(t *Table, rowid int64, row []any) error {
 			return err
 		}
 	}
-	return x.rows(t).Put(rowid, row)
+	if err := x.rows(t).Put(rowid, row); err != nil {
+		return err
+	}
+	return x.v.SpillPoint()
 }
 
 // prepareCompound plans every SELECT of a UNION / INTERSECT / EXCEPT chain.

@@ -398,7 +398,7 @@ INSERT INTO emp (dept_id, email, salary) VALUES (1, 'kim@example.com', 100)
 - **그룹 커밋**: 동시에 커밋하는 트랜잭션들의 WAL fsync를 한 번으로 묶습니다 (32 고루틴 동시 자동 커밋 ~1만 건/초).
 - **손상 감지**: 모든 페이지에 CRC32가 있어 디스크에서 읽을 때 검증합니다. `db.IntegrityCheck()`(CLI `.check`)는 트리 구조, 페이지 누수/중복 사용, 인덱스와 테이블 일치, 외래 키를 검사합니다.
 - **공간 회수**: 삭제로 빈 페이지는 같은 파일 안에서 재사용됩니다. `VACUUM`(또는 `db.Vacuum(ctx)`)은 파일을 새로 압축해 교체합니다 — 읽기는 계속되고 쓰기는 끝날 때까지 기다리며, 복제본은 스냅샷으로 다시 동기화됩니다.
-- **메모리 상한**: `Options.CacheSize`(기본 32 MiB, 페이지·노드 캐시), `Options.SortMemory`(기본 64 MiB, 초과 시 `Options.TempDir`에 임시 파일).
+- **메모리 상한**: `Options.CacheSize`(기본 32 MiB, 페이지·노드 캐시), `Options.SortMemory`(기본 64 MiB, 초과 시 `Options.TempDir`에 임시 파일), `Options.TxMemory`(기본 64 MiB: 쓰기 트랜잭션이 바꾼 페이지가 이를 넘으면 임시 파일로 옮김 — 메모리보다 큰 트랜잭션 가능, 암호화 DB는 임시 파일도 암호화).
 - **취소·타임아웃**: `ExecContext/QueryContext`의 context나 `Options.QueryTimeout`으로 실행 중인 문장을 중단하고 롤백합니다.
 - 한 파일은 한 프로세스만 열 수 있습니다 (Unix `flock`).
 

@@ -28,6 +28,8 @@ type Stats struct {
 	OldestSnapshot uint64 // sequence of the oldest open snapshot (0: none)
 	SnapshotLag    uint64 // commits since the oldest open snapshot
 	PendingCommits int    // commits prepared but not yet durable
+
+	TxSpills uint64 // transactions that moved changed pages to a spill file
 }
 
 type pagerCounters struct {
@@ -35,6 +37,7 @@ type pagerCounters struct {
 	checkpoints, checkpointPages uint64
 	checkpointTime               time.Duration
 	pageReads, pageCacheHits     uint64
+	txSpills                     uint64
 }
 
 // Stats returns the pager's statistics.
@@ -47,7 +50,7 @@ func (p *Pager) Stats() Stats {
 		WALPages: p.walPages, WALBytes: p.walSize, VersionBytes: p.verBytes,
 		Checkpoints: c.checkpoints, CheckpointPages: c.checkpointPages, CheckpointTime: c.checkpointTime,
 		PageReads: c.pageReads, PageCacheHits: c.pageCacheHits,
-		PendingCommits: len(p.pending),
+		PendingCommits: len(p.pending), TxSpills: c.txSpills,
 	}
 	for seq, n := range p.readers {
 		s.Snapshots += n
@@ -61,4 +64,22 @@ func (p *Pager) Stats() Stats {
 	p.mu.Unlock()
 	s.NodeHits, s.NodeMisses = p.objs.counts()
 	return s
+}
+
+// CarryCounters adds the cumulative counters of from (a pager this one
+// replaces, e.g. after VACUUM) to p, so that totals never go backwards.
+func (p *Pager) CarryCounters(from *Pager) {
+	from.mu.Lock()
+	c := from.counters
+	from.mu.Unlock()
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.counters.commits += c.commits
+	p.counters.walSyncs += c.walSyncs
+	p.counters.checkpoints += c.checkpoints
+	p.counters.checkpointPages += c.checkpointPages
+	p.counters.checkpointTime += c.checkpointTime
+	p.counters.pageReads += c.pageReads
+	p.counters.pageCacheHits += c.pageCacheHits
+	p.counters.txSpills += c.txSpills
 }
