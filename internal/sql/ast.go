@@ -182,6 +182,16 @@ type Begin struct{}
 // Vacuum rebuilds the database file compactly.
 type Vacuum struct{}
 
+// Pragma reads (Value == nil) or sets a database setting:
+// PRAGMA name, PRAGMA name = value, PRAGMA name(value).
+type Pragma struct {
+	Name  string // lower case
+	Value Expr
+	// Call is set for the function form, whose argument is an operand
+	// (PRAGMA table_info(users)), not a new value.
+	Call bool
+}
+
 // Analyze collects index statistics for the query planner (all tables,
 // or one).
 type Analyze struct{ Table string }
@@ -211,6 +221,7 @@ func (*Delete) stmt()                 {}
 func (*Begin) stmt()                  {}
 func (*Vacuum) stmt()                 {}
 func (*Analyze) stmt()                {}
+func (*Pragma) stmt()                 {}
 func (*Commit) stmt()                 {}
 func (*Rollback) stmt()               {}
 func (*Explain) stmt()                {}

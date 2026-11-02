@@ -95,6 +95,18 @@ func main() {
 }
 ```
 
+### 스키마 마이그레이션
+
+```go
+applied, err := db.Migrate(ctx, []bangdb.Migration{
+    {Version: 1, SQL: `CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)`},
+    {Version: 2, SQL: `ALTER TABLE users ADD COLUMN email TEXT`},
+    {Version: 3, Func: func(tx *bangdb.Tx) error { _, err := tx.Exec(`UPDATE users SET email = ''`); return err }},
+})
+```
+
+`PRAGMA user_version`에 마지막으로 적용한 버전이 기록되고, 각 단계는 자기 트랜잭션에서 실행되어 실패하면 그 단계만 취소됩니다. 그 밖의 `PRAGMA`: `table_info(t)`, `index_list(t)`, `index_info(i)`, `table_list`, `integrity_check`, `foreign_keys`, `journal_mode`, `page_count`, `page_size`.
+
 ### Prepared statement
 
 ```go
@@ -391,6 +403,8 @@ INSERT INTO emp (dept_id, email, salary) VALUES (1, 'kim@example.com', 100)
 - 파일 포맷 버전 3. 개발 중 버전(1, 2)으로 만든 파일은 열 수 없음
 
 ## 문서
+
+- [호환성 정책](docs/COMPATIBILITY.md) · [변경 이력](CHANGELOG.md)
 
 - [보완 검토와 개발 계획 (ROADMAP)](docs/ROADMAP.md)
 - [아키텍처](docs/ARCHITECTURE.md)

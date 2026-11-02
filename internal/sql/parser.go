@@ -234,6 +234,43 @@ func (p *parser) parseStmt() (Stmt, error) {
 		return &Commit{}, nil
 	case p.acceptKw("VACUUM"):
 		return &Vacuum{}, nil
+	case p.acceptKw("PRAGMA"):
+		t := p.next()
+		if t.kind != tIdent && t.kind != tQuotedIdent {
+			return nil, &SyntaxError{t.pos, "expected a pragma name"}
+		}
+		st := &Pragma{Name: strings.ToLower(t.text)}
+		switch {
+		case p.acceptOp("="):
+			// A bare word (ON, OFF, WAL) is the value as text.
+			if a := p.peek(); a.kind == tIdent && (p.peekAt(1).kind == tEOF || p.peekAt(1).text == ";") {
+				p.next()
+				st.Value = &Literal{Value: a.text}
+				break
+			}
+			v, err := p.parseExpr()
+			if err != nil {
+				return nil, err
+			}
+			st.Value = v
+		case p.acceptOp("("):
+			// The argument may be a bare name (a table): read it as one.
+			if a := p.peek(); (a.kind == tIdent || a.kind == tQuotedIdent) && p.peekAt(1).text == ")" {
+				p.next()
+				st.Value = &Literal{Value: a.text}
+			} else {
+				v, err := p.parseExpr()
+				if err != nil {
+					return nil, err
+				}
+				st.Value = v
+			}
+			if err := p.expectOp(")"); err != nil {
+				return nil, err
+			}
+			st.Call = true
+		}
+		return st, nil
 	case p.acceptKw("ANALYZE"):
 		st := &Analyze{}
 		if t := p.peek(); t.kind == tIdent || t.kind == tQuotedIdent {

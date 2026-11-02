@@ -6,3 +6,6 @@
 
 # build output
 /dist/
+
+# compatibility fixtures are databases on purpose
+!testdata/compat/*.db

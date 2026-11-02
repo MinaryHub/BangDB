@@ -36,6 +36,9 @@ func (db *DB) Dump(ctx context.Context, w io.Writer) error {
 func (x *execCtx) dump(w *bufio.Writer) error {
 	tables := dumpOrder(x.cat)
 	fmt.Fprintf(w, "-- BangDB dump\nBEGIN;\n")
+	if uv := int32(x.v.Meta(metaUserVersion)); uv != 0 {
+		fmt.Fprintf(w, "PRAGMA user_version = %d;\n", uv)
+	}
 	for _, t := range tables {
 		fmt.Fprintf(w, "%s\n", t.createSQL())
 		prefix := "INSERT INTO " + sql.QuoteIdent(t.Name) + " VALUES("
@@ -217,6 +220,10 @@ func (im *importer) statement(text string) error {
 	words := sql.LeadingWords(text, 4)
 	if len(words) == 0 {
 		return nil
+	}
+	if words[0] == "PRAGMA" && len(words) > 1 && words[1] == "USER_VERSION" {
+		_, err := im.exec(text)
+		return err
 	}
 	switch words[0] {
 	case "PRAGMA", "BEGIN", "COMMIT", "END", "ROLLBACK", "SAVEPOINT", "RELEASE", "ANALYZE":

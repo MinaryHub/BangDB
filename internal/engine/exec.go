@@ -56,6 +56,10 @@ func (x *execCtx) exec(s sql.Stmt) (Result, error) {
 	switch st := s.(type) {
 	case *sql.Select:
 		return x.execSelect(st)
+	case *sql.Pragma:
+		if st.Value == nil || st.Call {
+			return x.pragma(st)
+		}
 	case *sql.Explain:
 		if st.Analyze {
 			return x.explainAnalyze(st.Stmt)
@@ -94,6 +98,8 @@ func (x *execCtx) exec(s sql.Stmt) (Result, error) {
 		return Result{}, x.dropView(st)
 	case *sql.Analyze:
 		return Result{}, x.analyze(st)
+	case *sql.Pragma:
+		return x.pragma(st)
 	}
 	return Result{}, fmt.Errorf("bangdb: unsupported statement %T", s)
 }

@@ -716,9 +716,11 @@ func isTxControl(s sql.Stmt) bool {
 }
 
 func isReadOnly(s sql.Stmt) bool {
-	switch s.(type) {
+	switch st := s.(type) {
 	case *sql.Select, *sql.Explain:
 		return true
+	case *sql.Pragma:
+		return st.Value == nil || st.Call
 	}
 	return false
 }
