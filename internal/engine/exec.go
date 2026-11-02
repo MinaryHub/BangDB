@@ -34,6 +34,8 @@ type execCtx struct {
 
 	keyPart []byte // key part of the index entry being visited (covering scans)
 
+	triggerDepth int // nesting of trigger bodies
+
 	lastTable *Table // cache of rows()
 	lastRoot  uint32
 	lastRows  store.TableStore
@@ -96,6 +98,10 @@ func (x *execCtx) exec(s sql.Stmt) (Result, error) {
 		return Result{}, x.createView(st)
 	case *sql.DropView:
 		return Result{}, x.dropView(st)
+	case *sql.CreateTrigger:
+		return Result{}, x.createTrigger(st)
+	case *sql.DropTrigger:
+		return Result{}, x.dropTrigger(st)
 	case *sql.Analyze:
 		return Result{}, x.analyze(st)
 	case *sql.Pragma:
@@ -640,6 +646,9 @@ func (x *execCtx) dropTable(st *sql.DropTable) error {
 	}
 	x.mutableCatalog()
 	t = x.cat.table(st.Name)
+	if err := x.dropTableTriggers(t); err != nil {
+		return err
+	}
 	for _, ix := range t.indexes {
 		if err := ix.kind.DropIndex(x.v, ix.Root); err != nil {
 			return err
@@ -803,6 +812,9 @@ func (x *execCtx) renameTable(st *sql.AlterTableRename) error {
 	}
 	if strings.HasPrefix(strings.ToLower(st.NewName), "bangdb_") {
 		return fmt.Errorf("bangdb: table names starting with bangdb_ are reserved")
+	}
+	if x.hasTriggers(t) {
+		return fmt.Errorf("bangdb: table %s has triggers; drop them before renaming it", t.Name)
 	}
 	x.mutableCatalog()
 	t = x.cat.table(st.Table)

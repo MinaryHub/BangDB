@@ -84,6 +84,9 @@ func (x *execCtx) dump(w *bufio.Writer) error {
 	for _, v := range views {
 		fmt.Fprintf(w, "%s\n", x.cat.DescribeView(v))
 	}
+	for _, tr := range x.cat.TriggerNames() {
+		fmt.Fprintf(w, "%s\n", x.cat.DescribeTrigger(tr))
+	}
 	_, err := w.WriteString("COMMIT;\n")
 	return err
 }
@@ -209,8 +212,9 @@ type importer struct {
 	// Statements waiting for a table: CREATE TABLEs whose referenced table
 	// does not exist yet, with the statements that use them, and CREATE
 	// VIEWs that failed (they are retried at the end).
-	waiting []*waitingTable
-	views   []string
+	waiting  []*waitingTable
+	views    []string
+	triggers []string
 }
 
 type waitingTable struct {
@@ -237,7 +241,7 @@ func (im *importer) statement(text string) error {
 			k = 2
 		}
 		if len(words) > k && words[k] == "TRIGGER" {
-			im.skip(text)
+			im.triggers = append(im.triggers, text) // after the tables and views
 			return nil
 		}
 		if len(words) > k && words[k] == "VIEW" {
@@ -380,6 +384,13 @@ func (im *importer) finish() error {
 			return fmt.Errorf("bangdb: import: %w", lastErr)
 		}
 		im.views = failed
+	}
+	// Triggers come last (the data is already in). One that uses
+	// something BangDB lacks is skipped and reported, not fatal.
+	for _, text := range im.triggers {
+		if _, err := im.exec(text); err != nil {
+			im.skip(text + " -- " + err.Error())
+		}
 	}
 	return nil
 }

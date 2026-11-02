@@ -20,7 +20,7 @@ func TestImportSQLiteDump(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if res.Rows != 7 || len(res.Skipped) != 4 {
+	if res.Rows != 7 || len(res.Skipped) != 3 { // BEGIN, sqlite_sequence cleanup, COMMIT
 		t.Errorf("rows %d, skipped %q", res.Rows, res.Skipped)
 	}
 	expect(t, db, `SELECT id, customer, note, hex(data), "group" FROM orders ORDER BY id`,
@@ -28,6 +28,9 @@ func TestImportSQLiteDump(t *testing.T) {
 	expect(t, db, `SELECT * FROM totals ORDER BY order_id`, "1|119.00") // DECIMAL(10,2) is exact
 	expect(t, db, `SELECT k, typeof(v) FROM kv ORDER BY k`, "x|real;y|text;z|null")
 	expect(t, db, `SELECT customer FROM orders WHERE customer = 'KIM'`, "Kim") // COLLATE NOCASE kept
+	// The dump's trigger came along and works.
+	exec(t, db, `INSERT INTO orders (id, customer) VALUES (10, 'trig')`)
+	expect(t, db, `SELECT note FROM orders WHERE id = 10`, "new")
 	// The foreign key, the CHECK and the AUTOINCREMENT high-water mark came along.
 	if _, err := db.Exec(`INSERT INTO "order item" (order_id, sku) VALUES (9, 'x')`); err == nil {
 		t.Error("foreign key not enforced")

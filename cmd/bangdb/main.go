@@ -394,6 +394,12 @@ SQL statements end with ';'. BEGIN/COMMIT/ROLLBACK are supported.`)
 				fmt.Fprintln(s.out, cat.DescribeView(n))
 			}
 		}
+		for _, n := range cat.TriggerNames() {
+			if len(fields) > 1 && !strings.EqualFold(fields[1], n) {
+				continue
+			}
+			fmt.Fprintln(s.out, cat.DescribeTrigger(n))
+		}
 	case ".backup":
 		if len(fields) < 2 {
 			fmt.Fprintln(s.out, "usage: .backup FILE")

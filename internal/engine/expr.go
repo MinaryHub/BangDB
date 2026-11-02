@@ -762,6 +762,9 @@ func (c *compiler) compileCase(x *sql.Case) (evalFn, error) {
 }
 
 func (c *compiler) compileFunc(f *sql.Func) (evalFn, error) {
+	if f.Name == "RAISE" {
+		return c.compileRaise(f)
+	}
 	if f.Over != nil {
 		return c.compileWindow(f)
 	}

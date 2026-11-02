@@ -11,6 +11,7 @@ Go로 작성된 **경량 임베디드 관계형 데이터베이스**입니다. �
   - 제약: 복합 `PRIMARY KEY`/`UNIQUE`, `NOT NULL`, `DEFAULT`, `CHECK`, `FOREIGN KEY`(`CASCADE`/`SET NULL`/`RESTRICT`)
   - 파라미터: `?`, `?N`, `:name`, `@name`, `$name`
   - 윈도우 함수(`OVER (PARTITION BY … ORDER BY … ROWS/RANGE …)`), JSON 함수와 `->`/`->>` 연산자
+  - 트리거: `CREATE TRIGGER … BEFORE|AFTER INSERT|UPDATE [OF cols]|DELETE ON t [WHEN cond] BEGIN … END`, `NEW`/`OLD`, `RAISE(ABORT, '메시지')`·`RAISE(IGNORE)`
 - B+트리 기반 테이블/인덱스(삭제 시 병합, 긴 키 지원), 비용 기반 접근 경로 선택: rowid·인덱스 동등/범위/IN, OR → 인덱스 합집합, 인덱스 순서로 ORDER BY 생략, 해시 조인, covering index, `ANALYZE` 통계 기반 조인 순서
 - 디코드된 노드 캐시·플랜 캐시, 메모리 한도를 넘는 정렬·그룹핑은 임시 파일로 처리
 - 교체 가능한 저장 방식 인터페이스(`internal/store`, `CREATE TABLE … USING <kind>`) — 기본은 B+트리, **`USING memory`** 인메모리 테이블, **`USING timeseries`** 시계열 테이블
@@ -422,7 +423,7 @@ INSERT INTO emp (dept_id, email, salary) VALUES (1, 'kim@example.com', 100)
 
 > 보완 항목과 개발 계획은 [docs/ROADMAP.md](docs/ROADMAP.md)를 보세요.
 
-- 트리거, 식(expression) 인덱스, 이름 있는 윈도(`WINDOW w AS`), `json_each` 같은 테이블 값 함수 미지원
+- 식(expression) 인덱스, 이름 있는 윈도(`WINDOW w AS`), `json_each` 같은 테이블 값 함수, `INSTEAD OF` 트리거 미지원. 외래 키 동작(CASCADE 등)으로 바뀐 행은 트리거를 실행하지 않음
 - 윈도우 함수가 있는 조회는 결과 행을 메모리에 모은 뒤 계산
 - 조인 순서는 비용 추정(테이블 크기, `ANALYZE` 통계)으로 정하되 `LEFT JOIN`과 `ORDER BY … LIMIT` 질의는 쓴 순서를 따름 → `EXPLAIN`으로 확인. 통계는 평균값이라 값 분포가 치우친 컬럼은 잘못 추정할 수 있음
 - 외래 키는 항상 적용되며 즉시 검사 (지연 제약·`SET DEFAULT` 없음). 부모 테이블을 먼저 만들어야 함

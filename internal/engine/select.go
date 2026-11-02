@@ -991,7 +991,7 @@ func (x *execCtx) execInsert(st *sql.Insert) (Result, error) {
 		}
 		src = res.Rows
 	} else {
-		c := &compiler{x: x}
+		c := &compiler{x: x, sc: &scope{outer: x.outer}} // outer: NEW/OLD in a trigger
 		for _, exprs := range st.Rows {
 			if len(exprs) != len(positions) {
 				return Result{}, fmt.Errorf("bangdb: %d values for %d columns", len(exprs), len(positions))
@@ -1124,10 +1124,18 @@ func (x *execCtx) execInsert(st *sql.Insert) (Result, error) {
 					}
 				}
 				newRow := append([]any(nil), old...)
-				for _, s := range up.sets {
+				setCols := make([]int, len(up.sets))
+				for i, s := range up.sets {
 					if newRow[s.col], err = s.fn(up.e); err != nil {
 						return Result{}, err
 					}
+					setCols[i] = s.col
+				}
+				if err := x.fireTriggers(t, "BEFORE", "UPDATE", hit.rowid, old, hit.rowid, newRow, setCols); err != nil {
+					if errors.Is(err, errIgnoreRow) {
+						continue
+					}
+					return Result{}, err
 				}
 				id, err := x.updateRow(t, hit.rowid, old, newRow)
 				if err != nil {
@@ -1137,11 +1145,27 @@ func (x *execCtx) execInsert(st *sql.Insert) (Result, error) {
 				if err := ret.add(&res, id, newRow); err != nil {
 					return Result{}, err
 				}
+				if err := x.afterTriggers(t, "UPDATE", hit.rowid, old, id, newRow, setCols); err != nil {
+					return Result{}, err
+				}
 				continue
 			}
 		}
+		newID := int64(-1) // as in SQLite: unknown before the insert
+		if t.RowidCol >= 0 && row[t.RowidCol] != nil {
+			newID = row[t.RowidCol].(int64)
+		}
+		if err := x.fireTriggers(t, "BEFORE", "INSERT", 0, nil, newID, row, nil); err != nil {
+			if errors.Is(err, errIgnoreRow) {
+				continue
+			}
+			return Result{}, err
+		}
 		id, err := x.insertRow(t, row)
 		if err != nil {
+			return Result{}, err
+		}
+		if err := x.afterTriggers(t, "INSERT", 0, nil, id, row, nil); err != nil {
 			return Result{}, err
 		}
 		res.RowsAffected++
@@ -1183,7 +1207,8 @@ func (x *execCtx) execDelete(st *sql.Delete) (Result, error) {
 	if err != nil {
 		return Result{}, err
 	}
-	if ret == nil {
+	triggers := x.hasTriggers(t)
+	if ret == nil && !triggers {
 		if n, done, err := x.deleteByTime(t, st.Where); done || err != nil {
 			return Result{RowsAffected: n}, err
 		}
@@ -1197,8 +1222,8 @@ func (x *execCtx) execDelete(st *sql.Delete) (Result, error) {
 		res.Columns = ret.cols
 	}
 	for _, tg := range targets {
-		if len(t.referencedBy) > 0 {
-			// Foreign key actions may have removed or changed the row.
+		if len(t.referencedBy) > 0 || triggers {
+			// Foreign key actions or triggers may have removed or changed the row.
 			row, ok, err := x.getRow(t, tg.rowid)
 			if err != nil {
 				return Result{}, err
@@ -1209,10 +1234,20 @@ func (x *execCtx) execDelete(st *sql.Delete) (Result, error) {
 			}
 			tg.row = row
 		}
+		if err := x.fireTriggers(t, "BEFORE", "DELETE", tg.rowid, tg.row, 0, nil, nil); err != nil {
+			if errors.Is(err, errIgnoreRow) {
+				res.RowsAffected--
+				continue
+			}
+			return Result{}, err
+		}
 		if err := ret.add(&res, tg.rowid, tg.row); err != nil {
 			return Result{}, err
 		}
 		if err := x.removeRow(t, tg.rowid, tg.row); err != nil {
+			return Result{}, err
+		}
+		if err := x.afterTriggers(t, "DELETE", tg.rowid, tg.row, 0, nil, nil); err != nil {
 			return Result{}, err
 		}
 	}
@@ -1250,8 +1285,13 @@ func (x *execCtx) execUpdate(st *sql.Update) (Result, error) {
 		res.Columns = ret.cols
 	}
 	e := &env{row: make([]any, len(sc.cols)), args: x.args}
+	triggers := x.hasTriggers(t)
+	setCols := make([]int, len(sets))
+	for i, s := range sets {
+		setCols[i] = s.col
+	}
 	for _, tg := range targets {
-		if len(t.referencedBy) > 0 {
+		if len(t.referencedBy) > 0 || triggers {
 			row, ok, err := x.getRow(t, tg.rowid)
 			if err != nil {
 				return Result{}, err
@@ -1272,11 +1312,21 @@ func (x *execCtx) execUpdate(st *sql.Update) (Result, error) {
 			}
 			newRow[s.col] = v
 		}
+		if err := x.fireTriggers(t, "BEFORE", "UPDATE", tg.rowid, tg.row, tg.rowid, newRow, setCols); err != nil {
+			if errors.Is(err, errIgnoreRow) {
+				res.RowsAffected--
+				continue
+			}
+			return Result{}, err
+		}
 		id, err := x.updateRow(t, tg.rowid, tg.row, newRow)
 		if err != nil {
 			return Result{}, err
 		}
 		if err := ret.add(&res, id, newRow); err != nil {
+			return Result{}, err
+		}
+		if err := x.afterTriggers(t, "UPDATE", tg.rowid, tg.row, id, newRow, setCols); err != nil {
 			return Result{}, err
 		}
 	}

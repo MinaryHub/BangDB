@@ -51,6 +51,25 @@ type CreateView struct {
 	SQL         string // the SELECT's original text
 }
 
+// CreateTrigger is CREATE TRIGGER name {BEFORE|AFTER} {INSERT|DELETE|
+// UPDATE [OF cols]} ON table [FOR EACH ROW] [WHEN expr] BEGIN stmts END.
+type CreateTrigger struct {
+	Name        string
+	IfNotExists bool
+	Timing      string   // BEFORE or AFTER
+	Event       string   // INSERT, UPDATE or DELETE
+	Columns     []string // UPDATE OF columns
+	Table       string
+	When        Expr
+	Body        []Stmt // INSERT, UPDATE, DELETE or SELECT statements
+	SQL         string // the whole statement's text
+}
+
+type DropTrigger struct {
+	Name     string
+	IfExists bool
+}
+
 type DropView struct {
 	Name     string
 	IfExists bool
@@ -225,6 +244,8 @@ func (*Pragma) stmt()                 {}
 func (*Commit) stmt()                 {}
 func (*Rollback) stmt()               {}
 func (*Explain) stmt()                {}
+func (*CreateTrigger) stmt()          {}
+func (*DropTrigger) stmt()            {}
 
 // ---- Expressions ----
 

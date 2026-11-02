@@ -285,6 +285,10 @@ func (p *parser) parseStmt() (Stmt, error) {
 }
 
 func (p *parser) parseCreate() (Stmt, error) {
+	createPos := p.toks[p.pos-1].pos
+	if p.acceptKw("TRIGGER") || p.acceptKw("TEMP", "TRIGGER") || p.acceptKw("TEMPORARY", "TRIGGER") {
+		return p.parseTrigger(createPos)
+	}
 	if p.acceptKw("TABLE") {
 		ct := &CreateTable{}
 		ct.IfNotExists = p.acceptKw("IF", "NOT", "EXISTS")
@@ -539,7 +543,13 @@ func (p *parser) parseDrop() (Stmt, error) {
 		d.Name, err = p.ident()
 		return d, err
 	}
-	return nil, p.errf("expected TABLE, INDEX or VIEW")
+	if p.acceptKw("TRIGGER") {
+		d := &DropTrigger{IfExists: p.acceptKw("IF", "EXISTS")}
+		var err error
+		d.Name, err = p.ident()
+		return d, err
+	}
+	return nil, p.errf("expected TABLE, INDEX, VIEW or TRIGGER")
 }
 
 // parseParenExpr parses "( expr )".
@@ -1508,4 +1518,88 @@ func (p *parser) parseCase() (Expr, error) {
 		}
 	}
 	return c, p.expectKw("END")
+}
+
+// parseTrigger parses the rest of CREATE TRIGGER (start: offset of CREATE).
+func (p *parser) parseTrigger(start int) (Stmt, error) {
+	ct := &CreateTrigger{IfNotExists: p.acceptKw("IF", "NOT", "EXISTS"), Timing: "BEFORE"}
+	var err error
+	if ct.Name, err = p.ident(); err != nil {
+		return nil, err
+	}
+	switch {
+	case p.acceptKw("BEFORE"):
+	case p.acceptKw("AFTER"):
+		ct.Timing = "AFTER"
+	case p.acceptKw("INSTEAD", "OF"):
+		return nil, p.errf("INSTEAD OF triggers are not supported")
+	}
+	switch {
+	case p.acceptKw("INSERT"):
+		ct.Event = "INSERT"
+	case p.acceptKw("DELETE"):
+		ct.Event = "DELETE"
+	case p.acceptKw("UPDATE"):
+		ct.Event = "UPDATE"
+		if p.acceptKw("OF") {
+			for {
+				c, err := p.ident()
+				if err != nil {
+					return nil, err
+				}
+				ct.Columns = append(ct.Columns, c)
+				if !p.acceptOp(",") {
+					break
+				}
+			}
+		}
+	default:
+		return nil, p.errf("expected INSERT, UPDATE or DELETE")
+	}
+	if err := p.expectKw("ON"); err != nil {
+		return nil, err
+	}
+	if ct.Table, err = p.ident(); err != nil {
+		return nil, err
+	}
+	p.acceptKw("FOR", "EACH", "ROW")
+	if p.acceptKw("WHEN") {
+		if ct.When, err = p.parseExpr(); err != nil {
+			return nil, err
+		}
+	}
+	if err := p.expectKw("BEGIN"); err != nil {
+		return nil, err
+	}
+	for {
+		for p.acceptOp(";") {
+		}
+		if p.isKw("END") {
+			end := p.next()
+			ct.SQL = strings.TrimSpace(p.src[start : end.pos+len(end.text)])
+			break
+		}
+		if p.peek().kind == tEOF {
+			return nil, p.errf("expected END")
+		}
+		st, err := p.parseStmt()
+		if err != nil {
+			return nil, err
+		}
+		switch st.(type) {
+		case *Insert, *Update, *Delete, *Select:
+		default:
+			return nil, p.errf("a trigger body may only contain INSERT, UPDATE, DELETE and SELECT")
+		}
+		ct.Body = append(ct.Body, st)
+		if !p.isKw("END") {
+			if err := p.expectOp(";"); err != nil {
+				return nil, err
+			}
+		}
+	}
+	if len(ct.Body) == 0 {
+		return nil, p.errf("empty trigger body")
+	}
+	return ct, nil
 }

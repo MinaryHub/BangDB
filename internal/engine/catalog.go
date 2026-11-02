@@ -209,13 +209,14 @@ func (t *Table) ColIndex(name string) int {
 // Catalog is the in-memory schema. A committed catalog is immutable; write
 // transactions clone it before applying DDL.
 type Catalog struct {
-	tables  map[string]*Table
-	indexes map[string]*Index
-	views   map[string]*View
+	tables   map[string]*Table
+	indexes  map[string]*Index
+	views    map[string]*View
+	triggers map[string]*Trigger
 }
 
 func newCatalog() *Catalog {
-	return &Catalog{tables: map[string]*Table{}, indexes: map[string]*Index{}, views: map[string]*View{}}
+	return &Catalog{tables: map[string]*Table{}, indexes: map[string]*Index{}, views: map[string]*View{}, triggers: map[string]*Trigger{}}
 }
 
 // ForeignKey makes Columns of a table refer to RefColumns (a primary key or
@@ -304,6 +305,9 @@ func (c *Catalog) clone() *Catalog {
 		}
 		nt.indexes, nt.checkFns, nt.referencedBy = nil, nil, nil
 		n.tables[k] = &nt
+	}
+	for k, tr := range c.triggers {
+		n.triggers[k] = tr // immutable once created
 	}
 	for k, v := range c.views {
 		nv := *v
@@ -417,6 +421,15 @@ func loadCatalog(v *pager.View) (*Catalog, error) {
 				return nil, err
 			}
 			c.views[strings.ToLower(v.Name)] = v
+		case 'g':
+			tr := &Trigger{}
+			if err := json.Unmarshal(data, tr); err != nil {
+				return nil, fmt.Errorf("bangdb: corrupt catalog entry %q: %w", k, err)
+			}
+			if err := tr.prepare(); err != nil {
+				return nil, err
+			}
+			c.triggers[strings.ToLower(tr.Name)] = tr
 		}
 	}
 	if err := cur.Err(); err != nil {
