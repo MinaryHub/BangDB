@@ -4,6 +4,8 @@
 
 ## 0.7 (진행 중) — 실 프로젝트 적용 보완
 
+- **BangDB Manager 연결**: HTTP API에 `/v1/*`(health·tables·query·stats) 추가 — Manager의 "BangDB (Go)" 연결 종류가 그대로 동작. Basic 인증은 아무 사용자 + `-password` 값도 허용, `/v1/stats`에 API 요청·인증 거부 수
+- CLI: Termux(안드로이드)에서 모든 명령이 "database file is corrupt"로 실패하던 문제 수정(링커가 넘기는 실행 파일 경로를 DB로 오인). 열기 오류에 파일 경로 표시, DB가 아닌 파일을 열 때 `-wal`을 만들지 않음
 - **안드로이드 앱 내장**: `mobile/` 래퍼(gomobile) → `.aar`, Kotlin/Java `com.knoxxr.bangdb` (`Database`, `Tx`, `Rows`, `Args`, `Migrations`). CI가 `.aar`를 만들고 예제를 컴파일. `scripts/build.sh aar`, `all`에 android/arm64 CLI 추가 (docs/ANDROID.md)
 - Windows 파일 잠금(`LockFileEx`): 두 프로세스가 같은 파일을 여는 것을 막음. 모든 OS에서 두 번째 열기는 `ErrLocked`
 - 3개 OS CI (테스트·경합 검사·크래시 토처·퍼징·빌드)

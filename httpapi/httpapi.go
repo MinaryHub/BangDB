@@ -41,6 +41,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/knoxxr/bangdb"
@@ -84,6 +85,22 @@ type Handler struct {
 	opts  Options
 	mux   *http.ServeMux
 	slots chan struct{} // MaxConcurrent
+
+	// API counters (Stats).
+	requests, rejected, statements, failures atomic.Uint64
+}
+
+// Stats counts API activity.
+type Stats struct {
+	Requests   uint64 `json:"requests"`
+	Rejected   uint64 `json:"rejected"`   // failed authentication
+	Statements uint64 `json:"statements"` // SQL requests run
+	Errors     uint64 `json:"errors"`     // requests that failed
+}
+
+// Stats returns the API counters.
+func (h *Handler) Stats() Stats {
+	return Stats{Requests: h.requests.Load(), Rejected: h.rejected.Load(), Statements: h.statements.Load(), Errors: h.failures.Load()}
 }
 
 // New returns a handler for db.
@@ -105,6 +122,7 @@ func New(db *bangdb.DB, opts Options) *Handler {
 		return writeJSON(w, http.StatusOK, h.db.Stats())
 	}))
 	h.mux.HandleFunc("/metrics", h.get(h.metrics))
+	h.registerV1()
 	return h
 }
 
@@ -127,8 +145,13 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	h.requests.Add(1)
 	role, ok := h.authorize(r)
+	if !ok && r.URL.Path == "/v1/health" && r.Method == http.MethodGet {
+		role, ok = auth.RoleRead, true // liveness check: version only, no data
+	}
 	if !ok {
+		h.rejected.Add(1)
 		if h.opts.Logger != nil {
 			h.opts.Logger.Warn("authentication failed", "remote", r.RemoteAddr, "path", r.URL.Path)
 		}
@@ -187,8 +210,16 @@ func (h *Handler) authorize(r *http.Request) (auth.Role, bool) {
 	if tok, ok := strings.CutPrefix(r.Header.Get("Authorization"), "Bearer "); ok && h.opts.Token != "" {
 		return auth.RoleAdmin, subtle.ConstantTimeCompare([]byte(tok), []byte(h.opts.Token)) == 1
 	}
-	if user, pass, ok := r.BasicAuth(); ok && h.opts.Users != nil {
-		return h.opts.Users.Authenticate(user, pass)
+	if user, pass, ok := r.BasicAuth(); ok {
+		if h.opts.Users != nil {
+			if role, ok := h.opts.Users.Authenticate(user, pass); ok {
+				return role, true
+			}
+		}
+		// Any user name with the token as password (BangDB Manager).
+		if h.opts.Token != "" && subtle.ConstantTimeCompare([]byte(pass), []byte(h.opts.Token)) == 1 {
+			return auth.RoleAdmin, true
+		}
 	}
 	return auth.RoleRead, false
 }
@@ -210,7 +241,9 @@ func (h *Handler) post(fn handlerFunc) http.HandlerFunc {
 			return
 		}
 		r.Body = http.MaxBytesReader(w, r.Body, h.opts.MaxBodyBytes)
+		h.statements.Add(1)
 		if err := fn(w, r); err != nil {
+			h.failures.Add(1)
 			writeEngineError(w, err)
 		}
 	}
@@ -223,6 +256,7 @@ func (h *Handler) get(fn handlerFunc) http.HandlerFunc {
 			return
 		}
 		if err := fn(w, r); err != nil {
+			h.failures.Add(1)
 			writeEngineError(w, err)
 		}
 	}

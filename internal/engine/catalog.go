@@ -279,6 +279,14 @@ func (v *View) prepare() error {
 func (c *Catalog) table(name string) *Table { return c.tables[strings.ToLower(name)] }
 func (c *Catalog) index(name string) *Index { return c.indexes[strings.ToLower(name)] }
 
+// Table returns the table called name (case-insensitive), or nil. The
+// table must not be modified.
+func (c *Catalog) Table(name string) *Table { return c.table(name) }
+
+// Indexes returns the table's indexes, including those created for UNIQUE
+// and PRIMARY KEY constraints.
+func (t *Table) Indexes() []*Index { return append([]*Index(nil), t.indexes...) }
+
 // TableNames returns the table names in the catalog.
 func (c *Catalog) TableNames() []string {
 	var out []string

@@ -186,8 +186,10 @@ curl -H 'Authorization: Bearer s3cret' -d '{"statements":[{"sql":"..."},{"sql":"
 | `POST /exec` | 모든 문장. `{"rowsAffected","lastInsertId"}` (+ RETURNING이면 `columns`,`rows`) |
 | `POST /batch` | 여러 문장을 **한 트랜잭션**으로 (하나라도 실패하면 전부 취소, 실패 위치 `statement`) |
 | `GET /health`, `GET /stats` | 상태·버전, `db.Stats()` |
+| `/v1/health`, `/v1/tables`, `/v1/tables/{name}`, `POST /v1/query`, `/v1/stats` | [BangDB Manager](https://github.com/knoxxr/BangDB.Manager)의 "BangDB (Go)" 연결이 쓰는 API. `/v1/query`는 `{"sql","args","mode":"auto|exec|query","limit"}` → `{"columns","types","rows","rows_affected","last_insert_id","truncated","ms"}`, 스크립트 안의 `BEGIN…COMMIT` 가능, BLOB은 `{"blob":…}`. `/v1/health`는 인증 없이 버전만 |
 
 - 인자는 배열(`?`) 또는 객체(`:name`). 값: `null`, 숫자(정수는 정확히 유지), 문자열, `true/false`(1/0), BLOB은 `{"$blob":"<base64>"}`(결과도 같은 형식).
+- HTTP Basic은 계정 파일 사용자, 또는 **아무 사용자 이름 + `-password` 값**(관리자)으로 인증됩니다(BangDB Manager가 이렇게 보냄).
 - 오류는 `{"error","code"}` + HTTP 상태: 400 SQL 오류, 401 인증, 403 읽기 전용, 409 제약 위반, 499 중단, 503 쓰기 락 대기 초과.
 - 요청마다 독립(세션 없음)이라 `BEGIN/COMMIT`은 쓸 수 없고 트랜잭션은 `/batch`로. 성능·세션이 필요하면 바이너리 프로토콜(`-listen`)을 쓰세요. `-tls-cert/-tls-key`를 주면 HTTPS. Go에서는 `httpapi.New(db, opts)`를 `http.Handler`로 붙일 수 있습니다.
 
