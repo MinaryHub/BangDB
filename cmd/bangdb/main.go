@@ -120,7 +120,7 @@ options:`)
 		},
 	})
 	if err != nil {
-		fatal(err)
+		fatal(fmt.Errorf("%s: %s", path, strings.TrimPrefix(err.Error(), "bangdb: ")))
 	}
 	defer pub.Close()
 	db := pub.Engine()
@@ -674,7 +674,8 @@ func addUser(spec, usersFile string) error {
 // the program is started through the dynamic linker (Termux on Android 10+
 // runs binaries as "linker64 /path/to/bangdb args..."), the program's own
 // path can arrive as the first argument; it is dropped, or it would be
-// taken for the database file.
+// taken for the database file. Under the linker, os.Executable reports the
+// linker, so any ELF program file in that position is dropped.
 func cliArgs(argv []string) []string {
 	if len(argv) < 2 {
 		return nil
@@ -683,14 +684,31 @@ func cliArgs(argv []string) []string {
 	if strings.HasPrefix(args[0], "-") {
 		return args
 	}
-	self, err := os.Executable()
-	if err != nil {
-		return args
-	}
-	a, err1 := os.Stat(args[0])
-	b, err2 := os.Stat(self)
-	if err1 == nil && err2 == nil && os.SameFile(a, b) {
+	if isProgram(args[0]) {
 		return args[1:]
 	}
 	return args
+}
+
+// isProgram reports whether path is the running executable or any ELF
+// program file (under the linker, os.Executable names the linker, not
+// bangdb). A database file never starts with the ELF signature.
+func isProgram(path string) bool {
+	a, err := os.Stat(path)
+	if err != nil || !a.Mode().IsRegular() {
+		return false
+	}
+	if self, err := os.Executable(); err == nil {
+		if b, err := os.Stat(self); err == nil && os.SameFile(a, b) {
+			return true
+		}
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return false
+	}
+	defer f.Close()
+	magic := make([]byte, 4)
+	_, err = io.ReadFull(f, magic)
+	return err == nil && string(magic) == "\x7fELF"
 }

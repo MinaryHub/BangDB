@@ -265,14 +265,8 @@ func OpenEncrypted(path string, key []byte) (*Pager, error) {
 		f.Close()
 		return nil, err
 	}
-	wal, err := os.OpenFile(path+"-wal", os.O_RDWR|os.O_CREATE, 0o644)
-	if err != nil {
-		unlock()
-		f.Close()
-		return nil, err
-	}
 	p := newPager()
-	p.file, p.wal, p.unlock = f, wal, unlock
+	p.file, p.unlock = f, unlock
 	p.crypt = pc
 	p.cache, p.cacheMax = map[uint32][]byte{}, defaultCache
 	fail := func(err error) (*Pager, error) {
@@ -308,6 +302,11 @@ func OpenEncrypted(path string, key []byte) (*Pager, error) {
 		case pc != nil && p.hdr.KeyCheck != pc.check:
 			return fail(ErrWrongKey)
 		}
+	}
+	// The WAL is opened (and created) only once the file is known to be a
+	// database, so that opening some other file leaves nothing behind.
+	if p.wal, err = os.OpenFile(path+"-wal", os.O_RDWR|os.O_CREATE, 0o644); err != nil {
+		return fail(err)
 	}
 	if err := p.recover(); err != nil {
 		return fail(err)

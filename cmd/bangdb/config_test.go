@@ -93,6 +93,19 @@ func TestCLIArgsDropsOwnPath(t *testing.T) {
 	if got := cliArgs([]string{self, "app.db", "-x"}); len(got) != 2 || got[0] != "app.db" {
 		t.Fatalf("database argument dropped: %q", got)
 	}
+	// Under the linker, os.Executable is the linker: another ELF program
+	// in first position (here: a copy of this test binary) is dropped too.
+	b, err := os.ReadFile(self)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cp := filepath.Join(t.TempDir(), "bangdb")
+	if err := os.WriteFile(cp, b, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if got := cliArgs([]string{"/system/bin/linker64", cp, "-version"}); len(got) != 1 || got[0] != "-version" {
+		t.Fatalf("program path kept: %q", got)
+	}
 	if got := cliArgs([]string{self}); len(got) != 0 {
 		t.Fatalf("no arguments: %q", got)
 	}
