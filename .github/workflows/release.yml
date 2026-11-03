@@ -1,0 +1,101 @@
+name: Release
+
+# Pushing a tag v<VERSION>.<commit count> (the version scripts/build.sh
+# stamps, e.g. v0.7.68) builds the installers and publishes a GitHub release:
+#   bangdb-<version>-<os>-<arch>[.exe]   CLI / server, one file, no dependencies
+#   bangdb-<version>.aar                 Android library (docs/ANDROID.md)
+#   SHA256SUMS
+# The notes are the CHANGELOG section of the release's minor version.
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  cli:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # the version counts commits
+      - uses: actions/setup-go@v5
+        with:
+          # Current Go: recent macOS rejects binaries of older toolchains.
+          go-version: stable
+      - name: version matches the tag
+        run: |
+          v="$(tr -d ' \r\n' < VERSION).$(git rev-list --count HEAD)"
+          test "v$v" = "$GITHUB_REF_NAME" || { echo "tag $GITHUB_REF_NAME, but this commit builds v$v"; exit 1; }
+      - run: go test -count=1 ./...
+      - run: scripts/build.sh all
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cli
+          path: dist/
+
+  android:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: mobile/go.mod
+          cache-dependency-path: mobile/go.sum
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+      - name: gomobile
+        working-directory: mobile
+        run: |
+          go test -count=1 ./...
+          go install golang.org/x/mobile/cmd/gomobile golang.org/x/mobile/cmd/gobind
+          gomobile init
+      - name: build .aar
+        env:
+          ANDROID_NDK_HOME: ${{ env.ANDROID_NDK_LATEST_HOME }}
+        run: scripts/build.sh aar && scripts/check-android-sample.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: android
+          path: dist/*.aar
+
+  publish:
+    runs-on: ubuntu-latest
+    needs: [cli, android]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: checksums and notes
+        run: |
+          cd dist && sha256sum * > SHA256SUMS && cd ..
+          minor="$(tr -d ' \r\n' < VERSION)"
+          {
+            echo "## 설치"
+            echo
+            echo "| 파일 | 대상 |"
+            echo "|---|---|"
+            echo "| \`bangdb-*-windows-amd64.exe\` / \`-windows-arm64.exe\` | Windows (이름을 \`bangdb.exe\`로 바꿔 PATH에 두기) |"
+            echo "| \`bangdb-*-darwin-arm64\` / \`-darwin-amd64\` | macOS (Apple Silicon / Intel). \`chmod +x\` 후 처음 실행 시 \"확인되지 않은 개발자\" 경고가 나오면 \`xattr -d com.apple.quarantine <파일>\` |"
+            echo "| \`bangdb-*-linux-amd64\` / \`-linux-arm64\` | Linux (\`chmod +x\`) |"
+            echo "| \`bangdb-*-android-arm64\` | 안드로이드 Termux: \`cp\` 로 홈에 복사 → \`chmod +x\` → \`~/bangdb -version\` |"
+            echo "| \`bangdb-*.aar\` | 안드로이드 앱 내장 라이브러리 ([docs/ANDROID.md](docs/ANDROID.md)) |"
+            echo "| \`SHA256SUMS\` | 무결성 확인: \`sha256sum -c SHA256SUMS --ignore-missing\` |"
+            echo
+            echo "실행 파일 하나로 셸·서버(\`-listen\`)·HTTP API와 웹 콘솔(\`-http\`)이 모두 들어 있습니다. BangDB Manager는 \"BangDB (Go)\" 종류로 \`-http\` 주소에 연결합니다."
+            echo
+            awk -v h="## $minor" 'index($0, h) == 1 {on = 1; print; next} on && /^## / {exit} on' CHANGELOG.md
+          } > notes.md
+          cat notes.md
+      - name: publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" dist/* --title "BangDB $GITHUB_REF_NAME" --notes-file notes.md --verify-tag
