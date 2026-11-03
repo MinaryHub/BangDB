@@ -7,9 +7,15 @@ name: Release
 #   SHA256SUMS
 # The notes are the CHANGELOG section of the release's minor version.
 
+#
+# Or create the release on GitHub (Releases → Draft a new release → new tag
+# v<version> on the branch → Publish): the same jobs then attach the files.
+
 on:
   push:
     tags: ["v*"]
+  release:
+    types: [published]
 
 permissions:
   contents: write
@@ -98,4 +104,13 @@ jobs:
       - name: publish
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "$GITHUB_REF_NAME" dist/* --title "BangDB $GITHUB_REF_NAME" --notes-file notes.md --verify-tag
+        run: |
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            # Published on GitHub: attach the files; fill the notes if empty.
+            gh release upload "$GITHUB_REF_NAME" dist/* --clobber
+            if [ -z "$(gh release view "$GITHUB_REF_NAME" --json body --jq .body)" ]; then
+              gh release edit "$GITHUB_REF_NAME" --notes-file notes.md
+            fi
+          else
+            gh release create "$GITHUB_REF_NAME" dist/* --title "BangDB $GITHUB_REF_NAME" --notes-file notes.md --verify-tag
+          fi
