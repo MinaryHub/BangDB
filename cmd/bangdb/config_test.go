@@ -79,3 +79,21 @@ func TestEncryptionKeyFile(t *testing.T) {
 		t.Error("non-hex key accepted")
 	}
 }
+
+// Started through the dynamic linker (Termux), the program's own path can
+// arrive as the first argument; it must not be taken for the database.
+func TestCLIArgsDropsOwnPath(t *testing.T) {
+	self, err := os.Executable()
+	if err != nil {
+		t.Skip(err)
+	}
+	if got := cliArgs([]string{"linker64", self, "-version"}); len(got) != 1 || got[0] != "-version" {
+		t.Fatalf("own path kept: %q", got)
+	}
+	if got := cliArgs([]string{self, "app.db", "-x"}); len(got) != 2 || got[0] != "app.db" {
+		t.Fatalf("database argument dropped: %q", got)
+	}
+	if got := cliArgs([]string{self}); len(got) != 0 {
+		t.Fatalf("no arguments: %q", got)
+	}
+}

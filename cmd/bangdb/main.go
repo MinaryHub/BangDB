@@ -52,7 +52,7 @@ e.g. BANGDB_ENCRYPTION_KEY_FILE. Priority: flag > environment > file.
 options:`)
 		fs.PrintDefaults()
 	}
-	fs.Parse(os.Args[1:])
+	fs.Parse(cliArgs(os.Args))
 	var fileValues map[string]string
 	if cfg.configFile != "" {
 		var err error
@@ -668,4 +668,29 @@ func addUser(spec, usersFile string) error {
 	}
 	fmt.Fprintf(os.Stderr, "added %s (%s) to %s\n", name, role, usersFile)
 	return f.Close()
+}
+
+// cliArgs returns the command-line arguments after the program name. When
+// the program is started through the dynamic linker (Termux on Android 10+
+// runs binaries as "linker64 /path/to/bangdb args..."), the program's own
+// path can arrive as the first argument; it is dropped, or it would be
+// taken for the database file.
+func cliArgs(argv []string) []string {
+	if len(argv) < 2 {
+		return nil
+	}
+	args := argv[1:]
+	if strings.HasPrefix(args[0], "-") {
+		return args
+	}
+	self, err := os.Executable()
+	if err != nil {
+		return args
+	}
+	a, err1 := os.Stat(args[0])
+	b, err2 := os.Stat(self)
+	if err1 == nil && err2 == nil && os.SameFile(a, b) {
+		return args[1:]
+	}
+	return args
 }
