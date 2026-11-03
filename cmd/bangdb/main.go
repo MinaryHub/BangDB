@@ -690,9 +690,9 @@ func cliArgs(argv []string) []string {
 	return args
 }
 
-// isProgram reports whether path is the running executable or any ELF
-// program file (under the linker, os.Executable names the linker, not
-// bangdb). A database file never starts with the ELF signature.
+// isProgram reports whether path is the running executable or any program
+// file (ELF, Mach-O or PE; under the linker, os.Executable names the linker,
+// not bangdb). A database file never starts with these signatures.
 func isProgram(path string) bool {
 	a, err := os.Stat(path)
 	if err != nil || !a.Mode().IsRegular() {
@@ -710,5 +710,13 @@ func isProgram(path string) bool {
 	defer f.Close()
 	magic := make([]byte, 4)
 	_, err = io.ReadFull(f, magic)
-	return err == nil && string(magic) == "\x7fELF"
+	if err != nil {
+		return false
+	}
+	switch string(magic) {
+	case "\x7fELF", // Linux, Android
+		"\xcf\xfa\xed\xfe", "\xce\xfa\xed\xfe", "\xca\xfe\xba\xbe": // macOS (64, 32, universal)
+		return true
+	}
+	return string(magic[:2]) == "MZ" // Windows
 }
