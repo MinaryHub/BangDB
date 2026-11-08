@@ -19,8 +19,8 @@ import (
 	"io"
 	"time"
 
-	"github.com/knoxxr/bangdb/internal/engine"
-	"github.com/knoxxr/bangdb/internal/pager"
+	"github.com/minaryhub/bangdb/internal/engine"
+	"github.com/minaryhub/bangdb/internal/pager"
 )
 
 // Wire protocol (all integers big-endian):

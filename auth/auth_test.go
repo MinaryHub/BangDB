@@ -7,7 +7,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/knoxxr/bangdb/internal/engine"
+	"github.com/minaryhub/bangdb/internal/engine"
 )
 
 // RFC 7914 section 11 test vector for PBKDF2-HMAC-SHA256.

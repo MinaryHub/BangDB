@@ -24,9 +24,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/knoxxr/bangdb"
-	"github.com/knoxxr/bangdb/internal/value"
-	"github.com/knoxxr/bangdb/internal/wire"
+	"github.com/minaryhub/bangdb"
+	"github.com/minaryhub/bangdb/internal/value"
+	"github.com/minaryhub/bangdb/internal/wire"
 )
 
 // Options configures a connection.

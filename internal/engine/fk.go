@@ -7,8 +7,8 @@ import (
 	"math"
 	"strings"
 
-	"github.com/knoxxr/bangdb/internal/sql"
-	"github.com/knoxxr/bangdb/internal/value"
+	"github.com/minaryhub/bangdb/internal/sql"
+	"github.com/minaryhub/bangdb/internal/value"
 )
 
 // This file implements CHECK constraints, foreign keys and views.

@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/knoxxr/bangdb"
+	"github.com/minaryhub/bangdb"
 )
 
 func TestReplicaAcksAndLag(t *testing.T) {

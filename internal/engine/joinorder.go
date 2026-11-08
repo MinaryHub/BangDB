@@ -6,7 +6,7 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/knoxxr/bangdb/internal/sql"
+	"github.com/minaryhub/bangdb/internal/sql"
 )
 
 // ---- ANALYZE ----

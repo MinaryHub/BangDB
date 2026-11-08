@@ -4,8 +4,8 @@ import (
 	"errors"
 	"fmt"
 
-	"github.com/knoxxr/bangdb/internal/sql"
-	"github.com/knoxxr/bangdb/internal/value"
+	"github.com/minaryhub/bangdb/internal/sql"
+	"github.com/minaryhub/bangdb/internal/value"
 )
 
 // subplan is a planned subquery. Uncorrelated subqueries are run once per

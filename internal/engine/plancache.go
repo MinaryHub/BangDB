@@ -3,7 +3,7 @@ package engine
 import (
 	"sync"
 
-	"github.com/knoxxr/bangdb/internal/sql"
+	"github.com/minaryhub/bangdb/internal/sql"
 )
 
 // planCache reuses compiled SELECT plans. Parsed statements are cached by

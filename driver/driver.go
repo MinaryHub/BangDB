@@ -2,7 +2,7 @@
 //
 //	import (
 //		"database/sql"
-//		_ "github.com/knoxxr/bangdb/driver"
+//		_ "github.com/minaryhub/bangdb/driver"
 //	)
 //
 //	db, err := sql.Open("bangdb", "app.db") // or ":memory:"
@@ -21,9 +21,9 @@ import (
 	"reflect"
 	"strings"
 
-	"github.com/knoxxr/bangdb/client"
-	"github.com/knoxxr/bangdb/internal/engine"
-	"github.com/knoxxr/bangdb/internal/value"
+	"github.com/minaryhub/bangdb/client"
+	"github.com/minaryhub/bangdb/internal/engine"
+	"github.com/minaryhub/bangdb/internal/value"
 )
 
 func init() { sql.Register("bangdb", &Driver{}) }

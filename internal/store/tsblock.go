@@ -6,7 +6,7 @@ import (
 	"math"
 	"math/bits"
 
-	"github.com/knoxxr/bangdb/internal/value"
+	"github.com/minaryhub/bangdb/internal/value"
 )
 
 // Column-oriented block encoding for time-series data. A block holds the

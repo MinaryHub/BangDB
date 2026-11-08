@@ -5,8 +5,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/knoxxr/bangdb/internal/btree"
-	"github.com/knoxxr/bangdb/internal/value"
+	"github.com/minaryhub/bangdb/internal/btree"
+	"github.com/minaryhub/bangdb/internal/value"
 )
 
 func checkDB(t *testing.T) *DB {

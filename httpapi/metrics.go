@@ -5,7 +5,7 @@ import (
 	"io"
 	"net/http"
 
-	"github.com/knoxxr/bangdb"
+	"github.com/minaryhub/bangdb"
 )
 
 // metrics serves the database statistics in the Prometheus text format.

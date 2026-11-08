@@ -18,11 +18,11 @@ import (
 	"testing"
 	"time"
 
-	"github.com/knoxxr/bangdb"
-	"github.com/knoxxr/bangdb/auth"
-	"github.com/knoxxr/bangdb/client"
-	_ "github.com/knoxxr/bangdb/driver"
-	"github.com/knoxxr/bangdb/server"
+	"github.com/minaryhub/bangdb"
+	"github.com/minaryhub/bangdb/auth"
+	"github.com/minaryhub/bangdb/client"
+	_ "github.com/minaryhub/bangdb/driver"
+	"github.com/minaryhub/bangdb/server"
 )
 
 func start(t *testing.T, opts server.Options) (*bangdb.DB, *server.Server, string) {

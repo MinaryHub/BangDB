@@ -7,7 +7,7 @@ import (
 	"sort"
 	"testing"
 
-	"github.com/knoxxr/bangdb/internal/pager"
+	"github.com/minaryhub/bangdb/internal/pager"
 )
 
 func keys(it *Iter[int, int]) []int {

@@ -15,8 +15,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/knoxxr/bangdb"
-	"github.com/knoxxr/bangdb/internal/value"
+	"github.com/minaryhub/bangdb"
+	"github.com/minaryhub/bangdb/internal/value"
 )
 
 func openDB(t *testing.T, path string) *bangdb.DB {

@@ -6,8 +6,8 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/knoxxr/bangdb/internal/pager"
-	"github.com/knoxxr/bangdb/internal/value"
+	"github.com/minaryhub/bangdb/internal/pager"
+	"github.com/minaryhub/bangdb/internal/value"
 )
 
 // Stats describes the activity of a database since it was opened. The

@@ -7,8 +7,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/knoxxr/bangdb/auth"
-	"github.com/knoxxr/bangdb/httpapi"
+	"github.com/minaryhub/bangdb/auth"
+	"github.com/minaryhub/bangdb/httpapi"
 )
 
 // The /v1 API as BangDB Manager ("BangDB (Go)" connections) calls it:

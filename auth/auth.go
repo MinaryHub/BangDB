@@ -30,7 +30,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/knoxxr/bangdb/internal/engine"
+	"github.com/minaryhub/bangdb/internal/engine"
 )
 
 // Role is what an account may do.

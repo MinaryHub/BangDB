@@ -11,9 +11,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/knoxxr/bangdb/internal/btree"
-	"github.com/knoxxr/bangdb/internal/pager"
-	"github.com/knoxxr/bangdb/internal/value"
+	"github.com/minaryhub/bangdb/internal/btree"
+	"github.com/minaryhub/bangdb/internal/pager"
+	"github.com/minaryhub/bangdb/internal/value"
 )
 
 func init() { Register(TimeSeriesKind{}) }

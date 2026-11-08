@@ -5,8 +5,8 @@ import (
 	"fmt"
 	"sort"
 
-	"github.com/knoxxr/bangdb/internal/sql"
-	"github.com/knoxxr/bangdb/internal/value"
+	"github.com/minaryhub/bangdb/internal/sql"
+	"github.com/minaryhub/bangdb/internal/value"
 )
 
 // Window functions: f(...) OVER (PARTITION BY ... ORDER BY ... frame).

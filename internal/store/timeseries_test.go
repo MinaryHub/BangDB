@@ -6,8 +6,8 @@ import (
 	"sort"
 	"testing"
 
-	"github.com/knoxxr/bangdb/internal/pager"
-	"github.com/knoxxr/bangdb/internal/value"
+	"github.com/minaryhub/bangdb/internal/pager"
+	"github.com/minaryhub/bangdb/internal/value"
 )
 
 func openTS(t *testing.T, v *pager.View, opts map[string]string) (*tsStore, uint32) {

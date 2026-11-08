@@ -10,8 +10,8 @@ import (
 	"strings"
 	"unicode/utf8"
 
-	"github.com/knoxxr/bangdb/internal/sql"
-	"github.com/knoxxr/bangdb/internal/value"
+	"github.com/minaryhub/bangdb/internal/sql"
+	"github.com/minaryhub/bangdb/internal/value"
 )
 
 // JSON functions. JSON documents are TEXT values; they are parsed for each

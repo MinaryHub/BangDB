@@ -7,9 +7,9 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/knoxxr/bangdb/internal/sql"
-	"github.com/knoxxr/bangdb/internal/store"
-	"github.com/knoxxr/bangdb/internal/value"
+	"github.com/minaryhub/bangdb/internal/sql"
+	"github.com/minaryhub/bangdb/internal/store"
+	"github.com/minaryhub/bangdb/internal/value"
 )
 
 // accessKind is how rows of one table are located.

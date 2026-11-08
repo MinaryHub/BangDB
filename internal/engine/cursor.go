@@ -6,8 +6,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/knoxxr/bangdb/internal/pager"
-	"github.com/knoxxr/bangdb/internal/sql"
+	"github.com/minaryhub/bangdb/internal/pager"
+	"github.com/minaryhub/bangdb/internal/sql"
 )
 
 // Rows is a streaming result set. Rows are produced on demand from a pinned

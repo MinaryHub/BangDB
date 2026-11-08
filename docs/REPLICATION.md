@@ -41,7 +41,7 @@ err := db.Backup("/backup/app-2026-10-25.db")
 ### Primary
 
 ```go
-import "github.com/knoxxr/bangdb/replication"
+import "github.com/minaryhub/bangdb/replication"
 
 db, _ := bangdb.Open("app.db")
 p := replication.NewPrimary(db, replication.PrimaryOptions{
