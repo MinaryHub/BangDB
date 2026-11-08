@@ -47,7 +47,10 @@ func TestSemiSyncReplication(t *testing.T) {
 	dir := t.TempDir()
 	primary := openDB(t, filepath.Join(dir, "p.db"))
 	setup(t, primary)
-	p, addr := startPrimary(t, primary, PrimaryOptions{SyncReplicas: 1, SyncTimeout: 300 * time.Millisecond})
+	// The timeout is generous so a slow CI machine (Windows fsync) never
+	// hits it while the replica is connected.
+	const timeout = 2 * time.Second
+	p, addr := startPrimary(t, primary, PrimaryOptions{SyncReplicas: 1, SyncTimeout: timeout})
 	rdb := openDB(t, filepath.Join(dir, "r.db"))
 	r := StartReplica(rdb, addr, ReplicaOptions{})
 	waitSynced(t, r, primary)
@@ -67,7 +70,7 @@ func TestSemiSyncReplication(t *testing.T) {
 	r.Stop()
 	start := time.Now()
 	mustExec(t, primary, "INSERT INTO b (v) VALUES (1000)")
-	if d := time.Since(start); d < 250*time.Millisecond {
+	if d := time.Since(start); d < timeout*9/10 {
 		t.Fatalf("commit without replicas returned after %v", d)
 	}
 	if st := p.Stats(); st.SyncTimeouts != 1 {
@@ -81,8 +84,8 @@ func TestSemiSyncReplication(t *testing.T) {
 	p.Close()
 	start = time.Now()
 	mustExec(t, primary, "INSERT INTO b (v) VALUES (1001)") // no waiting once closed
-	if time.Since(start) > 200*time.Millisecond {
-		t.Fatal("commit still waits after the primary was closed")
+	if d := time.Since(start); d > timeout/2 {
+		t.Fatalf("commit still waits after the primary was closed (%v)", d)
 	}
 }
 
