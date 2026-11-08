@@ -11,7 +11,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/knoxxr/bangdb"
+	"github.com/minaryhub/bangdb"
 )
 
 func size(path string) float64 {

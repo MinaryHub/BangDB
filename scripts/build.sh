@@ -19,7 +19,7 @@ if [ -n "$(git status --porcelain --untracked-files=no)" ]; then
 	version="$version-dirty" # uncommitted changes: not a reproducible build
 fi
 built=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-pkg=github.com/knoxxr/bangdb
+pkg=github.com/minaryhub/bangdb
 ldflags="-s -w -X $pkg.Version=$version -X $pkg.Commit=$commit -X $pkg.BuildTime=$built"
 
 build() { # os arch

@@ -5,7 +5,7 @@ import (
 	"sort"
 	"testing"
 
-	"github.com/knoxxr/bangdb/internal/value"
+	"github.com/minaryhub/bangdb/internal/value"
 )
 
 func TestExtSorter(t *testing.T) {

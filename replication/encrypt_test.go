@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/knoxxr/bangdb"
+	"github.com/minaryhub/bangdb"
 )
 
 // Encryption is a property of each file: an encrypted primary can feed a

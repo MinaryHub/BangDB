@@ -24,7 +24,7 @@ Go로 작성된 **경량 임베디드 관계형 데이터베이스**입니다. �
 ## 설치
 
 ```bash
-go get github.com/knoxxr/bangdb
+go get github.com/minaryhub/bangdb
 ```
 
 안드로이드 앱에 내장: [docs/ANDROID.md](docs/ANDROID.md) (`.aar`, Kotlin/Java API `com.knoxxr.bangdb`).
@@ -42,7 +42,7 @@ import (
 	"log"
 	"time"
 
-	"github.com/knoxxr/bangdb"
+	"github.com/minaryhub/bangdb"
 )
 
 func main() {
@@ -123,7 +123,7 @@ get.QueryRow(42).Scan(&name)
 ```go
 import (
 	"database/sql"
-	_ "github.com/knoxxr/bangdb/driver"
+	_ "github.com/minaryhub/bangdb/driver"
 )
 
 db, err := sql.Open("bangdb", "app.db")
@@ -298,7 +298,7 @@ s := db.Stats() // 문장·오류·슬로우 수, 커밋 수와 누적 시간, �
 ### CLI
 
 ```bash
-go install github.com/knoxxr/bangdb/cmd/bangdb@latest
+go install github.com/minaryhub/bangdb/cmd/bangdb@latest
 
 bangdb app.db                         # 대화형 셸 (.help, .tables, .schema, .timer on, .backup FILE, .check)
 bangdb -serve :7070 app.db            # primary로 replica 접속 허용

@@ -4,9 +4,9 @@ import (
 	"bytes"
 	"cmp"
 
-	"github.com/knoxxr/bangdb/internal/memtree"
-	"github.com/knoxxr/bangdb/internal/pager"
-	"github.com/knoxxr/bangdb/internal/value"
+	"github.com/minaryhub/bangdb/internal/memtree"
+	"github.com/minaryhub/bangdb/internal/pager"
+	"github.com/minaryhub/bangdb/internal/value"
 )
 
 func init() { Register(MemoryKind{}) }

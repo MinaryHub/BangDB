@@ -6,8 +6,8 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/knoxxr/bangdb/internal/sql"
-	"github.com/knoxxr/bangdb/internal/value"
+	"github.com/minaryhub/bangdb/internal/sql"
+	"github.com/minaryhub/bangdb/internal/value"
 )
 
 // Triggers: CREATE TRIGGER name {BEFORE|AFTER} {INSERT|UPDATE [OF cols]|

@@ -3,8 +3,8 @@ package store_test
 import (
 	"testing"
 
-	"github.com/knoxxr/bangdb/internal/store"
-	"github.com/knoxxr/bangdb/internal/store/storetest"
+	"github.com/minaryhub/bangdb/internal/store"
+	"github.com/minaryhub/bangdb/internal/store/storetest"
 )
 
 func TestKinds(t *testing.T) {

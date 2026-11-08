@@ -4,7 +4,7 @@ import (
 	"bytes"
 	"errors"
 
-	"github.com/knoxxr/bangdb/internal/pager"
+	"github.com/minaryhub/bangdb/internal/pager"
 )
 
 // buildFill is how full Builder packs pages, leaving some room so that the

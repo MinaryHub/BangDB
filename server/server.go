@@ -26,11 +26,11 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/knoxxr/bangdb"
-	"github.com/knoxxr/bangdb/auth"
-	"github.com/knoxxr/bangdb/internal/engine"
-	"github.com/knoxxr/bangdb/internal/value"
-	"github.com/knoxxr/bangdb/internal/wire"
+	"github.com/minaryhub/bangdb"
+	"github.com/minaryhub/bangdb/auth"
+	"github.com/minaryhub/bangdb/internal/engine"
+	"github.com/minaryhub/bangdb/internal/value"
+	"github.com/minaryhub/bangdb/internal/wire"
 )
 
 // Options configures a server.

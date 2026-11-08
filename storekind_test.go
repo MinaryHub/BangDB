@@ -7,10 +7,10 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/knoxxr/bangdb/internal/engine"
-	"github.com/knoxxr/bangdb/internal/pager"
-	"github.com/knoxxr/bangdb/internal/store"
-	"github.com/knoxxr/bangdb/internal/store/storetest"
+	"github.com/minaryhub/bangdb/internal/engine"
+	"github.com/minaryhub/bangdb/internal/pager"
+	"github.com/minaryhub/bangdb/internal/store"
+	"github.com/minaryhub/bangdb/internal/store/storetest"
 )
 
 // reversedKind stores each row with its values in reverse order inside the

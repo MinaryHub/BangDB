@@ -26,14 +26,14 @@ import (
 	"time"
 	"unicode/utf8"
 
-	"github.com/knoxxr/bangdb"
-	"github.com/knoxxr/bangdb/auth"
-	"github.com/knoxxr/bangdb/client"
-	"github.com/knoxxr/bangdb/httpapi"
-	"github.com/knoxxr/bangdb/internal/engine"
-	"github.com/knoxxr/bangdb/internal/value"
-	"github.com/knoxxr/bangdb/replication"
-	"github.com/knoxxr/bangdb/server"
+	"github.com/minaryhub/bangdb"
+	"github.com/minaryhub/bangdb/auth"
+	"github.com/minaryhub/bangdb/client"
+	"github.com/minaryhub/bangdb/httpapi"
+	"github.com/minaryhub/bangdb/internal/engine"
+	"github.com/minaryhub/bangdb/internal/value"
+	"github.com/minaryhub/bangdb/replication"
+	"github.com/minaryhub/bangdb/server"
 )
 
 func main() {

@@ -4,6 +4,7 @@
 
 ## 0.7 — 실 프로젝트 적용 보완 (2026-11-03)
 
+- **모듈 경로 변경(저장소 이전)**: `github.com/knoxxr/bangdb` → `github.com/minaryhub/bangdb`. 가져오기(import)·`go get`·`go install` 주소를 새 경로로 바꿔야 합니다(예: `import "github.com/minaryhub/bangdb"`, 드라이버 `_ "github.com/minaryhub/bangdb/driver"`). 이전 버전은 옛 경로 그대로 받을 수 있습니다. 안드로이드 Java/Kotlin 패키지 `com.knoxxr.bangdb`는 그대로입니다
 - **BangDB Manager 연결**: HTTP API에 `/v1/*`(health·tables·query·stats) 추가 — Manager의 "BangDB (Go)" 연결 종류가 그대로 동작. Basic 인증은 아무 사용자 + `-password` 값도 허용, `/v1/stats`에 API 요청·인증 거부 수
 - CLI: Termux(안드로이드)에서 모든 명령이 "database file is corrupt"로 실패하던 문제 수정(링커가 넘기는 실행 파일 경로를 DB로 오인). 열기 오류에 파일 경로 표시, DB가 아닌 파일을 열 때 `-wal`을 만들지 않음
 - **안드로이드 앱 내장**: `mobile/` 래퍼(gomobile) → `.aar`, Kotlin/Java `com.knoxxr.bangdb` (`Database`, `Tx`, `Rows`, `Args`, `Migrations`). CI가 `.aar`를 만들고 예제를 컴파일. `scripts/build.sh aar`, `all`에 android/arm64 CLI 추가 (docs/ANDROID.md)

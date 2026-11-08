@@ -10,7 +10,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/knoxxr/bangdb/internal/pager"
+	"github.com/minaryhub/bangdb/internal/pager"
 )
 
 // Physical replication.

@@ -6,8 +6,8 @@ import (
 	"io"
 	"strings"
 
-	"github.com/knoxxr/bangdb/client"
-	"github.com/knoxxr/bangdb/internal/value"
+	"github.com/minaryhub/bangdb/client"
+	"github.com/minaryhub/bangdb/internal/value"
 )
 
 // Connections to a server (DSN "bangdb://...").

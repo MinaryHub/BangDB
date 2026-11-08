@@ -27,7 +27,7 @@ import (
 	"strings"
 	"time"
 
-	core "github.com/knoxxr/bangdb"
+	core "github.com/minaryhub/bangdb"
 )
 
 // Version returns the BangDB version.

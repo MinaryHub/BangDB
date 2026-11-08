@@ -5,7 +5,7 @@ import (
 	"encoding/binary"
 	"fmt"
 
-	"github.com/knoxxr/bangdb/internal/pager"
+	"github.com/minaryhub/bangdb/internal/pager"
 )
 
 // CheckResult summarizes a structural check of one tree.

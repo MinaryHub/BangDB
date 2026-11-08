@@ -8,9 +8,9 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/knoxxr/bangdb/internal/btree"
-	"github.com/knoxxr/bangdb/internal/store"
-	"github.com/knoxxr/bangdb/internal/value"
+	"github.com/minaryhub/bangdb/internal/btree"
+	"github.com/minaryhub/bangdb/internal/store"
+	"github.com/minaryhub/bangdb/internal/value"
 )
 
 // IntegrityCheck verifies the whole database on a consistent snapshot and

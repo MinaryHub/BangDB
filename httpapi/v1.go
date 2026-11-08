@@ -1,7 +1,7 @@
 package httpapi
 
 // The /v1 API: the endpoints BangDB Manager's "BangDB (Go)" connection type
-// uses (github.com/knoxxr/bangdb.manager, src/api/goapi.ts).
+// uses (github.com/minaryhub/bangdb.manager, src/api/goapi.ts).
 //
 //	GET  /v1/health          {"ok":true,"version":"..."}           (no authentication)
 //	GET  /v1/tables          {"tables":[{name, kind, columns, indexes, primaryKey, store, sql}],"count":N}
@@ -26,9 +26,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/knoxxr/bangdb"
-	"github.com/knoxxr/bangdb/internal/engine"
-	"github.com/knoxxr/bangdb/internal/value"
+	"github.com/minaryhub/bangdb"
+	"github.com/minaryhub/bangdb/internal/engine"
+	"github.com/minaryhub/bangdb/internal/value"
 )
 
 // v1MaxRows caps the rows of one /v1/query answer; a request may ask for

@@ -8,11 +8,11 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/knoxxr/bangdb/internal/btree"
-	"github.com/knoxxr/bangdb/internal/pager"
-	"github.com/knoxxr/bangdb/internal/sql"
-	"github.com/knoxxr/bangdb/internal/store"
-	"github.com/knoxxr/bangdb/internal/value"
+	"github.com/minaryhub/bangdb/internal/btree"
+	"github.com/minaryhub/bangdb/internal/pager"
+	"github.com/minaryhub/bangdb/internal/sql"
+	"github.com/minaryhub/bangdb/internal/store"
+	"github.com/minaryhub/bangdb/internal/value"
 )
 
 // metaCatalogRoot is the header meta slot holding the catalog tree root.

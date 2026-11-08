@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	_ "github.com/knoxxr/bangdb/driver"
+	_ "github.com/minaryhub/bangdb/driver"
 )
 
 func TestDatabaseSQL(t *testing.T) {

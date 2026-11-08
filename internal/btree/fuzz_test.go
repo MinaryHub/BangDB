@@ -3,7 +3,7 @@ package btree
 import (
 	"testing"
 
-	"github.com/knoxxr/bangdb/internal/pager"
+	"github.com/minaryhub/bangdb/internal/pager"
 )
 
 // FuzzDecode feeds arbitrary page images to the node decoder: it must report

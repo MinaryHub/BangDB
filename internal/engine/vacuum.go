@@ -4,8 +4,8 @@ import (
 	"context"
 	"sort"
 
-	"github.com/knoxxr/bangdb/internal/btree"
-	"github.com/knoxxr/bangdb/internal/pager"
+	"github.com/minaryhub/bangdb/internal/btree"
+	"github.com/minaryhub/bangdb/internal/pager"
 )
 
 // vacuumBatch is the number of dirty pages after which VACUUM commits the

@@ -8,7 +8,7 @@ import (
 	"os"
 	"sort"
 
-	"github.com/knoxxr/bangdb/internal/value"
+	"github.com/minaryhub/bangdb/internal/value"
 )
 
 // DefaultSortMemory is the memory a query may use for sorting, DISTINCT and

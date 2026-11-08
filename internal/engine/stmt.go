@@ -4,7 +4,7 @@ import (
 	"context"
 	"time"
 
-	"github.com/knoxxr/bangdb/internal/sql"
+	"github.com/minaryhub/bangdb/internal/sql"
 )
 
 // Stmt is a prepared statement: the SQL is parsed once and, for a single

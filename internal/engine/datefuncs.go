@@ -7,8 +7,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/knoxxr/bangdb/internal/store"
-	"github.com/knoxxr/bangdb/internal/value"
+	"github.com/minaryhub/bangdb/internal/store"
+	"github.com/minaryhub/bangdb/internal/value"
 )
 
 // Date and time functions in the style of SQLite. Times are text in

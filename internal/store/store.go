@@ -21,7 +21,7 @@ import (
 	"sort"
 	"sync"
 
-	"github.com/knoxxr/bangdb/internal/pager"
+	"github.com/minaryhub/bangdb/internal/pager"
 )
 
 // MinRowid and MaxRowid bound rowid ranges.

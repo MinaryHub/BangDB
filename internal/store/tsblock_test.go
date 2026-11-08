@@ -7,7 +7,7 @@ import (
 	"reflect"
 	"testing"
 
-	"github.com/knoxxr/bangdb/internal/value"
+	"github.com/minaryhub/bangdb/internal/value"
 )
 
 func roundTrip(t *testing.T, rowids []int64, rows [][]any) []byte {

@@ -9,8 +9,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/knoxxr/bangdb"
-	"github.com/knoxxr/bangdb/internal/engine"
+	"github.com/minaryhub/bangdb"
+	"github.com/minaryhub/bangdb/internal/engine"
 )
 
 // PrimaryOptions configures a primary.

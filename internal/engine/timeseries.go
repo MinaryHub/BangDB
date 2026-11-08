@@ -3,8 +3,8 @@ package engine
 import (
 	"strings"
 
-	"github.com/knoxxr/bangdb/internal/sql"
-	"github.com/knoxxr/bangdb/internal/store"
+	"github.com/minaryhub/bangdb/internal/sql"
+	"github.com/minaryhub/bangdb/internal/store"
 )
 
 // deleteByTime runs DELETE on a time-series table as a range deletion

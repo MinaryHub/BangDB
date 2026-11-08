@@ -8,9 +8,9 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/knoxxr/bangdb"
-	"github.com/knoxxr/bangdb/auth"
-	"github.com/knoxxr/bangdb/httpapi"
+	"github.com/minaryhub/bangdb"
+	"github.com/minaryhub/bangdb/auth"
+	"github.com/minaryhub/bangdb/httpapi"
 )
 
 func setup(t *testing.T, opts httpapi.Options) (*bangdb.DB, *httptest.Server) {
