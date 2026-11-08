@@ -1,3 +1,10 @@
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/logo-dark.svg">
+    <img src="assets/logo.svg" alt="BangDB" height="80">
+  </picture>
+</p>
+
 # BangDB
 
 Go로 작성된 **경량 임베디드 관계형 데이터베이스**입니다. 외부 의존성 0개, 단일 파일 저장, 프로젝트에 라이브러리로 바로 넣어 쓰는 것을 목표로 합니다 (SQLite와 같은 사용 방식).

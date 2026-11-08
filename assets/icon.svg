@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><defs><linearGradient id="iabg" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#3b7cf0"/><stop offset="1" stop-color="#1f4fb3"/></linearGradient>
+<linearGradient id="iafire" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#ffd84a"/><stop offset="1" stop-color="#ff8a1f"/></linearGradient></defs>
+  <rect x="16" y="16" width="480" height="480" rx="108" fill="url(#iabg)"/>
+  <path d="M283.1 37.6L311.9 122.8L378.1 99.3L374.0 169.4L472.2 169.7L404.5 240.8L464.7 287.2L395.2 317.9L433.2 394.9L348.6 380.0L334.1 444.9L277.2 410.5L228.9 486.4L200.1 401.2L133.9 424.7L138.0 354.6L39.8 354.3L107.5 283.2L47.3 236.8L116.8 206.1L78.8 129.1L163.4 144.0L177.9 79.1L234.8 113.5Z" fill="url(#iafire)"/>
+  
+  <clipPath id="cl256178"><rect x="156" y="178" width="200" height="218"/></clipPath>
+  <path d="M156 178v168c0 27.500000000000004 45 50 100 50s100-22.5 100-50V178" fill="#fff"/>
+  <path d="M156 234c0 27.500000000000004 45 50 100 50s100-22.5 100-50M156 290c0 27.500000000000004 45 50 100 50s100-22.5 100-50" fill="none" stroke="#1f4fb3" stroke-opacity=".3" stroke-width="9" clip-path="url(#cl256178)"/>
+  <ellipse cx="256" cy="178" rx="100" ry="50" fill="#fff" stroke="#1f4fb3" stroke-opacity=".25" stroke-width="6"/>
+  <rect x="239" y="212" width="34" height="96" rx="17" fill="#1f4fb3"/><circle cx="256" cy="343.7" r="19.72" fill="#1f4fb3"/></svg>
