@@ -920,6 +920,17 @@ func (p *parser) parseTableRef() (TableRef, error) {
 	if tr.Name, err = p.ident(); err != nil {
 		return tr, err
 	}
+	if p.acceptOp("(") { // a table-valued function
+		tr.Func = true
+		if !p.acceptOp(")") {
+			if tr.Args, err = p.parseExprList(); err != nil {
+				return tr, err
+			}
+			if err := p.expectOp(")"); err != nil {
+				return tr, err
+			}
+		}
+	}
 	if p.acceptKw("AS") {
 		tr.Alias, err = p.ident()
 	} else if t := p.peek(); t.kind == tQuotedIdent || t.kind == tIdent && !reserved[strings.ToUpper(t.text)] {

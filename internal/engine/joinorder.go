@@ -313,6 +313,11 @@ func (x *execCtx) reorderJoin(sc *scope, levels []*level, lefts []bool, ons []sq
 			return nil
 		}
 	}
+	for _, l := range levels {
+		if l.fn != nil {
+			return nil // its arguments use the tables before it
+		}
+	}
 	var conds []sql.Expr
 	for _, e := range append(append([]sql.Expr(nil), ons...), where) {
 		for _, cj := range conjuncts(e) {

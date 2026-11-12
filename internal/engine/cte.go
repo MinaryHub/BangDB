@@ -438,7 +438,7 @@ func selectRefersTo(s *sql.Select, name string) bool {
 		if t.Sub != nil {
 			return selectRefersTo(t.Sub, name)
 		}
-		return strings.EqualFold(t.Name, name)
+		return !t.Func && strings.EqualFold(t.Name, name)
 	}
 	if s.From != nil && ref(s.From) {
 		return true

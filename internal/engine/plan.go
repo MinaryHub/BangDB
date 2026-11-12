@@ -73,6 +73,11 @@ type level struct {
 	filters []evalFn    // conditions checked once this level's row is bound
 	virtual [][]any     // rows of a derived table (FROM (SELECT ...))
 	stats   *levelStats // set by EXPLAIN ANALYZE
+
+	// A table-valued function (virtual is then empty, not nil): its rows
+	// are computed from fnArgs for every row of the levels before it.
+	fn     *tableFunc
+	fnArgs []evalFn
 }
 
 // levelStats counts what a join level did.
@@ -842,6 +847,24 @@ func (x *execCtx) scanLevel(l *level, e *env, visit func(rowid int64, row []any)
 	if l.acc.kind == accHash {
 		return x.scanHash(l, e, visit)
 	}
+	if l.fn != nil {
+		args := make([]any, len(l.fnArgs))
+		for i, f := range l.fnArgs {
+			v, err := f(e)
+			if err != nil {
+				return err
+			}
+			args[i] = v
+		}
+		n := int64(0)
+		return l.fn.rows(args, func(row []any) (bool, error) {
+			if err := x.tick(); err != nil {
+				return false, err
+			}
+			n++
+			return visit(n, row)
+		})
+	}
 	if l.virtual == nil {
 		return x.scan(l.t, l.acc, e, visit)
 	}
@@ -1062,7 +1085,14 @@ func (x *execCtx) buildLevels(from []sql.TableRef, lefts []bool, ons []sql.Expr,
 		var t *Table
 		var virtual [][]any
 		var rec *cteDef // the recursive WITH table this level reads
-		if def := x.cte(ref.Name); def != nil && ref.Sub == nil && !ref.Base {
+		var fn *tableFunc
+		if ref.Func {
+			var err error
+			if fn, err = lookupTableFunc(ref.Name, len(ref.Args)); err != nil {
+				return nil, nil, nil, err
+			}
+			t, virtual = fn.table(ref.Name), [][]any{}
+		} else if def := x.cte(ref.Name); def != nil && ref.Sub == nil && !ref.Base {
 			var err error
 			if t, virtual, err = x.cteTable(def, ref.Name); err != nil {
 				return nil, nil, nil, err
@@ -1107,7 +1137,7 @@ func (x *execCtx) buildLevels(from []sql.TableRef, lefts []bool, ons []sql.Expr,
 			return nil, nil, nil, fmt.Errorf("bangdb: ambiguous table name %s (use an alias)", alias)
 		}
 		seen[strings.ToLower(alias)] = true
-		l := &level{t: t, alias: alias, offset: len(sc.cols), left: lefts[i], virtual: virtual}
+		l := &level{t: t, alias: alias, offset: len(sc.cols), left: lefts[i], virtual: virtual, fn: fn}
 		if rec != nil {
 			rec.levels = append(rec.levels, l)
 		}
@@ -1118,6 +1148,29 @@ func (x *execCtx) buildLevels(from []sql.TableRef, lefts []bool, ons []sql.Expr,
 		levels = append(levels, l)
 	}
 	c := &compiler{x: x, sc: sc}
+	for i, l := range levels {
+		if l.fn == nil {
+			continue
+		}
+		// The arguments are evaluated for each row of the tables before.
+		for _, a := range from[i].Args {
+			if containsSubquery(a) || hasAggregate(a) {
+				return nil, nil, nil, fmt.Errorf("bangdb: subqueries and aggregate functions are not allowed in the arguments of %s()", l.fn.name)
+			}
+			lvl, err := maxLevel(a, sc)
+			if err != nil {
+				return nil, nil, nil, err
+			}
+			if lvl >= i {
+				return nil, nil, nil, fmt.Errorf("bangdb: the arguments of %s() may only use tables to its left", l.fn.name)
+			}
+			f, err := c.compile(a)
+			if err != nil {
+				return nil, nil, nil, err
+			}
+			l.fnArgs = append(l.fnArgs, f)
+		}
+	}
 	if order := x.reorderJoin(sc, levels, lefts, ons, where, c); order != nil {
 		// Inner joins only: ON conditions are WHERE conditions, placed by
 		// the tables they use.
@@ -1185,6 +1238,10 @@ func (x *execCtx) buildLevels(from []sql.TableRef, lefts []bool, ons []sql.Expr,
 		accessConds[lvl] = append(accessConds[lvl], cj)
 	}
 	for i, l := range levels {
+		if l.fn != nil {
+			l.acc = &access{kind: accFull, desc: "SCAN FUNCTION " + l.fn.name}
+			continue
+		}
 		if l.virtual != nil {
 			l.acc = &access{kind: accFull, desc: "SCAN SUBQUERY " + l.alias}
 			if a, err := hashAccess(sc, l, i, accessConds[i], c); err != nil {

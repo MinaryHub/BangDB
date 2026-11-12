@@ -46,6 +46,7 @@ func FuzzExec(f *testing.F) {
 		"WITH x AS (SELECT id FROM t WHERE n > 0) UPDATE u SET tid = (SELECT MAX(id) FROM x) WHERE tid IN (SELECT id FROM x); WITH x AS (SELECT 1 AS a) INSERT INTO u (tid) SELECT a FROM x; WITH t AS (SELECT 2 AS id) DELETE FROM t WHERE id IN (SELECT id FROM t)",
 		"CREATE UNIQUE INDEX e1 ON t (lower(name), n + 1); CREATE INDEX e2 ON t (name || n) WHERE n > 0; CREATE INDEX e3 ON u (length(v), tid); UPDATE t SET name = upper(name), n = n + 1; SELECT * FROM t WHERE lower(name) = 'a' AND n + 1 IN (2, 3.0) ORDER BY lower(name) DESC; DELETE FROM t WHERE name || n > 'a'; ALTER TABLE t RENAME COLUMN n TO m",
 		"CREATE TABLE g (id INTEGER PRIMARY KEY, a INT, b TEXT, s INT AS (a * 2 + id) STORED, k TEXT GENERATED ALWAYS AS (lower(b) || a) UNIQUE, CHECK (s <> 13)); INSERT INTO g (a, b) SELECT n, name FROM t; INSERT INTO g VALUES (9, 1, 'A') ON CONFLICT DO NOTHING; UPDATE g SET a = a + 1 RETURNING s, k; ALTER TABLE g DROP COLUMN s; SELECT * FROM g",
+		"SELECT t.id, j.key, j.value, j.fullkey FROM t, json_each(json_array(t.n, t.name, json_object('k', t.id))) j WHERE j.type <> 'null'; SELECT fullkey, atom FROM json_tree('{\"a\":[1,{\"b\":null}]}', '$.a') ORDER BY id DESC; SELECT g.value, t.name FROM generate_series(3, 0, -1) g LEFT JOIN t ON t.id = g.value",
 	} {
 		f.Add(s)
 	}

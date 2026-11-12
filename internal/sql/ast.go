@@ -161,6 +161,10 @@ type TableRef struct {
 	// Base marks a name that must be a stored table (the target of UPDATE
 	// or DELETE), never a common table expression.
 	Base bool
+	// Func marks a table-valued function call, FROM name(args): its rows
+	// are computed from Args, which may use the tables to its left.
+	Func bool
+	Args []Expr
 }
 
 type Join struct {
