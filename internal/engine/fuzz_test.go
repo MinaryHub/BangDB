@@ -44,6 +44,8 @@ func FuzzExec(f *testing.F) {
 		"SELECT json_set(json_object('a', name, 'n', json_array(n, id)), '$.n[#]', 1, '$.x.y', 2) -> 'n' ->> 1, json_group_array(json_extract('{\"k\":[1,2]}', '$.k[#-1]')) FROM t GROUP BY n",
 		"WITH RECURSIVE c(n, p) AS (SELECT 1, 'a' UNION SELECT n + 1, p || name FROM c JOIN t ON t.id = c.n WHERE n < 5 ORDER BY 2 DESC LIMIT 9 OFFSET 1), d AS (SELECT MAX(n) m FROM c) SELECT * FROM c, d WHERE n IN (SELECT tid FROM u) UNION ALL SELECT n, NULL, 0 FROM c",
 		"WITH x AS (SELECT id FROM t WHERE n > 0) UPDATE u SET tid = (SELECT MAX(id) FROM x) WHERE tid IN (SELECT id FROM x); WITH x AS (SELECT 1 AS a) INSERT INTO u (tid) SELECT a FROM x; WITH t AS (SELECT 2 AS id) DELETE FROM t WHERE id IN (SELECT id FROM t)",
+		"CREATE UNIQUE INDEX e1 ON t (lower(name), n + 1); CREATE INDEX e2 ON t (name || n) WHERE n > 0; CREATE INDEX e3 ON u (length(v), tid); UPDATE t SET name = upper(name), n = n + 1; SELECT * FROM t WHERE lower(name) = 'a' AND n + 1 IN (2, 3.0) ORDER BY lower(name) DESC; DELETE FROM t WHERE name || n > 'a'; ALTER TABLE t RENAME COLUMN n TO m",
+		"CREATE TABLE g (id INTEGER PRIMARY KEY, a INT, b TEXT, s INT AS (a * 2 + id) STORED, k TEXT GENERATED ALWAYS AS (lower(b) || a) UNIQUE, CHECK (s <> 13)); INSERT INTO g (a, b) SELECT n, name FROM t; INSERT INTO g VALUES (9, 1, 'A') ON CONFLICT DO NOTHING; UPDATE g SET a = a + 1 RETURNING s, k; ALTER TABLE g DROP COLUMN s; SELECT * FROM g",
 	} {
 		f.Add(s)
 	}

@@ -133,6 +133,24 @@ func (x *execCtx) computeCTE(def *cteDef) error {
 	return nil
 }
 
+// trimBangdb removes the "bangdb: " prefix of an error that is going to be
+// wrapped in another message.
+func trimBangdb(err error) error {
+	if msg := err.Error(); strings.HasPrefix(msg, "bangdb: ") {
+		return &retitled{strings.TrimPrefix(msg, "bangdb: "), err}
+	}
+	return err
+}
+
+// retitled is an error shown with another text.
+type retitled struct {
+	msg string
+	err error
+}
+
+func (r *retitled) Error() string { return r.msg }
+func (r *retitled) Unwrap() error { return r.err }
+
 // errf is an error about the definition of def.
 func (def *cteDef) errf(format string, args ...any) error {
 	return fmt.Errorf("bangdb: WITH table %s: %s", def.name, fmt.Sprintf(format, args...))

@@ -404,7 +404,7 @@ func (p *parser) parseCreate() (Stmt, error) {
 		if ci.Table, err = p.ident(); err != nil {
 			return nil, err
 		}
-		if ci.Columns, err = p.parseColumnList(); err != nil {
+		if ci.Columns, ci.Exprs, err = p.parseIndexParts(); err != nil {
 			return nil, err
 		}
 		if p.acceptKw("WHERE") {
@@ -440,6 +440,44 @@ func (p *parser) parseColumnList() ([]string, error) {
 	return cols, p.expectOp(")")
 }
 
+// parseIndexParts parses the key of CREATE INDEX: "(part [ASC|DESC], ...)"
+// where a part is a column name or an expression. exprs is nil when every
+// part is a column.
+func (p *parser) parseIndexParts() (cols []string, exprs []Expr, err error) {
+	if err := p.expectOp("("); err != nil {
+		return nil, nil, err
+	}
+	anyExpr := false
+	for {
+		e, err := p.parseExpr()
+		if err != nil {
+			return nil, nil, err
+		}
+		switch x := e.(type) {
+		case *ColumnRef:
+			if x.Table != "" {
+				return nil, nil, p.errf("an index column cannot be qualified with a table name")
+			}
+			cols, exprs = append(cols, x.Name), append(exprs, nil)
+		case *Collate:
+			return nil, nil, p.errf("COLLATE is not supported in an index (declare the collation on the column)")
+		default:
+			cols, exprs = append(cols, ""), append(exprs, e)
+			anyExpr = true
+		}
+		if !p.acceptKw("ASC") {
+			p.acceptKw("DESC")
+		}
+		if !p.acceptOp(",") {
+			break
+		}
+	}
+	if !anyExpr {
+		exprs = nil
+	}
+	return cols, exprs, p.expectOp(")")
+}
+
 func (p *parser) parseColumnDef() (ColumnDef, error) {
 	var cd ColumnDef
 	var err error
@@ -449,6 +487,9 @@ func (p *parser) parseColumnDef() (ColumnDef, error) {
 	// Type name: one or more identifiers, optionally followed by (n[,m]).
 	var typ []string
 	for p.peek().kind == tIdent && !isConstraintKw(p.peek().text) {
+		if p.isKw("AS") && p.peekAt(1).text == "(" { // generated column without a type
+			break
+		}
 		typ = append(typ, p.next().text)
 	}
 	size := ""
@@ -500,6 +541,27 @@ func (p *parser) parseColumnDef() (ColumnDef, error) {
 				return cd, err
 			}
 			cd.References = fk
+		case p.isKw("AS") && p.peekAt(1).text == "(", p.isKw("GENERATED"):
+			if p.acceptKw("GENERATED") {
+				if err := p.expectKw("ALWAYS"); err != nil {
+					return cd, err
+				}
+			}
+			if err := p.expectKw("AS"); err != nil {
+				return cd, err
+			}
+			if cd.Generated != nil {
+				return cd, p.errf("column %s is generated twice", cd.Name)
+			}
+			e, err := p.parseParenExpr()
+			if err != nil {
+				return cd, err
+			}
+			cd.Generated = e
+			// Both kinds are computed when the row is written and stored.
+			if !p.acceptKw("STORED") {
+				p.acceptKw("VIRTUAL")
+			}
 		case p.acceptKw("DEFAULT"):
 			if p.acceptOp("(") {
 				e, err := p.parseExpr()
@@ -525,7 +587,7 @@ func (p *parser) parseColumnDef() (ColumnDef, error) {
 
 func isConstraintKw(s string) bool {
 	switch strings.ToUpper(s) {
-	case "PRIMARY", "NOT", "NULL", "UNIQUE", "DEFAULT", "AUTOINCREMENT", "AUTO_INCREMENT", "CONSTRAINT", "CHECK", "REFERENCES", "COLLATE":
+	case "PRIMARY", "NOT", "NULL", "UNIQUE", "DEFAULT", "AUTOINCREMENT", "AUTO_INCREMENT", "CONSTRAINT", "CHECK", "REFERENCES", "COLLATE", "GENERATED":
 		return true
 	}
 	return false

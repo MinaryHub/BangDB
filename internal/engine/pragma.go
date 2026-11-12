@@ -136,6 +136,10 @@ func (x *execCtx) pragma(st *sql.Pragma) (Result, error) {
 		t := x.cat.table(ix.Table)
 		res := Result{Columns: []string{"seqno", "cid", "name"}}
 		for i, c := range ix.cols {
+			if c < 0 { // an expression, as SQLite reports it
+				res.Rows = append(res.Rows, []any{int64(i), int64(-2), nil})
+				continue
+			}
 			res.Rows = append(res.Rows, []any{int64(i), int64(c), t.Columns[c].Name})
 		}
 		return res, nil

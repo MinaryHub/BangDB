@@ -18,6 +18,9 @@ type ColumnDef struct {
 	Collate       string // NOCASE, RTRIM, BINARY or ""
 	Check         Expr   // column CHECK constraint
 	References    *ForeignKey
+	// Generated is the expression of a generated column:
+	// [GENERATED ALWAYS] AS (expr) [STORED | VIRTUAL].
+	Generated Expr
 }
 
 // ForeignKey is FOREIGN KEY (cols) REFERENCES table [(cols)] [actions], or
@@ -101,9 +104,12 @@ type AlterTableDropColumn struct {
 }
 
 type CreateIndex struct {
-	Name        string
-	Table       string
-	Columns     []string
+	Name    string
+	Table   string
+	Columns []string
+	// Exprs is nil, or has an entry per key part: the expression of a part
+	// that is not a plain column (whose Columns entry is then ""), else nil.
+	Exprs       []Expr
 	Unique      bool
 	IfNotExists bool
 	Where       Expr // partial index condition, or nil

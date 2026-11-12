@@ -160,7 +160,7 @@ func (t *Table) isKey(cols []string) bool {
 
 func (t *Table) uniqueIndex(cols []string) *Index {
 	for _, ix := range t.indexes {
-		if ix.Unique && ix.Where == "" && sameColumns(cols, ix.Columns) {
+		if ix.Unique && ix.Where == "" && !ix.hasExpr() && sameColumns(cols, ix.Columns) {
 			return ix
 		}
 	}
@@ -275,7 +275,7 @@ func (x *execCtx) children(child *Table, fk *ForeignKey, vals []any) ([]target, 
 	}
 	// An index whose leading columns are the foreign key columns.
 	for _, ix := range child.indexes {
-		if ix.Where != "" || len(ix.cols) < len(fk.cols) || !sameColumns(ix.Columns[:len(fk.cols)], fk.Columns) {
+		if ix.Where != "" || ix.hasExpr() || len(ix.cols) < len(fk.cols) || !sameColumns(ix.Columns[:len(fk.cols)], fk.Columns) {
 			continue
 		}
 		var prefix []byte
@@ -484,6 +484,16 @@ func columnInUse(t *Table, i int) string {
 	for _, ix := range t.indexes {
 		if e, err := sql.ParseExpr(ix.Where); ix.Where != "" && err == nil && refersTo(e, name) {
 			return "it is used by the WHERE of index " + ix.Name
+		}
+		for _, src := range ix.Exprs {
+			if e, err := sql.ParseExpr(src); src != "" && err == nil && refersTo(e, name) {
+				return "it is used by an expression of index " + ix.Name + " (drop the index first)"
+			}
+		}
+	}
+	for _, c := range t.Columns {
+		if e, err := sql.ParseExpr(c.Generated); c.Generated != "" && err == nil && refersTo(e, name) {
+			return "it is used by generated column " + c.Name
 		}
 	}
 	return ""

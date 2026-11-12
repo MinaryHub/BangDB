@@ -168,12 +168,22 @@ func chooseAccess(sc *scope, l *level, li int, conds []sql.Expr, c *compiler) (*
 				byCol[col] = append(byCol[col], candidate{col: col, op: x.Op, other: x.R})
 			} else if col, ok := columnOf(x.R, sc, l, li); ok && refsBelow(x.L, sc, li) && coll == colColl(col) {
 				byCol[col] = append(byCol[col], candidate{col: col, op: op, other: x.L})
+			} else if coll != "" {
+				// An expression index keys its values without collation.
+			} else if col, ok := keyExprOf(x.L, sc, l, li); ok && refsBelow(x.R, sc, li) {
+				byCol[col] = append(byCol[col], candidate{col: col, op: x.Op, other: x.R})
+			} else if col, ok := keyExprOf(x.R, sc, l, li); ok && refsBelow(x.L, sc, li) {
+				byCol[col] = append(byCol[col], candidate{col: col, op: op, other: x.L})
 			}
 		case *sql.In:
 			if x.Not {
 				continue
 			}
-			if col, ok := columnOf(x.X, sc, l, li); ok {
+			col, ok := columnOf(x.X, sc, l, li)
+			if !ok {
+				col, ok = keyExprOf(x.X, sc, l, li)
+			}
+			if ok {
 				all := true
 				for _, a := range x.List {
 					all = all && refsBelow(a, sc, li)
@@ -255,16 +265,17 @@ func chooseAccess(sc *scope, l *level, li int, conds []sql.Expr, c *compiler) (*
 			continue // a partial index lacks the rows its WHERE excludes
 		}
 		p := &plan{ix: ix}
-		for _, col := range ix.cols {
-			if l.t.Columns[col].Type == value.Any || find(col, "=") == nil {
+		for i, col := range ix.cols {
+			if ix.types[i] == value.Any || find(col, "=") == nil {
 				break
 			}
 			p.eqN++
 		}
-		if p.eqN < len(ix.cols) && l.t.Columns[ix.cols[p.eqN]].Type != value.Any {
+		if p.eqN < len(ix.cols) && ix.types[p.eqN] != value.Any {
 			next := ix.cols[p.eqN]
 			p.in = find(next, "IN")
-			p.rng = p.in == nil && find(next, "<", "<=", ">", ">=") != nil
+			// Values of an expression of unknown type are not keyed in order.
+			p.rng = p.in == nil && ix.types[p.eqN] != typeExprAny && find(next, "<", "<=", ">", ">=") != nil
 		}
 		switch {
 		case p.eqN == len(ix.cols) && ix.Unique:
@@ -322,21 +333,21 @@ func chooseAccess(sc *scope, l *level, li int, conds []sql.Expr, c *compiler) (*
 	ix := best.ix
 	a := &access{kind: accIndex, ix: ix}
 	var parts []string
-	for _, col := range ix.cols[:best.eqN] {
+	for i, col := range ix.cols[:best.eqN] {
 		f, err := c.compile(find(col, "=").other)
 		if err != nil {
 			return nil, err
 		}
 		a.prefix = append(a.prefix, f)
-		a.prefTyp = append(a.prefTyp, l.t.Columns[col].Type)
-		a.prefColl = append(a.prefColl, l.t.Columns[col].Collate)
-		parts = append(parts, l.t.Columns[col].Name+"=?")
+		a.prefTyp = append(a.prefTyp, ix.types[i])
+		a.prefColl = append(a.prefColl, ix.colls[i])
+		parts = append(parts, ix.Columns[i]+"=?")
 	}
 	if best.eqN < len(ix.cols) {
 		next := ix.cols[best.eqN]
-		a.colTyp = l.t.Columns[next].Type
-		a.coll = l.t.Columns[next].Collate
-		colName := l.t.Columns[next].Name
+		a.colTyp = ix.types[best.eqN]
+		a.coll = ix.colls[best.eqN]
+		colName := ix.Columns[best.eqN]
 		if best.in != nil {
 			fns, err := compileList(best.in.list)
 			if err != nil {
@@ -539,6 +550,8 @@ func keyValue(v any, t value.Type) (any, bool) {
 		return r, true
 	}
 	switch t {
+	case typeExprAny:
+		return normKeyValue(v), v != nil
 	case value.Integer:
 		switch x := v.(type) {
 		case int64:
@@ -681,7 +694,9 @@ func (x *execCtx) scan(t *Table, acc *access, e *env, visit func(rowid int64, ro
 				return false, err
 			}
 			for i, c := range acc.ix.cols {
-				row[c] = vals[i]
+				if c >= 0 {
+					row[c] = vals[i]
+				}
 			}
 			if t.RowidCol >= 0 {
 				row[t.RowidCol] = rowid

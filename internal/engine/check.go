@@ -216,8 +216,8 @@ func (x *execCtx) checkIndex(t *Table, ix *Index, rows int, add func(string, ...
 		}
 		if ix.Unique && prevVal != nil && bytes.Equal(prevVal, valPart) && !ix.hasNull(row) {
 			var vals []string
-			for _, c := range ix.cols {
-				vals = append(vals, value.Format(row[c]))
+			for i := range ix.cols {
+				vals = append(vals, value.Format(ix.value(i, row)))
 			}
 			add("unique index %s has duplicate value %s", ix.Name, strings.Join(vals, ", "))
 		}

@@ -9,12 +9,26 @@ import (
 // FormatExpr renders an expression back to SQL text. It is used for result
 // column names and for persisting DEFAULT expressions.
 func FormatExpr(e Expr) string {
-	var sb strings.Builder
+	var sb fmtBuf
 	formatExpr(&sb, e)
 	return sb.String()
 }
 
-func formatExpr(sb *strings.Builder, e Expr) {
+// FormatExprCols is FormatExpr with every column reference rendered by
+// col (which returns the SQL text to use for it).
+func FormatExprCols(e Expr, col func(*ColumnRef) string) string {
+	sb := fmtBuf{col: col}
+	formatExpr(&sb, e)
+	return sb.String()
+}
+
+// fmtBuf is the output of formatExpr.
+type fmtBuf struct {
+	strings.Builder
+	col func(*ColumnRef) string // nil: [table.]name
+}
+
+func formatExpr(sb *fmtBuf, e Expr) {
 	switch x := e.(type) {
 	case *Literal:
 		switch v := x.Value.(type) {
@@ -40,6 +54,10 @@ func formatExpr(sb *strings.Builder, e Expr) {
 			fmt.Fprintf(sb, "?%d", x.Index+1)
 		}
 	case *ColumnRef:
+		if sb.col != nil {
+			sb.WriteString(sb.col(x))
+			return
+		}
 		if x.Table != "" {
 			sb.WriteString(QuoteIdent(x.Table) + ".")
 		}
@@ -206,7 +224,7 @@ func ParseExpr(src string) (Expr, error) {
 	return e, nil
 }
 
-func formatBound(sb *strings.Builder, b FrameBound) {
+func formatBound(sb *fmtBuf, b FrameBound) {
 	switch b.Kind {
 	case UnboundedPreceding:
 		sb.WriteString("UNBOUNDED PRECEDING")
