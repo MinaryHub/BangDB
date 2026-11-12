@@ -2,6 +2,16 @@
 
 버전은 `주.부.커밋수`입니다(`VERSION` + 커밋 수, `bangdb -version`). 호환성 약속은 [docs/COMPATIBILITY.md](docs/COMPATIBILITY.md).
 
+## 다음 릴리스 — SQL 완성도, 셸
+
+- **CTE**: `WITH name [(cols)] AS (…)`와 **`WITH RECURSIVE`** — `SELECT`/`INSERT`/`UPDATE`/`DELETE` 앞, 서브쿼리·파생 테이블·뷰 안. 재귀는 SQLite 방식(큐에서 행을 꺼내 재귀 SELECT에 넣음): `UNION`은 중복 제거, 본문의 `LIMIT`/`OFFSET`은 결과 제한, `ORDER BY`는 처리 순서(깊이 우선·너비 우선)
+- **식 인덱스**: `CREATE [UNIQUE] INDEX … ON t (lower(email), …) [WHERE …]`. 조건·`ORDER BY`가 인덱스의 식과 같으면 플래너가 사용. 타입을 아는 식은 범위·정렬에도, 그 밖의 식은 동등·`IN`에 사용. `PRAGMA index_info`는 식 부분을 SQLite처럼 `cid = -2`로 표시
+- **생성 컬럼**: `c TYPE [GENERATED ALWAYS] AS (식) [STORED|VIRTUAL]` (쓸 때 계산해 저장). 덤프는 생성 컬럼 값을 빼고 내보냄
+- **테이블 값 함수**: `json_each`, `json_tree`(SQLite와 같은 컬럼), `generate_series` — 왼쪽 테이블의 컬럼을 인수로 받는 lateral 조인
+- `PRAGMA schema [(이름)]`: 테이블·인덱스·뷰·트리거의 CREATE 문 (`type`, `name`, `tbl_name`, `sql`)
+- **CLI 셸**: 줄 편집(방향키, Home/End, Ctrl-A/E/K/U/W), 히스토리(↑/↓, `~/.bangdb_history`, `-history`), Tab 자동 완성(테이블·컬럼·키워드·점 명령) — 외부 의존성 없이 Linux·macOS·FreeBSD·Windows 콘솔 지원. `.mode table|list|csv|json|line`, `.headers on|off`, `.output FILE`. 명령줄 인수로 점 명령 실행(`bangdb app.db ".mode csv" "SELECT …"`). 원격 셸에서 `.tables`·`.schema` 사용 가능. 표 출력이 전각 문자(한글 등) 폭을 맞춤
+- 카탈로그에 필드 추가(`Index.exprs`, `Column.generated`): 이 기능을 쓴 파일은 이전 버전에서 열 수 없음(되돌리기는 원래 미지원). 기능을 쓰지 않은 파일의 형식은 그대로
+
 ## 0.7 — 실 프로젝트 적용 보완 (2026-11-03)
 
 - **BangDB Manager 연결**: HTTP API에 `/v1/*`(health·tables·query·stats) 추가 — Manager의 "BangDB (Go)" 연결 종류가 그대로 동작. Basic 인증은 아무 사용자 + `-password` 값도 허용, `/v1/stats`에 API 요청·인증 거부 수

@@ -2,6 +2,21 @@
 
 > 이 문서가 BangDB의 **기준 개발 계획**입니다. [시계열·인메모리 검토](REVIEW-timeseries-inmemory.md)의 단계 계획은 여기 통합되었습니다.
 
+## 8. SQL 완성도와 셸 (완료)
+
+7단계 이후 "현재 제약 사항"에 남아 있던 SQL 공백과 CLI 사용성을 보완했습니다.
+
+| 항목 | 결과 |
+|---|---|
+| CTE | `WITH`·`WITH RECURSIVE`(SELECT/INSERT/UPDATE/DELETE, 서브쿼리·뷰). CTE는 문장당 한 번, 처음 참조될 때 계산해 파생 테이블처럼 훑음. 재귀는 재귀 SELECT의 플랜을 한 번 만들고 작업 테이블만 바꿔 반복 실행(`internal/engine/cte.go`) |
+| 식 인덱스 | 키 부분이 식인 인덱스. 식은 카탈로그에 테이블의 컬럼 이름으로 정규화한 SQL 텍스트로 저장하고, 질의 조건의 한쪽을 같은 방식으로 정규화해 일치하면 사용. 타입 추론이 되는 식은 컬럼과 같은 키, 그 밖에는 숫자를 정규화한 키(동등·IN 전용) (`internal/engine/keyexpr.go`) |
+| 생성 컬럼 | 쓰기 시 계산·저장(`prepareRow`), 일반 컬럼처럼 인덱스·제약 적용 |
+| 테이블 값 함수 | `json_each`·`json_tree`·`generate_series`. 조인의 한 단계로, 앞 단계 행마다 인수를 평가해 행을 스트리밍(`internal/engine/tablefunc.go`) |
+| CLI 셸 | 표준 라이브러리만으로 raw 모드 줄 편집기(히스토리·자동 완성), 출력 형식, 원격 `.tables`/`.schema` |
+| 검증 | 기능별 테스트(`cte_test.go`, `exprindex_test.go`, `tablefunc_test.go`, `cmd/bangdb/shell_test.go`), 덤프·재오픈 왕복, 퍼저 시드 추가, 메모리 저장 방식으로도 실행 |
+
+- **남긴 것:** CTE·뷰의 조건 push-down(지금은 전체를 계산), 상호 재귀, 식 인덱스의 covering 사용과 `ON CONFLICT (식)`, 계산만 하는 `VIRTUAL` 생성 컬럼, 테이블 값 함수가 있는 조인의 재배치, 이름 있는 윈도.
+
 ## 7. 실 프로젝트 적용을 위한 보완 (완료)
 
 6단계 이후 실사용 관점 검토에서 나온 항목입니다. 위험도 순서로 진행합니다.
@@ -17,7 +32,7 @@
 | 7-4 확장 | 트리거(BEFORE/AFTER, UPDATE OF, WHEN, NEW/OLD, RAISE), 부분 인덱스(`CREATE INDEX ... WHERE`) | ✅ |
 | | 대용량 시험 `TestScale`(1천만 행, 4.6 GB): 처음 실행에서 `DELETE` 100만 행 한 문장이 메모리 14 GB로 OOM 종료 → 트랜잭션 spill(`TxMemory`), 청크 단위 체크포인트·WAL 복구, UPDATE/DELETE 대상 행 비보관으로 **단계별 최대 RSS 1 GB 미만** | ✅ |
 | | 장시간 시험 `TestSoak`(10분: 이체 558만 건, 스냅샷 읽기, 정기 백업·검증, VACUUM 동시 실행): 합계 보존·무결성 통과, 최대 힙 31 MB | ✅ |
-| | 식 인덱스(`CREATE INDEX ON t (lower(email))`) — 보류: 대소문자 무시는 `COLLATE NOCASE` 인덱스로 가능 | 남김 |
+| | 식 인덱스(`CREATE INDEX ON t (lower(email))`) — 8단계에서 추가 | ✅ |
 
 **1천만 행 측정 (Linux, 16 GB 메모리, 기본 캐시 32 MiB)**
 
@@ -50,7 +65,7 @@
 | 플래너 (P1-5 ④⑤) | `ANALYZE` 통계 + 비용 기반 조인 순서(쓴 순서보다 2배 이상 쌀 때만), 통계로 인덱스 선택, **covering index**(5만 행 범위 집계 139 → 11 ms) |
 | 기타 이월 | `DB.Prepare`(파싱 1회·문장 전용 플랜), 시계열 블록 compaction, 메모리 테이블 `persist` 스냅샷 |
 
-- **남긴 것:** 단건 조회는 여전히 약 2 µs(실행 상태·행 디코드 할당과 GC가 주 비용). 시계열의 열 단위 집계·블록 요약·태그 인덱스. 자동 장애 조치(합의 기반 리더 선출). 트리거, 식 인덱스, 이름 있는 윈도(`WINDOW w AS`), `json_each` 같은 테이블 값 함수. 통계는 평균값이라 치우친 분포는 잘못 추정할 수 있음.
+- **남긴 것:** 단건 조회는 여전히 약 2 µs(실행 상태·행 디코드 할당과 GC가 주 비용). 시계열의 열 단위 집계·블록 요약·태그 인덱스. 자동 장애 조치(합의 기반 리더 선출). 이름 있는 윈도(`WINDOW w AS`). 통계는 평균값이라 치우친 분포는 잘못 추정할 수 있음. (트리거는 7단계, 식 인덱스·테이블 값 함수는 8단계에서 추가)
 
 ## 0-5. 5단계(시계열 테이블) 완료 기록
 
