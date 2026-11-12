@@ -29,9 +29,13 @@ type Column struct {
 	AutoIncrement bool       `json:"autoinc,omitempty"`
 	Collate       string     `json:"collate,omitempty"` // NOCASE, RTRIM or "" (binary)
 	DefaultSQL    string     `json:"default,omitempty"`
+	// Generated is the expression of a generated column: its value is
+	// computed from the row's other columns whenever the row is written.
+	Generated string `json:"generated,omitempty"`
 
 	defExpr  sql.Expr // parsed DefaultSQL
 	defConst any      // value used to pad rows written before ADD COLUMN
+	genFn    evalFn   // compiled Generated
 }
 
 // Table describes a table. Rows are stored in a B+tree keyed by rowid.
@@ -56,8 +60,10 @@ type Table struct {
 	storeCfg     any        // configuration of a store.ConfigurableKind
 	timeCol      int        // time column of a time-keyed kind, or -1
 	indexes      []*Index
-	checkFns     []evalFn // compiled Checks
-	referencedBy []fkRef  // foreign keys of other tables pointing here
+	checkFns     []evalFn   // compiled Checks
+	referencedBy []fkRef    // foreign keys of other tables pointing here
+	keyExprs     []*keyExpr // the expressions of its expression indexes
+	hasGen       bool       // it has generated columns
 }
 
 // Index is a secondary index on one or more columns. Entries are keyed by
@@ -67,10 +73,13 @@ type Index struct {
 	Name    string   `json:"name"`
 	Table   string   `json:"table"`
 	Columns []string `json:"columns"`
-	Column  string   `json:"column,omitempty"` // legacy single-column form
-	Unique  bool     `json:"unique,omitempty"`
-	Auto    bool     `json:"auto,omitempty"` // created for UNIQUE / PRIMARY KEY
-	Root    uint32   `json:"root"`
+	// Exprs is empty, or has an entry per key part: the SQL of a part that
+	// is an expression (Columns then holds the same text), "" for a column.
+	Exprs  []string `json:"exprs,omitempty"`
+	Column string   `json:"column,omitempty"` // legacy single-column form
+	Unique bool     `json:"unique,omitempty"`
+	Auto   bool     `json:"auto,omitempty"` // created for UNIQUE / PRIMARY KEY
+	Root   uint32   `json:"root"`
 	// Stats (from ANALYZE): Stats[k] is the average number of entries
 	// sharing the values of the first k+1 indexed columns.
 	Stats []float64 `json:"stats,omitempty"`
@@ -80,9 +89,12 @@ type Index struct {
 
 	pred  evalFn // compiled Where
 	defs  []any  // the table's column defaults, for rows shorter than it
-	cols  []int
-	colls []string   // collation per column: keys of collated text are folded
-	kind  store.Kind // the table's storage kind, which also stores its indexes
+	table *Table
+	cols  []int        // per key part: column position, or the pseudo column of an expression
+	exprs []*keyExpr   // per key part: its expression, or nil for a column
+	types []value.Type // per key part: the type its values are keyed as
+	colls []string     // collation per column: keys of collated text are folded
+	kind  store.Kind   // the table's storage kind, which also stores its indexes
 }
 
 // key returns the index key part for row (without the rowid), truncated if
@@ -95,8 +107,8 @@ func (ix *Index) key(row []any) []byte {
 // fullKey is the untruncated key part for row.
 func (ix *Index) fullKey(row []any) []byte {
 	var k []byte
-	for i, c := range ix.cols {
-		k = value.AppendKey(k, foldValue(row[c], ix.colls[i]))
+	for i := range ix.cols {
+		k = value.AppendKey(k, foldValue(ix.value(i, row), ix.colls[i]))
 	}
 	return k
 }
@@ -141,15 +153,15 @@ func truncGroup(part []byte) []byte { return part[:keyLimit+1] }
 // hasNull reports whether any indexed value of row is NULL (such rows never
 // conflict in a UNIQUE index).
 func (ix *Index) hasNull(row []any) bool {
-	for _, c := range ix.cols {
-		if row[c] == nil {
+	for i := range ix.cols {
+		if ix.value(i, row) == nil {
 			return true
 		}
 	}
 	return false
 }
 
-func (ix *Index) columnList() string { return quoteIdents(ix.Columns) }
+func (ix *Index) columnList() string { return ix.keyPartList() }
 
 func quoteIdents(names []string) string {
 	q := make([]string, len(names))
@@ -316,7 +328,7 @@ func (c *Catalog) clone() *Catalog {
 			fk.cols = nil
 			nt.ForeignKeys = append(nt.ForeignKeys, fk)
 		}
-		nt.indexes, nt.checkFns, nt.referencedBy = nil, nil, nil
+		nt.indexes, nt.checkFns, nt.referencedBy, nt.keyExprs = nil, nil, nil, nil
 		n.tables[k] = &nt
 	}
 	for k, tr := range c.triggers {
@@ -329,7 +341,8 @@ func (c *Catalog) clone() *Catalog {
 	for k, ix := range c.indexes {
 		ni := *ix
 		ni.Columns = append([]string(nil), ix.Columns...)
-		ni.cols, ni.colls = nil, nil
+		ni.Exprs = append([]string(nil), ix.Exprs...)
+		ni.cols, ni.colls, ni.exprs, ni.types, ni.table = nil, nil, nil, nil, nil
 		n.indexes[k] = &ni
 	}
 	n.link()
@@ -341,6 +354,8 @@ func (c *Catalog) link() {
 	for _, t := range c.tables {
 		t.indexes = t.indexes[:0]
 		t.referencedBy = t.referencedBy[:0]
+		t.keyExprs = nil
+		t.compileGenerated()
 	}
 	for _, t := range c.tables {
 		for i := range t.ForeignKeys {
@@ -382,15 +397,23 @@ func (ix *Index) resolve(t *Table) {
 		}
 		ix.pred = f
 	}
-	ix.cols, ix.colls = ix.cols[:0], ix.colls[:0]
-	for _, c := range ix.Columns {
+	ix.table = t
+	ix.cols, ix.colls, ix.exprs, ix.types = ix.cols[:0], ix.colls[:0], ix.exprs[:0], ix.types[:0]
+	for k, c := range ix.Columns {
+		if k < len(ix.Exprs) && ix.Exprs[k] != "" {
+			ke, id := t.keyExpr(ix.Exprs[k])
+			ix.cols, ix.colls = append(ix.cols, id), append(ix.colls, "")
+			ix.exprs, ix.types = append(ix.exprs, ke), append(ix.types, ke.typ)
+			continue
+		}
 		i := t.ColIndex(c)
 		ix.cols = append(ix.cols, i)
-		coll := ""
+		coll, typ := "", value.Any
 		if i >= 0 {
-			coll = t.Columns[i].Collate
+			coll, typ = t.Columns[i].Collate, t.Columns[i].Type
 		}
 		ix.colls = append(ix.colls, coll)
+		ix.exprs, ix.types = append(ix.exprs, nil), append(ix.types, typ)
 	}
 }
 
@@ -570,6 +593,9 @@ func (t *Table) createSQL() string {
 		}
 		if col.Unique {
 			sb.WriteString(" UNIQUE")
+		}
+		if col.Generated != "" {
+			sb.WriteString(" GENERATED ALWAYS AS (" + col.Generated + ") STORED")
 		}
 		if col.DefaultSQL != "" {
 			sb.WriteString(" DEFAULT " + col.DefaultSQL)

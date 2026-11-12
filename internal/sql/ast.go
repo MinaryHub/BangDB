@@ -18,6 +18,9 @@ type ColumnDef struct {
 	Collate       string // NOCASE, RTRIM, BINARY or ""
 	Check         Expr   // column CHECK constraint
 	References    *ForeignKey
+	// Generated is the expression of a generated column:
+	// [GENERATED ALWAYS] AS (expr) [STORED | VIRTUAL].
+	Generated Expr
 }
 
 // ForeignKey is FOREIGN KEY (cols) REFERENCES table [(cols)] [actions], or
@@ -101,9 +104,12 @@ type AlterTableDropColumn struct {
 }
 
 type CreateIndex struct {
-	Name        string
-	Table       string
-	Columns     []string
+	Name    string
+	Table   string
+	Columns []string
+	// Exprs is nil, or has an entry per key part: the expression of a part
+	// that is not a plain column (whose Columns entry is then ""), else nil.
+	Exprs       []Expr
 	Unique      bool
 	IfNotExists bool
 	Where       Expr // partial index condition, or nil
@@ -114,7 +120,22 @@ type DropIndex struct {
 	IfExists bool
 }
 
+// With is a WITH clause: common table expressions visible to the statement
+// it precedes.
+type With struct {
+	Recursive bool // WITH RECURSIVE: a CTE may refer to itself
+	CTEs      []CTE
+}
+
+// CTE is one "name [(columns)] AS (select)" of a WITH clause.
+type CTE struct {
+	Name    string
+	Columns []string // optional column names
+	Select  *Select
+}
+
 type Insert struct {
+	With       *With
 	Table      string
 	Columns    []string
 	Rows       [][]Expr // VALUES rows, or
@@ -137,6 +158,13 @@ type TableRef struct {
 	Name  string
 	Alias string
 	Sub   *Select // derived table: FROM (SELECT ...) AS alias
+	// Base marks a name that must be a stored table (the target of UPDATE
+	// or DELETE), never a common table expression.
+	Base bool
+	// Func marks a table-valued function call, FROM name(args): its rows
+	// are computed from Args, which may use the tables to its left.
+	Func bool
+	Args []Expr
 }
 
 type Join struct {
@@ -158,6 +186,7 @@ type OrderItem struct {
 }
 
 type Select struct {
+	With     *With // WITH clause in front of the SELECT
 	Distinct bool
 	Items    []SelectItem
 	From     *TableRef
@@ -185,6 +214,7 @@ type Assignment struct {
 }
 
 type Update struct {
+	With      *With
 	Table     string
 	Sets      []Assignment
 	Where     Expr
@@ -192,6 +222,7 @@ type Update struct {
 }
 
 type Delete struct {
+	With      *With
 	Table     string
 	Where     Expr
 	Returning []SelectItem

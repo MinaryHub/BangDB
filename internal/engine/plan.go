@@ -73,6 +73,11 @@ type level struct {
 	filters []evalFn    // conditions checked once this level's row is bound
 	virtual [][]any     // rows of a derived table (FROM (SELECT ...))
 	stats   *levelStats // set by EXPLAIN ANALYZE
+
+	// A table-valued function (virtual is then empty, not nil): its rows
+	// are computed from fnArgs for every row of the levels before it.
+	fn     *tableFunc
+	fnArgs []evalFn
 }
 
 // levelStats counts what a join level did.
@@ -168,12 +173,22 @@ func chooseAccess(sc *scope, l *level, li int, conds []sql.Expr, c *compiler) (*
 				byCol[col] = append(byCol[col], candidate{col: col, op: x.Op, other: x.R})
 			} else if col, ok := columnOf(x.R, sc, l, li); ok && refsBelow(x.L, sc, li) && coll == colColl(col) {
 				byCol[col] = append(byCol[col], candidate{col: col, op: op, other: x.L})
+			} else if coll != "" {
+				// An expression index keys its values without collation.
+			} else if col, ok := keyExprOf(x.L, sc, l, li); ok && refsBelow(x.R, sc, li) {
+				byCol[col] = append(byCol[col], candidate{col: col, op: x.Op, other: x.R})
+			} else if col, ok := keyExprOf(x.R, sc, l, li); ok && refsBelow(x.L, sc, li) {
+				byCol[col] = append(byCol[col], candidate{col: col, op: op, other: x.L})
 			}
 		case *sql.In:
 			if x.Not {
 				continue
 			}
-			if col, ok := columnOf(x.X, sc, l, li); ok {
+			col, ok := columnOf(x.X, sc, l, li)
+			if !ok {
+				col, ok = keyExprOf(x.X, sc, l, li)
+			}
+			if ok {
 				all := true
 				for _, a := range x.List {
 					all = all && refsBelow(a, sc, li)
@@ -255,16 +270,17 @@ func chooseAccess(sc *scope, l *level, li int, conds []sql.Expr, c *compiler) (*
 			continue // a partial index lacks the rows its WHERE excludes
 		}
 		p := &plan{ix: ix}
-		for _, col := range ix.cols {
-			if l.t.Columns[col].Type == value.Any || find(col, "=") == nil {
+		for i, col := range ix.cols {
+			if ix.types[i] == value.Any || find(col, "=") == nil {
 				break
 			}
 			p.eqN++
 		}
-		if p.eqN < len(ix.cols) && l.t.Columns[ix.cols[p.eqN]].Type != value.Any {
+		if p.eqN < len(ix.cols) && ix.types[p.eqN] != value.Any {
 			next := ix.cols[p.eqN]
 			p.in = find(next, "IN")
-			p.rng = p.in == nil && find(next, "<", "<=", ">", ">=") != nil
+			// Values of an expression of unknown type are not keyed in order.
+			p.rng = p.in == nil && ix.types[p.eqN] != typeExprAny && find(next, "<", "<=", ">", ">=") != nil
 		}
 		switch {
 		case p.eqN == len(ix.cols) && ix.Unique:
@@ -322,21 +338,21 @@ func chooseAccess(sc *scope, l *level, li int, conds []sql.Expr, c *compiler) (*
 	ix := best.ix
 	a := &access{kind: accIndex, ix: ix}
 	var parts []string
-	for _, col := range ix.cols[:best.eqN] {
+	for i, col := range ix.cols[:best.eqN] {
 		f, err := c.compile(find(col, "=").other)
 		if err != nil {
 			return nil, err
 		}
 		a.prefix = append(a.prefix, f)
-		a.prefTyp = append(a.prefTyp, l.t.Columns[col].Type)
-		a.prefColl = append(a.prefColl, l.t.Columns[col].Collate)
-		parts = append(parts, l.t.Columns[col].Name+"=?")
+		a.prefTyp = append(a.prefTyp, ix.types[i])
+		a.prefColl = append(a.prefColl, ix.colls[i])
+		parts = append(parts, ix.Columns[i]+"=?")
 	}
 	if best.eqN < len(ix.cols) {
 		next := ix.cols[best.eqN]
-		a.colTyp = l.t.Columns[next].Type
-		a.coll = l.t.Columns[next].Collate
-		colName := l.t.Columns[next].Name
+		a.colTyp = ix.types[best.eqN]
+		a.coll = ix.colls[best.eqN]
+		colName := ix.Columns[best.eqN]
 		if best.in != nil {
 			fns, err := compileList(best.in.list)
 			if err != nil {
@@ -539,6 +555,8 @@ func keyValue(v any, t value.Type) (any, bool) {
 		return r, true
 	}
 	switch t {
+	case typeExprAny:
+		return normKeyValue(v), v != nil
 	case value.Integer:
 		switch x := v.(type) {
 		case int64:
@@ -681,7 +699,9 @@ func (x *execCtx) scan(t *Table, acc *access, e *env, visit func(rowid int64, ro
 				return false, err
 			}
 			for i, c := range acc.ix.cols {
-				row[c] = vals[i]
+				if c >= 0 {
+					row[c] = vals[i]
+				}
 			}
 			if t.RowidCol >= 0 {
 				row[t.RowidCol] = rowid
@@ -826,6 +846,24 @@ func (x *execCtx) scanUnion(t *Table, acc *access, e *env, visit func(rowid int6
 func (x *execCtx) scanLevel(l *level, e *env, visit func(rowid int64, row []any) (bool, error)) error {
 	if l.acc.kind == accHash {
 		return x.scanHash(l, e, visit)
+	}
+	if l.fn != nil {
+		args := make([]any, len(l.fnArgs))
+		for i, f := range l.fnArgs {
+			v, err := f(e)
+			if err != nil {
+				return err
+			}
+			args[i] = v
+		}
+		n := int64(0)
+		return l.fn.rows(args, func(row []any) (bool, error) {
+			if err := x.tick(); err != nil {
+				return false, err
+			}
+			n++
+			return visit(n, row)
+		})
 	}
 	if l.virtual == nil {
 		return x.scan(l.t, l.acc, e, visit)
@@ -1046,7 +1084,23 @@ func (x *execCtx) buildLevels(from []sql.TableRef, lefts []bool, ons []sql.Expr,
 	for i, ref := range from {
 		var t *Table
 		var virtual [][]any
-		if ref.Sub != nil {
+		var rec *cteDef // the recursive WITH table this level reads
+		var fn *tableFunc
+		if ref.Func {
+			var err error
+			if fn, err = lookupTableFunc(ref.Name, len(ref.Args)); err != nil {
+				return nil, nil, nil, err
+			}
+			t, virtual = fn.table(ref.Name), [][]any{}
+		} else if def := x.cte(ref.Name); def != nil && ref.Sub == nil && !ref.Base {
+			var err error
+			if t, virtual, err = x.cteTable(def, ref.Name); err != nil {
+				return nil, nil, nil, err
+			}
+			if def.running {
+				rec = def
+			}
+		} else if ref.Sub != nil {
 			// Derived table: run the subquery once and scan its rows.
 			res, err := x.execSelect(ref.Sub)
 			if err != nil {
@@ -1083,7 +1137,10 @@ func (x *execCtx) buildLevels(from []sql.TableRef, lefts []bool, ons []sql.Expr,
 			return nil, nil, nil, fmt.Errorf("bangdb: ambiguous table name %s (use an alias)", alias)
 		}
 		seen[strings.ToLower(alias)] = true
-		l := &level{t: t, alias: alias, offset: len(sc.cols), left: lefts[i], virtual: virtual}
+		l := &level{t: t, alias: alias, offset: len(sc.cols), left: lefts[i], virtual: virtual, fn: fn}
+		if rec != nil {
+			rec.levels = append(rec.levels, l)
+		}
 		for _, c := range t.Columns {
 			sc.cols = append(sc.cols, scopeCol{table: strings.ToLower(alias), name: strings.ToLower(c.Name), level: i, coll: c.Collate})
 		}
@@ -1091,6 +1148,29 @@ func (x *execCtx) buildLevels(from []sql.TableRef, lefts []bool, ons []sql.Expr,
 		levels = append(levels, l)
 	}
 	c := &compiler{x: x, sc: sc}
+	for i, l := range levels {
+		if l.fn == nil {
+			continue
+		}
+		// The arguments are evaluated for each row of the tables before.
+		for _, a := range from[i].Args {
+			if containsSubquery(a) || hasAggregate(a) {
+				return nil, nil, nil, fmt.Errorf("bangdb: subqueries and aggregate functions are not allowed in the arguments of %s()", l.fn.name)
+			}
+			lvl, err := maxLevel(a, sc)
+			if err != nil {
+				return nil, nil, nil, err
+			}
+			if lvl >= i {
+				return nil, nil, nil, fmt.Errorf("bangdb: the arguments of %s() may only use tables to its left", l.fn.name)
+			}
+			f, err := c.compile(a)
+			if err != nil {
+				return nil, nil, nil, err
+			}
+			l.fnArgs = append(l.fnArgs, f)
+		}
+	}
 	if order := x.reorderJoin(sc, levels, lefts, ons, where, c); order != nil {
 		// Inner joins only: ON conditions are WHERE conditions, placed by
 		// the tables they use.
@@ -1158,6 +1238,10 @@ func (x *execCtx) buildLevels(from []sql.TableRef, lefts []bool, ons []sql.Expr,
 		accessConds[lvl] = append(accessConds[lvl], cj)
 	}
 	for i, l := range levels {
+		if l.fn != nil {
+			l.acc = &access{kind: accFull, desc: "SCAN FUNCTION " + l.fn.name}
+			continue
+		}
 		if l.virtual != nil {
 			l.acc = &access{kind: accFull, desc: "SCAN SUBQUERY " + l.alias}
 			if a, err := hashAccess(sc, l, i, accessConds[i], c); err != nil {

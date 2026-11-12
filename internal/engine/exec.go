@@ -25,6 +25,9 @@ type execCtx struct {
 	ticks uint32
 	outer *outerCtx // set when planning a subquery
 
+	ctes      *cteScope   // the WITH tables visible to what is being planned
+	curSelect *sql.Select // the SELECT being planned
+
 	fkDepth int          // nesting of foreign key actions and views
 	spill   *spillConfig // nil: defaults
 
@@ -73,10 +76,13 @@ func (x *execCtx) exec(s sql.Stmt) (Result, error) {
 	}
 	switch st := s.(type) {
 	case *sql.Insert:
+		defer x.pushCTEs(st.With)()
 		return x.execInsert(st)
 	case *sql.Update:
+		defer x.pushCTEs(st.With)()
 		return x.execUpdate(st)
 	case *sql.Delete:
+		defer x.pushCTEs(st.With)()
 		return x.execDelete(st)
 	case *sql.CreateTable:
 		return Result{}, x.createTable(st)
@@ -217,6 +223,9 @@ func (x *execCtx) scanAll(t *Table, fn func(rowid int64, row []any) (bool, error
 // does not cover the row.
 func indexEntry(ix *Index, row []any, rowid int64) ([]byte, error) {
 	if ok, err := ix.covers(row); !ok || err != nil {
+		return nil, err
+	}
+	if err := ix.checkExprs(row); err != nil {
 		return nil, err
 	}
 	return append(ix.key(row), value.EncodeRowID(rowid)...), nil
@@ -366,14 +375,29 @@ func (x *execCtx) noteRowid(t *Table, id int64) {
 // prepareRow coerces values to column types and checks NOT NULL and CHECK
 // constraints.
 func prepareRow(t *Table, row []any) error {
-	for i, c := range t.Columns {
-		v, err := value.Coerce(row[i], c.Type)
-		if err != nil {
-			return fmt.Errorf("bangdb: column %s.%s: %w", t.Name, c.Name, err)
+	// Generated columns are computed from the coerced values of the others.
+	for pass := 0; pass < 2; pass++ {
+		gen := pass == 1
+		if gen {
+			if !t.hasGen {
+				break
+			}
+			if err := t.generate(row); err != nil {
+				return err
+			}
 		}
-		row[i] = v
-		if v == nil && (c.NotNull || (c.PrimaryKey && i != t.RowidCol)) {
-			return constraintErr("NOT NULL constraint failed: %s.%s", t.Name, c.Name)
+		for i, c := range t.Columns {
+			if (c.Generated != "") != gen {
+				continue
+			}
+			v, err := value.Coerce(row[i], c.Type)
+			if err != nil {
+				return fmt.Errorf("bangdb: column %s.%s: %w", t.Name, c.Name, err)
+			}
+			row[i] = v
+			if v == nil && (c.NotNull || (c.PrimaryKey && i != t.RowidCol)) {
+				return constraintErr("NOT NULL constraint failed: %s.%s", t.Name, c.Name)
+			}
 		}
 	}
 	return checkRow(t, row)
@@ -406,6 +430,11 @@ func (x *execCtx) insertRow(t *Table, row []any) (int64, error) {
 		x.tx.rowids[strings.ToLower(t.Name)] = rowid + 1
 		if t.RowidCol >= 0 {
 			row[t.RowidCol] = rowid
+			if t.hasGen { // generated columns may use the new id
+				if err := prepareRow(t, row); err != nil {
+					return 0, err
+				}
+			}
 		}
 	}
 	for _, ix := range t.indexes {
@@ -493,6 +522,24 @@ func (x *execCtx) createTable(st *sql.CreateTable) error {
 	}
 	if len(t.Columns) == 0 {
 		return fmt.Errorf("bangdb: table %s must have at least one column", st.Name)
+	}
+	for i, cd := range st.Columns {
+		if cd.Generated == nil {
+			continue
+		}
+		err := t.checkGenerated(i, cd.Generated)
+		if err == nil {
+			t.Columns[i].Generated, err = t.storedText(cd.Generated)
+		}
+		if err == nil {
+			_, err = t.compileStored(cd.Generated)
+		}
+		if err != nil {
+			return fmt.Errorf("bangdb: generated column %s.%s: %w", st.Name, cd.Name, trimBangdb(err))
+		}
+	}
+	if len(t.storedColumns()) == 0 {
+		return fmt.Errorf("bangdb: table %s must have a column that is not generated", st.Name)
 	}
 	resolve := func(names []string) ([]int, []string, error) {
 		var idx []int
@@ -649,6 +696,12 @@ func columnFromDef(cd sql.ColumnDef) (Column, error) {
 	if cd.AutoIncrement && !cd.PrimaryKey {
 		return col, fmt.Errorf("bangdb: AUTOINCREMENT requires PRIMARY KEY")
 	}
+	if cd.Generated != nil {
+		if cd.PrimaryKey || cd.Default != nil {
+			return col, fmt.Errorf("bangdb: generated column %s cannot be a PRIMARY KEY or have a DEFAULT", cd.Name)
+		}
+		col.Generated = sql.FormatExpr(cd.Generated) // completed by the caller, which knows the table
+	}
 	if cd.Default != nil {
 		col.DefaultSQL = sql.FormatExpr(cd.Default)
 		if err := col.prepareDefault(); err != nil {
@@ -720,8 +773,27 @@ func (x *execCtx) createIndex(st *sql.CreateIndex) error {
 	if err != nil {
 		return err
 	}
-	var cols []string
-	for _, name := range st.Columns {
+	var cols, exprs []string
+	for k, name := range st.Columns {
+		if k < len(st.Exprs) && st.Exprs[k] != nil {
+			text, err := t.storedText(st.Exprs[k])
+			if err == nil {
+				_, err = t.compileStored(st.Exprs[k])
+			}
+			if err != nil {
+				return fmt.Errorf("bangdb: expression of index %s: %w", st.Name, trimBangdb(err))
+			}
+			for _, c := range cols {
+				if c == text {
+					return fmt.Errorf("bangdb: expression %s listed twice in index %s", text, st.Name)
+				}
+			}
+			for len(exprs) < len(cols) {
+				exprs = append(exprs, "")
+			}
+			cols, exprs = append(cols, text), append(exprs, text)
+			continue
+		}
 		i := t.ColIndex(name)
 		if i < 0 {
 			return fmt.Errorf("bangdb: no such column: %s.%s", t.Name, name)
@@ -744,7 +816,10 @@ func (x *execCtx) createIndex(st *sql.CreateIndex) error {
 		}
 	}
 	x.mutableCatalog()
-	if err := x.addIndex(&Index{Name: st.Name, Table: t.Name, Columns: cols, Unique: st.Unique, Where: where}); err != nil {
+	for exprs != nil && len(exprs) < len(cols) {
+		exprs = append(exprs, "")
+	}
+	if err := x.addIndex(&Index{Name: st.Name, Table: t.Name, Columns: cols, Exprs: exprs, Unique: st.Unique, Where: where}); err != nil {
 		return err
 	}
 	x.cat.link()
@@ -815,6 +890,9 @@ func (x *execCtx) addColumn(st *sql.AlterTableAddColumn) error {
 	}
 	if st.Column.Check != nil || st.Column.References != nil {
 		return fmt.Errorf("bangdb: cannot add a column with a CHECK or REFERENCES constraint")
+	}
+	if st.Column.Generated != nil {
+		return fmt.Errorf("bangdb: cannot add a generated column (existing rows would lack its value)")
 	}
 	col, err := columnFromDef(st.Column)
 	if err != nil {
@@ -937,9 +1015,17 @@ func (x *execCtx) renameColumn(st *sql.AlterTableRenameColumn) error {
 			t.PrimaryKey[k] = st.New
 		}
 	}
+	for k := range t.Columns {
+		if g := t.Columns[k].Generated; g != "" {
+			t.Columns[k].Generated = renameInExpr(g, old, st.New)
+		}
+	}
 	for _, ix := range t.indexes {
 		for k, c := range ix.Columns {
-			if strings.EqualFold(c, old) {
+			if k < len(ix.Exprs) && ix.Exprs[k] != "" {
+				ix.Exprs[k] = renameInExpr(ix.Exprs[k], old, st.New)
+				ix.Columns[k] = ix.Exprs[k]
+			} else if strings.EqualFold(c, old) {
 				ix.Columns[k] = st.New
 			}
 		}

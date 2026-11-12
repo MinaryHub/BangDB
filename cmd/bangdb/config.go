@@ -43,6 +43,8 @@ type config struct {
 	backupInterval      time.Duration
 	backupKeep          int
 
+	history string
+
 	connect     string
 	configFile  string
 	showVersion bool
@@ -87,6 +89,7 @@ func (c *config) settings() []setting {
 		{"backup_dir", "take scheduled, verified backups into this directory", &c.backupDir},
 		{"backup_interval", "time between scheduled backups (default 24h)", &c.backupInterval},
 		{"backup_keep", "number of scheduled backups kept (0 = all)", &c.backupKeep},
+		{"history", "file keeping the lines entered in the shell (default: .bangdb_history in the home directory; off = none)", &c.history},
 	}
 }
 

@@ -42,6 +42,7 @@ func (x *execCtx) dump(w *bufio.Writer) error {
 	for _, t := range tables {
 		fmt.Fprintf(w, "%s\n", t.createSQL())
 		prefix := "INSERT INTO " + sql.QuoteIdent(t.Name) + " VALUES("
+		stored := t.storedColumns() // generated columns are computed on import
 		var last int64
 		err := x.rows(t).Scan(store.MinRowid, store.MaxRowid, false, func(rowid int64, row []any) (bool, error) {
 			if err := x.tick(); err != nil {
@@ -49,11 +50,12 @@ func (x *execCtx) dump(w *bufio.Writer) error {
 			}
 			last = rowid
 			w.WriteString(prefix)
-			for i, v := range padRow(t, row) {
+			row = padRow(t, row)
+			for i, c := range stored {
 				if i > 0 {
 					w.WriteByte(',')
 				}
-				w.WriteString(sqlLiteral(v))
+				w.WriteString(sqlLiteral(row[c]))
 			}
 			_, err := w.WriteString(");\n")
 			return err == nil, err
@@ -569,8 +571,8 @@ func (db *DB) ImportCSV(ctx context.Context, table string, r io.Reader, opts *CS
 	if header != nil {
 		cols = header
 	} else {
-		for _, c := range t.Columns {
-			cols = append(cols, c.Name)
+		for _, i := range t.storedColumns() {
+			cols = append(cols, t.Columns[i].Name)
 		}
 	}
 	quoted := make([]string, len(cols))

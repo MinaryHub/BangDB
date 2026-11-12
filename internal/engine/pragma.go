@@ -20,6 +20,8 @@ const metaUserVersion = 3
 //	table_info(t)         columns of t
 //	index_list(t)         indexes of t
 //	index_info(i)         columns of index i
+//	schema [(name)]       the CREATE statements of everything (or of one table
+//	                      with its indexes and triggers, or one view)
 //	integrity_check       "ok" or the problems found
 //	foreign_keys [= on]   always on (1)
 //	journal_mode [= wal]  always "wal"
@@ -81,6 +83,46 @@ func (x *execCtx) pragma(st *sql.Pragma) (Result, error) {
 			res.Rows = append(res.Rows, []any{p})
 		}
 		return res, nil
+	case "schema":
+		want := ""
+		if st.Value != nil {
+			v, err := arg()
+			if err != nil {
+				return Result{}, err
+			}
+			want, _ = v.(string)
+		}
+		res := Result{Columns: []string{"type", "name", "tbl_name", "sql"}}
+		add := func(typ, name, table, sql string) {
+			if want == "" || strings.EqualFold(want, name) || strings.EqualFold(want, table) {
+				res.Rows = append(res.Rows, []any{typ, name, table, sql})
+			}
+		}
+		tables := x.cat.TableNames()
+		sort.Strings(tables)
+		for _, n := range tables {
+			t := x.cat.table(n)
+			add("table", t.Name, t.Name, t.createSQL())
+			ixs := append([]*Index(nil), t.indexes...)
+			sort.Slice(ixs, func(i, j int) bool { return ixs[i].Name < ixs[j].Name })
+			for _, ix := range ixs {
+				if !ix.Auto {
+					add("index", ix.Name, t.Name, ix.createSQL())
+				}
+			}
+		}
+		views := x.cat.ViewNames()
+		sort.Strings(views)
+		for _, n := range views {
+			add("view", x.cat.view(n).Name, x.cat.view(n).Name, x.cat.DescribeView(n))
+		}
+		for _, n := range x.cat.TriggerNames() {
+			add("trigger", n, x.cat.trigger(n).Table, x.cat.DescribeTrigger(n))
+		}
+		if want != "" && len(res.Rows) == 0 {
+			return Result{}, fmt.Errorf("bangdb: no such table or view: %s", want)
+		}
+		return res, nil
 	case "table_list":
 		res := Result{Columns: []string{"name", "type", "kind", "ncol"}}
 		for _, n := range x.cat.TableNames() {
@@ -136,6 +178,10 @@ func (x *execCtx) pragma(st *sql.Pragma) (Result, error) {
 		t := x.cat.table(ix.Table)
 		res := Result{Columns: []string{"seqno", "cid", "name"}}
 		for i, c := range ix.cols {
+			if c < 0 { // an expression, as SQLite reports it
+				res.Rows = append(res.Rows, []any{int64(i), int64(-2), nil})
+				continue
+			}
 			res.Rows = append(res.Rows, []any{int64(i), int64(c), t.Columns[c].Name})
 		}
 		return res, nil

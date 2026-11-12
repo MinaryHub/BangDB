@@ -12,10 +12,13 @@ Go로 작성된 **경량 임베디드 관계형 데이터베이스**입니다. �
 - 순수 Go, 표준 라이브러리만 사용 (`go.mod`에 require 없음)
 - 단일 파일 + WAL(`<파일>-wal`) 기반 **원자적·내구성 있는 커밋과 크래시 복구**, 페이지 체크섬, 무결성 검사(`IntegrityCheck`)
 - `:memory:` 인메모리 모드
-- SQL: `CREATE/DROP TABLE`, `ALTER TABLE ADD/RENAME/DROP COLUMN`, `RENAME TO`, `CREATE [UNIQUE] INDEX`(복합·부분 `WHERE`), `CREATE TRIGGER`, `CREATE VIEW`, `INSERT/SELECT/UPDATE/DELETE`, `JOIN`(INNER/LEFT/CROSS), `GROUP BY/HAVING`, `ORDER BY`, `LIMIT/OFFSET`, `DISTINCT`, `CASE`, `IN`, `BETWEEN`, `LIKE`, `COLLATE`, 집계/스칼라/날짜 함수, `EXPLAIN`, `VACUUM`
+- SQL: `CREATE/DROP TABLE`, `ALTER TABLE ADD/RENAME/DROP COLUMN`, `RENAME TO`, `CREATE [UNIQUE] INDEX`(복합·부분 `WHERE`·식 `(lower(email))`), `CREATE TRIGGER`, `CREATE VIEW`, `INSERT/SELECT/UPDATE/DELETE`, `JOIN`(INNER/LEFT/CROSS), `GROUP BY/HAVING`, `ORDER BY`, `LIMIT/OFFSET`, `DISTINCT`, `CASE`, `IN`, `BETWEEN`, `LIKE`, `COLLATE`, 집계/스칼라/날짜 함수, `EXPLAIN`, `VACUUM`
   - 서브쿼리(스칼라·`EXISTS`·`IN (SELECT)`·`FROM (SELECT)`, 상관 포함), `UNION [ALL]`/`INTERSECT`/`EXCEPT`
+  - CTE: `WITH name [(cols)] AS (…)`, 재귀 `WITH RECURSIVE`(트리·그래프 탐색, 수열 생성) — `SELECT`/`INSERT`/`UPDATE`/`DELETE` 앞, 서브쿼리·뷰 안
+  - 테이블 값 함수: `json_each`, `json_tree`, `generate_series` — 왼쪽 테이블의 컬럼을 인수로 받음(`FROM posts p, json_each(p.tags) j`)
   - UPSERT(`ON CONFLICT … DO NOTHING / DO UPDATE`), `INSERT OR IGNORE/REPLACE`, `INSERT … SELECT`, `RETURNING`
   - 제약: 복합 `PRIMARY KEY`/`UNIQUE`, `NOT NULL`, `DEFAULT`, `CHECK`, `FOREIGN KEY`(`CASCADE`/`SET NULL`/`RESTRICT`)
+  - 생성 컬럼: `total DECIMAL(12,2) GENERATED ALWAYS AS (price * qty) STORED`
   - 파라미터: `?`, `?N`, `:name`, `@name`, `$name`
   - 윈도우 함수(`OVER (PARTITION BY … ORDER BY … ROWS/RANGE …)`), JSON 함수와 `->`/`->>` 연산자
   - 트리거: `CREATE TRIGGER … BEFORE|AFTER INSERT|UPDATE [OF cols]|DELETE ON t [WHEN cond] BEGIN … END`, `NEW`/`OLD`, `RAISE(ABORT, '메시지')`·`RAISE(IGNORE)`
@@ -311,8 +314,13 @@ bangdb app.db                         # 대화형 셸 (.help, .tables, .schema, 
 bangdb -serve :7070 app.db            # primary로 replica 접속 허용
 bangdb -replica-of host:7070 r.db     # 읽기 전용 replica (.repl 상태, .promote 승격)
 bangdb app.db "SELECT COUNT(*) FROM users"
+bangdb app.db ".mode json" "SELECT * FROM users"   # 점 명령을 SQL 앞에 줄 수 있음
 cat schema.sql | bangdb app.db
 ```
+
+- **줄 편집·히스토리·자동 완성** (터미널에서 실행할 때): 방향키·Home/End·Ctrl-A/E/K/U/W로 줄을 고치고, ↑/↓로 이전에 입력한 줄을 불러오고, Tab으로 테이블·컬럼 이름과 SQL 키워드·점 명령을 완성합니다(후보가 여럿이면 Tab을 한 번 더 눌러 목록 표시, `users.` 뒤에서는 그 테이블의 컬럼). Ctrl-C는 입력 중인 줄을 버리고 Ctrl-D는 종료합니다. 입력한 줄은 홈 디렉터리의 `.bangdb_history`에 남습니다 — 파일을 바꾸려면 `-history 경로`(또는 `BANGDB_HISTORY`), 남기지 않으려면 `-history off`. 외부 라이브러리 없이 구현했고 Linux·macOS·FreeBSD·Windows 콘솔에서 동작합니다. 파이프 입력이나 그 밖의 환경에서는 이전처럼 한 줄씩 읽습니다.
+- **출력 형식**: `.mode table`(기본) `| list | csv | json | line`, `.headers on|off`(list·csv의 컬럼 이름 줄), `.output FILE`(결과를 파일로, 인수 없이 다시 화면으로). 표 형식은 한글 같은 전각 문자의 폭을 맞춥니다.
+- **원격 셸**(`-connect bangdb://…`)에서도 `.tables`, `.schema [이름]`, `.mode`, `.headers`, `.output`을 쓸 수 있습니다(`PRAGMA table_list`, `PRAGMA schema` 사용).
 
 ```
 bangdb> EXPLAIN SELECT * FROM users u JOIN orders o ON o.user_id = u.id WHERE u.id = 1;
@@ -381,6 +389,41 @@ GROUP BY t, host ORDER BY t;
 - JSON (문서는 TEXT): `json`, `json_valid`, `json_type`, `json_extract`, `json_array_length`, `json_array`, `json_object`, `json_set/insert/replace/remove`, `json_patch`, `json_quote`, 집계 `json_group_array/json_group_object`, 연산자 `doc -> 'path'`(JSON) / `doc ->> 'path'`(SQL 값). 경로는 `$.a.b[0]`, `$[#-1]`, `$."키"`; `->`의 오른쪽은 `'$…'` 경로·키 이름·배열 번호. JSON 함수나 `->`의 결과를 다른 JSON 생성 함수에 넣으면 문자열이 아니라 JSON으로 들어감
 - 비교 규칙: `COLLATE NOCASE`(유니코드 대소문자 무시), `RTRIM`, `BINARY` — 컬럼에 지정하면 인덱스도 같은 규칙을 따름
 
+## CTE, 식 인덱스, 생성 컬럼, 테이블 값 함수
+
+```sql
+-- CTE: 이름 붙인 서브쿼리. 뒤의 CTE는 앞의 것을 볼 수 있고, 여러 번 참조해도 한 번만 계산
+WITH totals (uid, total) AS (SELECT user_id, SUM(amount) FROM orders GROUP BY user_id),
+     top AS (SELECT MAX(total) AS m FROM totals)
+SELECT u.name FROM users u JOIN totals t ON t.uid = u.id, top WHERE t.total = top.m;
+
+-- 재귀 CTE: 조직도에서 CTO 아래 전원 (세대 순)
+WITH RECURSIVE under (id, name, depth) AS (
+  SELECT id, name, 0 FROM emp WHERE name = 'cto'
+  UNION ALL
+  SELECT e.id, e.name, u.depth + 1 FROM emp e JOIN under u ON e.boss = u.id
+)
+SELECT name, depth FROM under;
+
+-- 식 인덱스: 조건을 인덱스의 식과 같게 쓰면 사용됨 (EXPLAIN으로 확인)
+CREATE UNIQUE INDEX users_email ON users (lower(email));
+SELECT id FROM users WHERE lower(email) = 'kim@example.com';
+CREATE INDEX docs_city ON docs (json_extract(body, '$.city'));
+
+-- 생성 컬럼: 행을 쓸 때 계산해 저장. 일반 컬럼처럼 인덱스·제약을 걸 수 있음
+CREATE TABLE items (id INTEGER PRIMARY KEY, price DECIMAL(10,2), qty INT,
+  total DECIMAL(12,2) GENERATED ALWAYS AS (price * qty) STORED);
+
+-- 테이블 값 함수: JSON 배열을 행으로 펼쳐 조인
+SELECT p.id, j.value AS tag FROM posts p, json_each(p.tags) j WHERE j.value = 'go';
+SELECT value FROM generate_series(1, 10, 2);
+```
+
+- **CTE**: 본문은 바깥 질의의 행을 보지 않습니다(상관 불가). `WITH RECURSIVE`의 본문은 `초기 SELECT UNION [ALL] 재귀 SELECT` 형태이고, 재귀 SELECT는 자기 이름을 `FROM`에서 한 번만(서브쿼리 안은 불가) 참조합니다. `UNION`은 이미 나온 행을 버리므로 순환 그래프에서도 끝납니다. 본문의 `LIMIT`은 결과 행 수를 제한하고(끝없는 재귀를 멈춤), `ORDER BY`는 SQLite처럼 다음에 처리할 행의 순서를 정합니다(`ORDER BY depth DESC`면 깊이 우선). `RECURSIVE` 없이 자기 이름을 쓰면 같은 이름의 테이블을 가리킵니다. 끝나지 않는 재귀는 쿼리 타임아웃으로 중단하세요.
+- **식 인덱스**: 식에는 그 테이블의 컬럼과 결정적 함수만 쓸 수 있습니다(서브쿼리·집계·파라미터·`'now'` 불가). 결과 타입을 아는 식(`lower(x)`·`a || b`는 TEXT, `length(x)`는 INTEGER, `CAST(x AS t)`는 t)은 컬럼과 똑같이 동등·`IN`·범위 조건과 `ORDER BY`에 쓰이고, 그 밖의 식(`a + b`, `json_extract(…)`, `doc ->> 'k'`)은 **동등·`IN` 조건에만** 쓰입니다 — 범위 검색이 필요하면 `CAST(json_extract(doc, '$.age') AS INTEGER)`처럼 타입을 정하세요. 복합 인덱스에 컬럼과 섞어 쓸 수 있고(`(lower(name), age)`), `UNIQUE`와 부분 인덱스(`WHERE`)도 됩니다. 식을 계산할 수 없는 행(예: 문자열에 대한 산술)은 저장이 거부됩니다.
+- **생성 컬럼**: `[GENERATED ALWAYS] AS (식) [STORED | VIRTUAL]`. 두 종류 모두 행을 쓸 때 계산해 저장합니다(`VIRTUAL`도 저장됨). 식은 같은 행의 일반 컬럼만 참조합니다(다른 생성 컬럼 불가). 값을 직접 넣거나 바꿀 수 없고, 컬럼 목록 없는 `INSERT INTO t VALUES (…)`에는 일반 컬럼 값만 줍니다. `ALTER TABLE ADD COLUMN`으로는 추가할 수 없습니다.
+- **`json_each(json [, path])`**는 배열·객체의 바로 아래 항목마다, **`json_tree`**는 그 아래 전체에 대해 한 행을 냅니다. 컬럼은 SQLite와 같습니다: `key`, `value`, `type`, `atom`, `id`, `parent`, `fullkey`, `path`. **`generate_series(start, stop [, step])`**의 컬럼은 `value`. 인수에는 왼쪽에 있는 테이블의 컬럼을 쓸 수 있고(서브쿼리는 불가), `LEFT JOIN json_each(…) j ON 1`로 항목이 없는 행도 남길 수 있습니다.
+
 ## 스키마 예
 
 ```sql
@@ -434,7 +477,11 @@ INSERT INTO emp (dept_id, email, salary) VALUES (1, 'kim@example.com', 100)
 
 > 보완 항목과 개발 계획은 [docs/ROADMAP.md](docs/ROADMAP.md)를 보세요.
 
-- 식(expression) 인덱스, 이름 있는 윈도(`WINDOW w AS`), `json_each` 같은 테이블 값 함수, `INSTEAD OF` 트리거 미지원. 외래 키 동작(CASCADE 등)으로 바뀐 행은 트리거를 실행하지 않음
+- 이름 있는 윈도(`WINDOW w AS`), `INSTEAD OF` 트리거 미지원. 외래 키 동작(CASCADE 등)으로 바뀐 행은 트리거를 실행하지 않음
+- CTE는 참조될 때 전체를 계산해 메모리에 둠(조건 push-down 없음). 서로를 참조하는 재귀 CTE(상호 재귀)와 바깥 질의에 상관된 CTE는 미지원
+- 타입을 알 수 없는 식의 인덱스는 동등·`IN` 조건에만 쓰임. 식 인덱스는 covering index로 쓰이지 않고, `ON CONFLICT (식)` 대상으로 지정할 수 없음(대상 없는 `ON CONFLICT DO NOTHING`·`INSERT OR REPLACE`는 동작)
+- 생성 컬럼은 항상 저장되며(`VIRTUAL` 포함) 다른 생성 컬럼을 참조할 수 없음
+- 테이블 값 함수가 있는 조인은 쓴 순서대로 실행(재배치 없음)
 - 윈도우 함수가 있는 조회는 결과 행을 메모리에 모은 뒤 계산
 - 조인 순서는 비용 추정(테이블 크기, `ANALYZE` 통계)으로 정하되 `LEFT JOIN`과 `ORDER BY … LIMIT` 질의는 쓴 순서를 따름 → `EXPLAIN`으로 확인. 통계는 평균값이라 값 분포가 치우친 컬럼은 잘못 추정할 수 있음
 - 외래 키는 항상 적용되며 즉시 검사 (지연 제약·`SET DEFAULT` 없음). 부모 테이블을 먼저 만들어야 함

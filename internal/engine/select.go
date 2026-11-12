@@ -60,10 +60,11 @@ func (x *execCtx) planSelect(st *sql.Select) (*selectPlan, error) {
 		}
 	}
 	var err error
-	keep := x.keepJoinOrder
+	keep, cur := x.keepJoinOrder, x.curSelect
 	x.keepJoinOrder = len(st.OrderBy) > 0 && st.Limit != nil
+	x.curSelect = st
 	p.sc, p.levels, p.final, err = x.buildLevels(from, lefts, ons, st.Where)
-	x.keepJoinOrder = keep
+	x.keepJoinOrder, x.curSelect = keep, cur
 	if err != nil {
 		return nil, err
 	}
@@ -317,6 +318,9 @@ func (r *selectRun) small() bool {
 }
 
 func (x *execCtx) prepareSelect(st *sql.Select) (*selectRun, error) {
+	if st.With != nil {
+		defer x.pushCTEs(st.With)()
+	}
 	if len(st.Compound) > 0 {
 		return x.prepareCompound(st)
 	}
@@ -771,6 +775,7 @@ func (x *execCtx) explain(s sql.Stmt) (Result, error) {
 	var levels []*level
 	switch st := s.(type) {
 	case *sql.Select:
+		defer x.pushCTEs(st.With)()
 		p, err := x.planSelect(st)
 		if err != nil {
 			return res, err
@@ -788,14 +793,16 @@ func (x *execCtx) explain(s sql.Stmt) (Result, error) {
 			}
 		}()
 	case *sql.Update:
-		_, lv, _, err := x.buildLevels([]sql.TableRef{{Name: st.Table}}, []bool{false}, []sql.Expr{nil}, st.Where)
+		defer x.pushCTEs(st.With)()
+		_, lv, _, err := x.buildLevels([]sql.TableRef{{Name: st.Table, Base: true}}, []bool{false}, []sql.Expr{nil}, st.Where)
 		if err != nil {
 			return res, err
 		}
 		levels = lv
 		add("UPDATE " + st.Table)
 	case *sql.Delete:
-		_, lv, _, err := x.buildLevels([]sql.TableRef{{Name: st.Table}}, []bool{false}, []sql.Expr{nil}, st.Where)
+		defer x.pushCTEs(st.With)()
+		_, lv, _, err := x.buildLevels([]sql.TableRef{{Name: st.Table, Base: true}}, []bool{false}, []sql.Expr{nil}, st.Where)
 		if err != nil {
 			return res, err
 		}
@@ -955,9 +962,7 @@ func (x *execCtx) execInsert(st *sql.Insert) (Result, error) {
 	}
 	positions := make([]int, 0, len(t.Columns))
 	if len(st.Columns) == 0 {
-		for i := range t.Columns {
-			positions = append(positions, i)
-		}
+		positions = t.storedColumns()
 	} else {
 		used := map[int]bool{}
 		for _, name := range st.Columns {
@@ -967,6 +972,9 @@ func (x *execCtx) execInsert(st *sql.Insert) (Result, error) {
 			}
 			if used[i] {
 				return Result{}, fmt.Errorf("bangdb: column %s specified more than once", name)
+			}
+			if t.Columns[i].Generated != "" {
+				return Result{}, fmt.Errorf("bangdb: cannot INSERT into generated column %s", t.Columns[i].Name)
 			}
 			used[i] = true
 			positions = append(positions, i)
@@ -1038,6 +1046,9 @@ func (x *execCtx) execInsert(st *sql.Insert) (Result, error) {
 			i := t.ColIndex(a.Column)
 			if i < 0 {
 				return Result{}, fmt.Errorf("bangdb: no such column: %s", a.Column)
+			}
+			if t.Columns[i].Generated != "" {
+				return Result{}, fmt.Errorf("bangdb: cannot UPDATE generated column %s", t.Columns[i].Name)
 			}
 			f, err := c.compile(a.Value)
 			if err != nil {
@@ -1136,6 +1147,11 @@ func (x *execCtx) execInsert(st *sql.Insert) (Result, error) {
 					}
 					setCols[i] = s.col
 				}
+				if t.hasGen { // for the triggers; computed again when stored
+					if err := t.generate(newRow); err != nil {
+						return Result{}, err
+					}
+				}
 				if err := x.fireTriggers(t, "BEFORE", "UPDATE", hit.rowid, old, hit.rowid, newRow, setCols); err != nil {
 					if errors.Is(err, errIgnoreRow) {
 						continue
@@ -1195,7 +1211,7 @@ type target struct {
 const collectRowsKept = 4096
 
 func (x *execCtx) collect(t *Table, where sql.Expr) (*scope, []target, error) {
-	sc, levels, final, err := x.buildLevels([]sql.TableRef{{Name: t.Name}}, []bool{false}, []sql.Expr{nil}, where)
+	sc, levels, final, err := x.buildLevels([]sql.TableRef{{Name: t.Name, Base: true}}, []bool{false}, []sql.Expr{nil}, where)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -1288,6 +1304,9 @@ func (x *execCtx) execUpdate(st *sql.Update) (Result, error) {
 		if i < 0 {
 			return Result{}, fmt.Errorf("bangdb: no such column: %s", a.Column)
 		}
+		if t.Columns[i].Generated != "" {
+			return Result{}, fmt.Errorf("bangdb: cannot UPDATE generated column %s", t.Columns[i].Name)
+		}
 		f, err := c.compile(a.Value)
 		if err != nil {
 			return Result{}, err
@@ -1325,6 +1344,11 @@ func (x *execCtx) execUpdate(st *sql.Update) (Result, error) {
 				return Result{}, err
 			}
 			newRow[s.col] = v
+		}
+		if t.hasGen && triggers { // for the triggers; computed again when stored
+			if err := t.generate(newRow); err != nil {
+				return Result{}, err
+			}
 		}
 		if err := x.fireTriggers(t, "BEFORE", "UPDATE", tg.rowid, tg.row, tg.rowid, newRow, setCols); err != nil {
 			if errors.Is(err, errIgnoreRow) {
@@ -1425,6 +1449,7 @@ func (x *execCtx) writeRow(t *Table, rowid int64, row []any) error {
 // ORDER BY may name result columns or use their ordinal positions.
 func (x *execCtx) prepareCompound(st *sql.Select) (*selectRun, error) {
 	head := *st
+	head.With = nil // already visible
 	head.Compound, head.OrderBy, head.Limit, head.Offset = nil, nil, nil, nil
 	first, err := x.prepareSelect(&head)
 	if err != nil {
@@ -1573,7 +1598,14 @@ func (p *selectPlan) useScanOrder(st *sql.Select) bool {
 		}
 		ref, ok := e.(*sql.ColumnRef)
 		if !ok {
-			return false
+			// An index expression of known type is keyed in value order.
+			id, ok := keyExprOf(e, p.sc, l, 0)
+			if !ok || l.t.keyExprs[-2-id].typ == typeExprAny {
+				return false
+			}
+			cols = append(cols, id)
+			dirs = append(dirs, o.Desc)
+			continue
 		}
 		idx, err := p.sc.resolve(ref.Table, ref.Name)
 		if err != nil || p.sc.cols[idx].level != 0 {
@@ -1627,8 +1659,8 @@ func (p *selectPlan) useScanOrder(st *sql.Select) bool {
 		for i, c := range want {
 			pos := from + i
 			switch {
-			case c < 0 && pos == len(ix.cols) && i == len(want)-1:
-			case pos >= len(ix.cols) || c < 0 || ix.cols[pos] != c:
+			case c == -1 && pos == len(ix.cols) && i == len(want)-1:
+			case pos >= len(ix.cols) || c == -1 || ix.cols[pos] != c:
 				return false
 			}
 		}
