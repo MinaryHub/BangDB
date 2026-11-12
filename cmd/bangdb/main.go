@@ -4,6 +4,7 @@
 //
 //	bangdb app.db                         # interactive shell
 //	bangdb app.db "SELECT 1"              # run SQL and exit
+//	bangdb app.db ".mode csv" "SELECT 1"  # shell commands may precede the SQL
 //	echo "SELECT 1;" | bangdb app.db
 //	bangdb -serve :7070 app.db            # shell + serve replicas
 //	bangdb -replica-of host:7070 r.db     # read-only mirror of a primary
@@ -20,18 +21,18 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"syscall"
 	"time"
-	"unicode/utf8"
 
 	"github.com/knoxxr/bangdb"
 	"github.com/knoxxr/bangdb/auth"
 	"github.com/knoxxr/bangdb/client"
 	"github.com/knoxxr/bangdb/httpapi"
 	"github.com/knoxxr/bangdb/internal/engine"
-	"github.com/knoxxr/bangdb/internal/value"
 	"github.com/knoxxr/bangdb/replication"
 	"github.com/knoxxr/bangdb/server"
 )
@@ -68,7 +69,7 @@ options:`)
 		return
 	}
 	if cfg.connect != "" {
-		os.Exit(remoteShell(cfg.connect, fs.Args()))
+		os.Exit(remoteShell(cfg.connect, fs.Args(), cfg.history))
 	}
 	if cfg.addUser != "" {
 		if err := addUser(cfg.addUser, cfg.usersFile); err != nil {
@@ -124,7 +125,7 @@ options:`)
 	}
 	defer pub.Close()
 	db := pub.Engine()
-	sh := &shell{db: db, conn: localSession{db.Conn()}, out: os.Stdout}
+	sh := newShell(db, localSession{db.Conn()}, os.Stdout)
 	if serving && password == "" && users == nil {
 		logger.Warn("serving without a password or users file: anyone who can reach the port has full access")
 	}
@@ -221,8 +222,8 @@ options:`)
 		fmt.Fprintf(os.Stderr, "replicating from %s (read-only)\n", cfg.replicaOf)
 	}
 	if len(args) > 0 {
-		ok := sh.run(strings.Join(args, " "))
-		sh.conn.Close()
+		ok := sh.runArgs(args)
+		sh.close()
 		if !ok {
 			os.Exit(1)
 		}
@@ -232,8 +233,8 @@ options:`)
 	if interactive {
 		fmt.Printf("BangDB %s — %s\nEnter \".help\" for usage hints.\n", bangdb.Version, path)
 	}
-	sh.loop(os.Stdin, interactive)
-	sh.conn.Close()
+	sh.interact(os.Stdin, interactive, cfg.history)
+	sh.close()
 	if serving || cfg.serve != "" || cfg.replicaOf != "" {
 		// Keep replicating after stdin is closed until interrupted.
 		sig := make(chan os.Signal, 1)
@@ -271,7 +272,7 @@ func (r remoteSession) InTx() bool   { return r.c.InTx() }
 func (r remoteSession) Close() error { return r.c.Close() }
 
 // remoteShell runs the shell (SQL only) against a server.
-func remoteShell(dsn string, args []string) int {
+func remoteShell(dsn string, args []string, history string) int {
 	addr, opts, err := client.ParseDSN(dsn)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
@@ -283,9 +284,10 @@ func remoteShell(dsn string, args []string) int {
 		return 1
 	}
 	defer c.Close()
-	sh := &shell{conn: remoteSession{c}, out: os.Stdout}
+	sh := newShell(nil, remoteSession{c}, os.Stdout)
+	defer sh.closeOutput()
 	if len(args) > 0 {
-		if !sh.run(strings.Join(args, " ")) {
+		if !sh.runArgs(args) {
 			return 1
 		}
 		return 0
@@ -294,51 +296,165 @@ func remoteShell(dsn string, args []string) int {
 	if interactive {
 		fmt.Printf("BangDB shell — %s\nEnter \".help\" for usage hints.\n", addr)
 	}
-	sh.loop(os.Stdin, interactive)
+	sh.interact(os.Stdin, interactive, history)
 	return 0
 }
 
 type shell struct {
 	db      *engine.DB // nil for a remote shell
 	conn    session
-	out     io.Writer
+	out     io.Writer // messages and, unless redirected, results
 	timer   bool
 	primary *replication.Primary
 	replica *replication.Replica
+
+	mode    string       // output mode of query results (see printResult)
+	headers bool         // list and csv modes: print the column names
+	results io.Writer    // where results go (.output); nil = out
+	outFile *os.File     // the file behind results
+	names   *schemaNames // cache for completion; dropped after every statement
 }
 
+func newShell(db *engine.DB, conn session, out io.Writer) *shell {
+	return &shell{db: db, conn: conn, out: out, mode: "table", headers: true}
+}
+
+func (s *shell) close() {
+	s.closeOutput()
+	s.conn.Close()
+}
+
+// closeOutput ends a redirection of the results (.output).
+func (s *shell) closeOutput() {
+	if s.outFile != nil {
+		if err := s.outFile.Close(); err != nil {
+			fmt.Fprintln(s.out, "Error:", err)
+		}
+	}
+	s.outFile, s.results = nil, nil
+}
+
+// runArgs runs the command line's arguments: shell commands (starting
+// with a dot) one by one, the others together as SQL.
+func (s *shell) runArgs(args []string) bool {
+	ok := true
+	var parts []string
+	flush := func() {
+		if len(parts) > 0 {
+			ok = s.run(strings.Join(parts, " ")) && ok
+			parts = nil
+		}
+	}
+	for _, a := range args {
+		if cmd := strings.TrimSpace(a); strings.HasPrefix(cmd, ".") {
+			flush()
+			if !s.command(cmd) {
+				return ok
+			}
+			continue
+		}
+		parts = append(parts, a)
+	}
+	flush()
+	return ok
+}
+
+func (s *shell) prompt(continued bool) string {
+	switch {
+	case continued:
+		return "   ...> "
+	case s.conn.InTx():
+		return "bangdb*> "
+	}
+	return "bangdb> "
+}
+
+// feed handles one line of input: a shell command, or SQL collected in buf
+// until a line ends with ';'. It returns false to leave the shell.
+func (s *shell) feed(buf *strings.Builder, line string) bool {
+	if buf.Len() == 0 && strings.HasPrefix(strings.TrimSpace(line), ".") {
+		return s.command(strings.TrimSpace(line))
+	}
+	buf.WriteString(line)
+	buf.WriteString("\n")
+	if strings.HasSuffix(strings.TrimSpace(line), ";") {
+		s.run(buf.String())
+		buf.Reset()
+	}
+	return true
+}
+
+// interact reads commands and SQL from in until its end. On a terminal
+// that allows it, lines are read with editing keys, a history kept in the
+// history file ("off": not kept; "": .bangdb_history in the home
+// directory) and Tab completion.
+func (s *shell) interact(in *os.File, interactive bool, history string) {
+	if interactive {
+		if restore, ok := rawMode(); ok {
+			restore()
+			s.edit(newLineEditor(in, os.Stdout, historyFile(history)))
+			return
+		}
+	}
+	s.loop(in, interactive)
+}
+
+// historyFile returns the path of the shell's history file, or "".
+func historyFile(setting string) string {
+	switch strings.ToLower(setting) {
+	case "off", "none", "no", "false":
+		return ""
+	case "":
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return ""
+		}
+		return filepath.Join(home, ".bangdb_history")
+	}
+	return setting
+}
+
+// edit is the interactive loop with a line editor.
+func (s *shell) edit(ed *lineEditor) {
+	ed.complete = func(line []rune, pos int) (int, []string) {
+		if s.names == nil {
+			s.names = loadNames(s.conn.Exec)
+		}
+		return completions(line, pos, s.names)
+	}
+	var buf strings.Builder
+	for {
+		line, err := ed.readLine(s.prompt(buf.Len() > 0))
+		if err == errAbandoned {
+			buf.Reset()
+			continue
+		}
+		if err != nil {
+			break
+		}
+		if !s.feed(&buf, line) {
+			return
+		}
+	}
+	if strings.TrimSpace(buf.String()) != "" {
+		s.run(buf.String())
+	}
+}
+
+// loop reads plain lines (a pipe, a file, or a terminal without raw mode).
 func (s *shell) loop(in io.Reader, interactive bool) {
 	sc := bufio.NewScanner(in)
 	sc.Buffer(make([]byte, 1<<20), 1<<26)
 	var buf strings.Builder
 	prompt := func() {
-		if !interactive {
-			return
-		}
-		switch {
-		case buf.Len() > 0:
-			fmt.Print("   ...> ")
-		case s.conn.InTx():
-			fmt.Print("bangdb*> ")
-		default:
-			fmt.Print("bangdb> ")
+		if interactive {
+			fmt.Print(s.prompt(buf.Len() > 0))
 		}
 	}
 	prompt()
 	for sc.Scan() {
-		line := sc.Text()
-		if buf.Len() == 0 && strings.HasPrefix(strings.TrimSpace(line), ".") {
-			if !s.command(strings.TrimSpace(line)) {
-				return
-			}
-			prompt()
-			continue
-		}
-		buf.WriteString(line)
-		buf.WriteString("\n")
-		if strings.HasSuffix(strings.TrimSpace(line), ";") {
-			s.run(buf.String())
-			buf.Reset()
+		if !s.feed(&buf, sc.Text()) {
+			return
 		}
 		prompt()
 	}
@@ -350,7 +466,7 @@ func (s *shell) loop(in io.Reader, interactive bool) {
 func (s *shell) command(cmd string) bool {
 	fields := strings.Fields(cmd)
 	switch fields[0] {
-	case ".quit", ".exit", ".help", ".timer", ".version":
+	case ".quit", ".exit", ".help", ".timer", ".version", ".mode", ".headers", ".output", ".tables", ".schema":
 	default:
 		if s.db == nil {
 			fmt.Fprintf(s.out, "%s is not available on a remote connection\n", fields[0])
@@ -363,6 +479,9 @@ func (s *shell) command(cmd string) bool {
 	case ".help":
 		fmt.Fprintln(s.out, `.tables            list tables and views
 .schema [table]    show table definitions
+.mode [MODE]       output of query results: table, list, csv, json or line
+.headers on|off    column names as the first line (list and csv modes)
+.output [FILE]     write query results to FILE (no FILE: back to the screen)
 .timer on|off      show execution time
 .backup FILE       write an online backup to FILE
 .check             verify checksums, structure and indexes
@@ -375,31 +494,62 @@ func (s *shell) command(cmd string) bool {
 .repl              show replication status
 .promote           turn this replica into a writable primary
 .quit              exit
-SQL statements end with ';'. BEGIN/COMMIT/ROLLBACK are supported.`)
+SQL statements end with ';'. BEGIN/COMMIT/ROLLBACK are supported.
+On a terminal: arrow keys edit the line and recall earlier ones, Tab completes
+names and keywords, Ctrl-C abandons the line, Ctrl-D leaves.`)
 	case ".tables":
-		names := append(s.db.Catalog().TableNames(), s.db.Catalog().ViewNames()...)
+		res, err := s.conn.Exec("PRAGMA table_list")
+		if err != nil {
+			fmt.Fprintln(s.out, "Error:", err)
+			break
+		}
+		var names []string
+		for _, row := range res.Rows {
+			names = append(names, fmt.Sprint(row[0]))
+		}
 		sort.Strings(names)
 		fmt.Fprintln(s.out, strings.Join(names, "  "))
 	case ".schema":
-		cat := s.db.Catalog()
-		names := append(cat.TableNames(), cat.ViewNames()...)
-		sort.Strings(names)
-		for _, n := range names {
-			if len(fields) > 1 && !strings.EqualFold(fields[1], n) {
-				continue
-			}
-			if d := cat.Describe(n); d != "" {
-				fmt.Fprintln(s.out, d)
-			} else {
-				fmt.Fprintln(s.out, cat.DescribeView(n))
-			}
+		q := "PRAGMA schema"
+		if len(fields) > 1 {
+			q += "('" + strings.ReplaceAll(fields[1], "'", "''") + "')"
 		}
-		for _, n := range cat.TriggerNames() {
-			if len(fields) > 1 && !strings.EqualFold(fields[1], n) {
-				continue
-			}
-			fmt.Fprintln(s.out, cat.DescribeTrigger(n))
+		res, err := s.conn.Exec(q)
+		if err != nil {
+			fmt.Fprintln(s.out, "Error:", err)
+			break
 		}
+		for _, row := range res.Rows {
+			fmt.Fprintln(s.out, row[len(row)-1])
+		}
+	case ".mode":
+		if len(fields) < 2 {
+			fmt.Fprintln(s.out, s.mode)
+			break
+		}
+		mode := strings.ToLower(fields[1])
+		if !slices.Contains(outputModes, mode) {
+			fmt.Fprintf(s.out, "unknown mode %s (use %s)\n", fields[1], strings.Join(outputModes, ", "))
+			break
+		}
+		s.mode = mode
+	case ".headers":
+		if len(fields) < 2 || fields[1] != "on" && fields[1] != "off" {
+			fmt.Fprintln(s.out, "usage: .headers on|off")
+			break
+		}
+		s.headers = fields[1] == "on"
+	case ".output":
+		s.closeOutput()
+		if len(fields) < 2 || fields[1] == "stdout" {
+			break
+		}
+		f, err := os.Create(fields[1])
+		if err != nil {
+			fmt.Fprintln(s.out, "Error:", err)
+			break
+		}
+		s.outFile, s.results = f, f
 	case ".backup":
 		if len(fields) < 2 {
 			fmt.Fprintln(s.out, "usage: .backup FILE")
@@ -546,12 +696,20 @@ SQL statements end with ';'. BEGIN/COMMIT/ROLLBACK are supported.`)
 func (s *shell) run(src string) bool {
 	start := time.Now()
 	res, err := s.conn.Exec(src)
+	s.names = nil // the statement may have changed the schema
 	if err != nil {
 		fmt.Fprintln(s.out, "Error:", err)
 		return false
 	}
 	if len(res.Columns) > 0 {
-		printTable(s.out, res)
+		w := s.results
+		if w == nil {
+			w = s.out
+		}
+		if err := printResult(w, res, s.mode, s.headers); err != nil {
+			fmt.Fprintln(s.out, "Error:", err)
+			return false
+		}
 	} else if res.RowsAffected > 0 {
 		fmt.Fprintf(s.out, "%d row(s) affected\n", res.RowsAffected)
 	}
@@ -559,38 +717,6 @@ func (s *shell) run(src string) bool {
 		fmt.Fprintf(s.out, "Run Time: %s\n", time.Since(start))
 	}
 	return true
-}
-
-func printTable(w io.Writer, res engine.Result) {
-	widths := make([]int, len(res.Columns))
-	cells := make([][]string, len(res.Rows))
-	for i, c := range res.Columns {
-		widths[i] = utf8.RuneCountInString(c)
-	}
-	for r, row := range res.Rows {
-		cells[r] = make([]string, len(row))
-		for i, v := range row {
-			cells[r][i] = value.Format(v)
-			widths[i] = max(widths[i], utf8.RuneCountInString(cells[r][i]))
-		}
-	}
-	line := func(vals []string) {
-		parts := make([]string, len(vals))
-		for i, v := range vals {
-			parts[i] = v + strings.Repeat(" ", widths[i]-utf8.RuneCountInString(v))
-		}
-		fmt.Fprintln(w, strings.TrimRight(strings.Join(parts, " | "), " "))
-	}
-	line(res.Columns)
-	seps := make([]string, len(widths))
-	for i, n := range widths {
-		seps[i] = strings.Repeat("-", n)
-	}
-	fmt.Fprintln(w, strings.Join(seps, "-+-"))
-	for _, row := range cells {
-		line(row)
-	}
-	fmt.Fprintf(w, "(%d row%s)\n", len(res.Rows), map[bool]string{true: "", false: "s"}[len(res.Rows) == 1])
 }
 
 func fatal(err error) {
