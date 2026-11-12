@@ -25,6 +25,9 @@ type execCtx struct {
 	ticks uint32
 	outer *outerCtx // set when planning a subquery
 
+	ctes      *cteScope   // the WITH tables visible to what is being planned
+	curSelect *sql.Select // the SELECT being planned
+
 	fkDepth int          // nesting of foreign key actions and views
 	spill   *spillConfig // nil: defaults
 
@@ -73,10 +76,13 @@ func (x *execCtx) exec(s sql.Stmt) (Result, error) {
 	}
 	switch st := s.(type) {
 	case *sql.Insert:
+		defer x.pushCTEs(st.With)()
 		return x.execInsert(st)
 	case *sql.Update:
+		defer x.pushCTEs(st.With)()
 		return x.execUpdate(st)
 	case *sql.Delete:
+		defer x.pushCTEs(st.With)()
 		return x.execDelete(st)
 	case *sql.CreateTable:
 		return Result{}, x.createTable(st)

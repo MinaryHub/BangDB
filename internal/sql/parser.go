@@ -214,6 +214,8 @@ func (p *parser) parseStmt() (Stmt, error) {
 		return &Explain{Stmt: s, Analyze: analyze}, nil
 	case p.isKw("SELECT"):
 		return p.parseSelect()
+	case p.isKw("WITH"):
+		return p.parseWithStmt()
 	case p.acceptKw("INSERT"):
 		return p.parseInsert()
 	case p.acceptKw("UPDATE"):
@@ -671,7 +673,7 @@ func (p *parser) parseInsert() (Stmt, error) {
 			return nil, err
 		}
 	}
-	if p.isKw("SELECT") {
+	if p.isSelectStart() {
 		if ins.Select, err = p.parseSelect(); err != nil {
 			return nil, err
 		}
@@ -864,13 +866,121 @@ func (p *parser) parseTableRef() (TableRef, error) {
 	return tr, err
 }
 
-// parseSelect parses a full SELECT: one or more cores combined with set
-// operators, then ORDER BY / LIMIT / OFFSET.
+// isSelectStart reports whether a query follows: SELECT, or WITH and the
+// name of a common table expression.
+func (p *parser) isSelectStart() bool {
+	if p.isKw("SELECT") {
+		return true
+	}
+	t := p.peekAt(1)
+	return p.isKw("WITH") && (t.kind == tIdent || t.kind == tQuotedIdent)
+}
+
+// parseWith parses the rest of a WITH clause (after WITH):
+// [RECURSIVE] name [(columns)] AS (select), ...
+func (p *parser) parseWith() (*With, error) {
+	w := &With{}
+	// RECURSIVE is the keyword unless it is itself the table's name.
+	if p.isKw("RECURSIVE") && !p.isKwAt(1, "AS") && p.peekAt(1).text != "(" {
+		p.next()
+		w.Recursive = true
+	}
+	for {
+		var c CTE
+		var err error
+		if c.Name, err = p.ident(); err != nil {
+			return nil, err
+		}
+		for _, o := range w.CTEs {
+			if strings.EqualFold(o.Name, c.Name) {
+				return nil, p.errf("duplicate WITH table name %s", c.Name)
+			}
+		}
+		if p.peek().kind == tOp && p.peek().text == "(" {
+			if c.Columns, err = p.parseColumnList(); err != nil {
+				return nil, err
+			}
+		}
+		if err := p.expectKw("AS"); err != nil {
+			return nil, err
+		}
+		// Materialization hints are accepted and ignored.
+		if !p.acceptKw("MATERIALIZED") {
+			p.acceptKw("NOT", "MATERIALIZED")
+		}
+		if err := p.expectOp("("); err != nil {
+			return nil, err
+		}
+		if c.Select, err = p.parseSelect(); err != nil {
+			return nil, err
+		}
+		if err := p.expectOp(")"); err != nil {
+			return nil, err
+		}
+		w.CTEs = append(w.CTEs, c)
+		if !p.acceptOp(",") {
+			return w, nil
+		}
+	}
+}
+
+// parseWithStmt parses a statement that starts with a WITH clause: a
+// SELECT, INSERT, UPDATE or DELETE.
+func (p *parser) parseWithStmt() (Stmt, error) {
+	p.next()
+	w, err := p.parseWith()
+	if err != nil {
+		return nil, err
+	}
+	switch {
+	case p.isKw("SELECT"):
+		s, err := p.parseSelect()
+		if err != nil {
+			return nil, err
+		}
+		s.With = w
+		return s, nil
+	case p.acceptKw("INSERT"):
+		st, err := p.parseInsert()
+		if err != nil {
+			return nil, err
+		}
+		st.(*Insert).With = w
+		return st, nil
+	case p.acceptKw("UPDATE"):
+		st, err := p.parseUpdate()
+		if err != nil {
+			return nil, err
+		}
+		st.(*Update).With = w
+		return st, nil
+	case p.acceptKw("DELETE"):
+		st, err := p.parseDelete()
+		if err != nil {
+			return nil, err
+		}
+		st.(*Delete).With = w
+		return st, nil
+	}
+	return nil, p.errf("expected SELECT, INSERT, UPDATE or DELETE after WITH")
+}
+
+// parseSelect parses a full SELECT: an optional WITH clause, one or more
+// cores combined with set operators, then ORDER BY / LIMIT / OFFSET.
 func (p *parser) parseSelect() (*Select, error) {
+	var with *With
+	if p.isKw("WITH") {
+		p.next()
+		var err error
+		if with, err = p.parseWith(); err != nil {
+			return nil, err
+		}
+	}
 	s, err := p.parseSelectCore()
 	if err != nil {
 		return nil, err
 	}
+	s.With = with
 	for {
 		var op string
 		switch {
@@ -1101,7 +1211,7 @@ func (p *parser) parseComparison() (Expr, error) {
 			if err := p.expectOp("("); err != nil {
 				return nil, err
 			}
-			if p.isKw("SELECT") {
+			if p.isSelectStart() {
 				sub, err := p.parseSelect()
 				if err != nil {
 					return nil, err
@@ -1297,7 +1407,7 @@ func (p *parser) parsePrimary() (Expr, error) {
 	case tOp:
 		if t.text == "(" {
 			p.next()
-			if p.isKw("SELECT") {
+			if p.isSelectStart() {
 				sub, err := p.parseSelect()
 				if err != nil {
 					return nil, err

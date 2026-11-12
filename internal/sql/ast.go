@@ -114,7 +114,22 @@ type DropIndex struct {
 	IfExists bool
 }
 
+// With is a WITH clause: common table expressions visible to the statement
+// it precedes.
+type With struct {
+	Recursive bool // WITH RECURSIVE: a CTE may refer to itself
+	CTEs      []CTE
+}
+
+// CTE is one "name [(columns)] AS (select)" of a WITH clause.
+type CTE struct {
+	Name    string
+	Columns []string // optional column names
+	Select  *Select
+}
+
 type Insert struct {
+	With       *With
 	Table      string
 	Columns    []string
 	Rows       [][]Expr // VALUES rows, or
@@ -137,6 +152,9 @@ type TableRef struct {
 	Name  string
 	Alias string
 	Sub   *Select // derived table: FROM (SELECT ...) AS alias
+	// Base marks a name that must be a stored table (the target of UPDATE
+	// or DELETE), never a common table expression.
+	Base bool
 }
 
 type Join struct {
@@ -158,6 +176,7 @@ type OrderItem struct {
 }
 
 type Select struct {
+	With     *With // WITH clause in front of the SELECT
 	Distinct bool
 	Items    []SelectItem
 	From     *TableRef
@@ -185,6 +204,7 @@ type Assignment struct {
 }
 
 type Update struct {
+	With      *With
 	Table     string
 	Sets      []Assignment
 	Where     Expr
@@ -192,6 +212,7 @@ type Update struct {
 }
 
 type Delete struct {
+	With      *With
 	Table     string
 	Where     Expr
 	Returning []SelectItem

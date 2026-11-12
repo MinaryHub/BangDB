@@ -42,6 +42,8 @@ func FuzzExec(f *testing.F) {
 		"CREATE VIEW v (a, b) AS SELECT name, COUNT(*) FROM t GROUP BY name; SELECT * FROM v JOIN t ON t.name = v.a WHERE b > 0; DROP VIEW v",
 		"SELECT name, n, rank() OVER (PARTITION BY n % 2 ORDER BY name DESC), sum(n) OVER (ORDER BY id ROWS BETWEEN 1 PRECEDING AND 2 FOLLOWING), lag(name, 2, 'z') OVER (ORDER BY n), ntile(2) OVER () FROM t ORDER BY 3",
 		"SELECT json_set(json_object('a', name, 'n', json_array(n, id)), '$.n[#]', 1, '$.x.y', 2) -> 'n' ->> 1, json_group_array(json_extract('{\"k\":[1,2]}', '$.k[#-1]')) FROM t GROUP BY n",
+		"WITH RECURSIVE c(n, p) AS (SELECT 1, 'a' UNION SELECT n + 1, p || name FROM c JOIN t ON t.id = c.n WHERE n < 5 ORDER BY 2 DESC LIMIT 9 OFFSET 1), d AS (SELECT MAX(n) m FROM c) SELECT * FROM c, d WHERE n IN (SELECT tid FROM u) UNION ALL SELECT n, NULL, 0 FROM c",
+		"WITH x AS (SELECT id FROM t WHERE n > 0) UPDATE u SET tid = (SELECT MAX(id) FROM x) WHERE tid IN (SELECT id FROM x); WITH x AS (SELECT 1 AS a) INSERT INTO u (tid) SELECT a FROM x; WITH t AS (SELECT 2 AS id) DELETE FROM t WHERE id IN (SELECT id FROM t)",
 	} {
 		f.Add(s)
 	}

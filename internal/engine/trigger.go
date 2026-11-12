@@ -187,7 +187,7 @@ func (x *execCtx) fireTriggers(t *Table, timing, event string, oldID int64, old 
 		}
 		y := *x // the trigger's statements run in this statement's transaction
 		y.outer, y.triggerDepth, y.args = outer, x.triggerDepth+1, nil
-		y.lastTable, y.plans = nil, nil
+		y.lastTable, y.plans, y.ctes = nil, nil, nil
 		if def.When != nil {
 			c := &compiler{x: &y, sc: &scope{outer: outer}}
 			f, err := c.compile(def.When)

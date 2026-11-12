@@ -60,10 +60,11 @@ func (x *execCtx) planSelect(st *sql.Select) (*selectPlan, error) {
 		}
 	}
 	var err error
-	keep := x.keepJoinOrder
+	keep, cur := x.keepJoinOrder, x.curSelect
 	x.keepJoinOrder = len(st.OrderBy) > 0 && st.Limit != nil
+	x.curSelect = st
 	p.sc, p.levels, p.final, err = x.buildLevels(from, lefts, ons, st.Where)
-	x.keepJoinOrder = keep
+	x.keepJoinOrder, x.curSelect = keep, cur
 	if err != nil {
 		return nil, err
 	}
@@ -317,6 +318,9 @@ func (r *selectRun) small() bool {
 }
 
 func (x *execCtx) prepareSelect(st *sql.Select) (*selectRun, error) {
+	if st.With != nil {
+		defer x.pushCTEs(st.With)()
+	}
 	if len(st.Compound) > 0 {
 		return x.prepareCompound(st)
 	}
@@ -771,6 +775,7 @@ func (x *execCtx) explain(s sql.Stmt) (Result, error) {
 	var levels []*level
 	switch st := s.(type) {
 	case *sql.Select:
+		defer x.pushCTEs(st.With)()
 		p, err := x.planSelect(st)
 		if err != nil {
 			return res, err
@@ -788,14 +793,16 @@ func (x *execCtx) explain(s sql.Stmt) (Result, error) {
 			}
 		}()
 	case *sql.Update:
-		_, lv, _, err := x.buildLevels([]sql.TableRef{{Name: st.Table}}, []bool{false}, []sql.Expr{nil}, st.Where)
+		defer x.pushCTEs(st.With)()
+		_, lv, _, err := x.buildLevels([]sql.TableRef{{Name: st.Table, Base: true}}, []bool{false}, []sql.Expr{nil}, st.Where)
 		if err != nil {
 			return res, err
 		}
 		levels = lv
 		add("UPDATE " + st.Table)
 	case *sql.Delete:
-		_, lv, _, err := x.buildLevels([]sql.TableRef{{Name: st.Table}}, []bool{false}, []sql.Expr{nil}, st.Where)
+		defer x.pushCTEs(st.With)()
+		_, lv, _, err := x.buildLevels([]sql.TableRef{{Name: st.Table, Base: true}}, []bool{false}, []sql.Expr{nil}, st.Where)
 		if err != nil {
 			return res, err
 		}
@@ -1195,7 +1202,7 @@ type target struct {
 const collectRowsKept = 4096
 
 func (x *execCtx) collect(t *Table, where sql.Expr) (*scope, []target, error) {
-	sc, levels, final, err := x.buildLevels([]sql.TableRef{{Name: t.Name}}, []bool{false}, []sql.Expr{nil}, where)
+	sc, levels, final, err := x.buildLevels([]sql.TableRef{{Name: t.Name, Base: true}}, []bool{false}, []sql.Expr{nil}, where)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -1425,6 +1432,7 @@ func (x *execCtx) writeRow(t *Table, rowid int64, row []any) error {
 // ORDER BY may name result columns or use their ordinal positions.
 func (x *execCtx) prepareCompound(st *sql.Select) (*selectRun, error) {
 	head := *st
+	head.With = nil // already visible
 	head.Compound, head.OrderBy, head.Limit, head.Offset = nil, nil, nil, nil
 	first, err := x.prepareSelect(&head)
 	if err != nil {

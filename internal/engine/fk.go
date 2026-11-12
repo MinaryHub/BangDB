@@ -584,10 +584,10 @@ func (x *execCtx) viewTable(v *View, alias string) (*Table, [][]any, error) {
 	if x.fkDepth > maxFKDepth {
 		return nil, nil, fmt.Errorf("bangdb: view %s is nested too deeply (or refers to itself)", v.Name)
 	}
-	outer := x.outer
-	x.outer = nil // a view never sees the enclosing query
+	outer, ctes := x.outer, x.ctes
+	x.outer, x.ctes = nil, nil // a view never sees the enclosing query
 	res, err := x.execSelect(v.sel)
-	x.outer = outer
+	x.outer, x.ctes = outer, ctes
 	if err != nil {
 		return nil, nil, fmt.Errorf("bangdb: view %s: %w", v.Name, err)
 	}

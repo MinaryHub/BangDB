@@ -1046,7 +1046,16 @@ func (x *execCtx) buildLevels(from []sql.TableRef, lefts []bool, ons []sql.Expr,
 	for i, ref := range from {
 		var t *Table
 		var virtual [][]any
-		if ref.Sub != nil {
+		var rec *cteDef // the recursive WITH table this level reads
+		if def := x.cte(ref.Name); def != nil && ref.Sub == nil && !ref.Base {
+			var err error
+			if t, virtual, err = x.cteTable(def, ref.Name); err != nil {
+				return nil, nil, nil, err
+			}
+			if def.running {
+				rec = def
+			}
+		} else if ref.Sub != nil {
 			// Derived table: run the subquery once and scan its rows.
 			res, err := x.execSelect(ref.Sub)
 			if err != nil {
@@ -1084,6 +1093,9 @@ func (x *execCtx) buildLevels(from []sql.TableRef, lefts []bool, ons []sql.Expr,
 		}
 		seen[strings.ToLower(alias)] = true
 		l := &level{t: t, alias: alias, offset: len(sc.cols), left: lefts[i], virtual: virtual}
+		if rec != nil {
+			rec.levels = append(rec.levels, l)
+		}
 		for _, c := range t.Columns {
 			sc.cols = append(sc.cols, scopeCol{table: strings.ToLower(alias), name: strings.ToLower(c.Name), level: i, coll: c.Collate})
 		}
