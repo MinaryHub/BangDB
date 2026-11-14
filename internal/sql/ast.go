@@ -73,6 +73,22 @@ type DropTrigger struct {
 	IfExists bool
 }
 
+// CreateClosure is CREATE CLOSURE [IF NOT EXISTS] name ON table (child,
+// parent): a table called name whose rows (anc, des, depth) are kept equal
+// to the transitive closure of the child -> parent edges of table.
+type CreateClosure struct {
+	Name        string
+	IfNotExists bool
+	Table       string
+	Child       string
+	Parent      string
+}
+
+type DropClosure struct {
+	Name     string
+	IfExists bool
+}
+
 type DropView struct {
 	Name     string
 	IfExists bool
@@ -278,6 +294,8 @@ func (*Rollback) stmt()               {}
 func (*Explain) stmt()                {}
 func (*CreateTrigger) stmt()          {}
 func (*DropTrigger) stmt()            {}
+func (*CreateClosure) stmt()          {}
+func (*DropClosure) stmt()            {}
 
 // ---- Expressions ----
 

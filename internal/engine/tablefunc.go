@@ -19,6 +19,7 @@ import (
 //	json_each(json [, path])   the members of an array or object (one level)
 //	json_tree(json [, path])   the element and everything below it
 //	generate_series(start, stop [, step])   the integers from start to stop
+//	graph_walk, graph_path                  traversals of an edge table (graphfunc.go)
 //
 // json_each and json_tree have the columns of SQLite: key, value, type,
 // atom, id, parent, fullkey and path.
@@ -30,6 +31,8 @@ type tableFunc struct {
 	// rows passes the function's rows for args to emit, which returns false
 	// to stop.
 	rows func(args []any, emit func(row []any) (bool, error)) error
+	// xrows is rows for a function that reads the database (set instead).
+	xrows func(x *execCtx, args []any, emit func(row []any) (bool, error)) error
 }
 
 var jsonEachCols = []string{"key", "value", "type", "atom", "id", "parent", "fullkey", "path"}

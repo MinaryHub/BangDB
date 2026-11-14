@@ -2,7 +2,12 @@
 
 버전은 `주.부.커밋수`입니다(`VERSION` + 커밋 수, `bangdb -version`). 호환성 약속은 [docs/COMPATIBILITY.md](docs/COMPATIBILITY.md).
 
-## 다음 릴리스 — SQL 완성도, 셸
+## 다음 릴리스 — SQL 완성도, 셸, 온톨로지
+
+- **폐포 테이블** `CREATE CLOSURE 이름 ON 원본 (자식열, 부모열)` / `DROP CLOSURE`: 계층(트리 또는 다중 부모 DAG)의 모든 (조상, 자손, 최단 거리)를 자동 유지하는 읽기 전용 테이블. 원본 변경은 문장 끝에 바뀐 노드와 그 아래만 재계산(바뀐 행만 고침), 순환을 만드는 간선은 문장 실패. 이름 변경 추적, 덤프(`CREATE CLOSURE`로 출력)·VACUUM·재오픈·복제 지원, `IntegrityCheck`가 독립 재계산과 비교, `PRAGMA schema`에 표시, `Tx.ForceClosureWrite`(복구용). 카탈로그 항목 `h` 추가: 이 기능을 쓴 파일은 이전 버전에서 열 수 없음
+- **그래프 탐색 함수** `graph_walk(간선, 출발열, 도착열, 시작 [, 최대깊이 [, 방향]])`(node, depth, parent)와 `graph_path(…, 시작, 목표 …)`(step, node): 너비 우선·순환 안전, 테이블(인덱스 조회) 또는 뷰(문장마다 한 번 계산)를 간선으로 사용. 테이블 값 함수가 DB를 읽을 수 있게 됨
+- **뷰·CTE·파생 테이블 조건 push-down**: 바깥의 `열 = 상수`·`열 IN (상수…)`를 본문 각 SELECT의 WHERE(그룹이면 HAVING)로, 재귀 CTE는 그대로 넘겨지는 열에 한해 시작 SELECT로. `EXPLAIN`에 `(pushed …)` 표시. 10만 개 계층의 폐포 뷰 조회 2.6 s → 17 ms
+- 온톨로지 사용 안내 [docs/ONTOLOGY.md](docs/ONTOLOGY.md)
 
 - **CTE**: `WITH name [(cols)] AS (…)`와 **`WITH RECURSIVE`** — `SELECT`/`INSERT`/`UPDATE`/`DELETE` 앞, 서브쿼리·파생 테이블·뷰 안. 재귀는 SQLite 방식(큐에서 행을 꺼내 재귀 SELECT에 넣음): `UNION`은 중복 제거, 본문의 `LIMIT`/`OFFSET`은 결과 제한, `ORDER BY`는 처리 순서(깊이 우선·너비 우선)
 - **식 인덱스**: `CREATE [UNIQUE] INDEX … ON t (lower(email), …) [WHERE …]`. 조건·`ORDER BY`가 인덱스의 식과 같으면 플래너가 사용. 타입을 아는 식은 범위·정렬에도, 그 밖의 식은 동등·`IN`에 사용. `PRAGMA index_info`는 식 부분을 SQLite처럼 `cid = -2`로 표시

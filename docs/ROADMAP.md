@@ -2,6 +2,19 @@
 
 > 이 문서가 BangDB의 **기준 개발 계획**입니다. [시계열·인메모리 검토](REVIEW-timeseries-inmemory.md)의 단계 계획은 여기 통합되었습니다.
 
+## 9. 온톨로지·그래프 (완료)
+
+온톨로지(개념 계층 + 관계)를 SQL 위에서 다룰 수 있게 한 단계입니다. 검토 시점 측정(10만 개 계층, 30만 트리플)에서 재귀 CTE·트리플 조인 자체는 충분히 빨랐지만, 계층 폐포를 뷰로 정의하고 한 개념을 물으면 전체 폐포를 계산해 2.6 s가 걸렸습니다.
+
+| 항목 | 결과 |
+|---|---|
+| 조건 push-down | 뷰·CTE·파생 테이블에 바깥의 `열 = 상수`·`열 IN (상수…)`를 넣음. 일반 본문은 각 SELECT의 WHERE/HAVING, 재귀 CTE는 반복 단계가 그대로 넘기는 열만 시작 SELECT에. LIMIT/OFFSET·윈도·`*`·행에 따른 값은 제외, 바깥 조건은 유지 (`internal/engine/pushdown.go`). 2.6 s → 17 ms |
+| 폐포 테이블 | `CREATE CLOSURE`: (anc, des, depth) 읽기 전용 테이블, PK (anc, des) + (des, anc, depth) 인덱스. 원본 행 변경을 `insertRow`/`removeRow`/`updateRow`에서 기록(자식·부모 열이 바뀐 UPDATE만), 문장 끝에 바뀐 노드 + 그 아래를 Kahn 순서로 재계산해 다른 행만 고침, 순환은 문장 실패. 덤프·VACUUM·복제·`IntegrityCheck`(BFS 독립 재계산) (`internal/engine/closure.go`). 5만 노드: 생성 4 s, 조회 1 ms, 잎 추가 0.3 ms, 3.8천 노드 하위 트리 이동 0.33 s |
+| 그래프 함수 | `graph_walk`/`graph_path`: 너비 우선, out/in/both, 깊이 제한, LIMIT에서 멈춤. 간선이 인덱스 있는 테이블이면 노드마다 조회, 뷰나 인덱스 없는 테이블은 문장마다 한 번 메모리로. 테이블 값 함수가 실행 맥락을 받도록 확장 (`internal/engine/graphfunc.go`) |
+| 검증 | push-down 켬/끔 결과 비교 32개 질의(LEFT JOIN·UNION·GROUP BY·윈도·LIMIT·NOCASE·타입 혼합·중첩 뷰), 폐포 무작위 편집 400단계마다 BFS 재계산과 비교(외래 키 연쇄, 롤백, 순환 거부, 덤프·재오픈·VACUUM), 그래프 함수를 무작위 그래프에서 방향·깊이·인덱스 유무별로 직접 탐색과 비교. 메모리 저장 방식·경합 검사로도 실행 |
+
+- **남긴 것:** 다른 테이블 값에 따른 조건의 push-down(행마다 재계산이 필요), SPARQL 부분집합 → SQL 변환기(별도 패키지 후보), 라벨 전문 검색 색인, IRI 사전 인코딩을 하는 트리플 전용 저장 방식, 폐포 조회 시 covering 인덱스 키에서 직접 읽기(하위 트리 이동 비용의 대부분).
+
 ## 8. SQL 완성도와 셸 (완료)
 
 7단계 이후 "현재 제약 사항"에 남아 있던 SQL 공백과 CLI 사용성을 보완했습니다.
@@ -15,7 +28,7 @@
 | CLI 셸 | 표준 라이브러리만으로 raw 모드 줄 편집기(히스토리·자동 완성), 출력 형식, 원격 `.tables`/`.schema` |
 | 검증 | 기능별 테스트(`cte_test.go`, `exprindex_test.go`, `tablefunc_test.go`, `cmd/bangdb/shell_test.go`), 덤프·재오픈 왕복, 퍼저 시드 추가, 메모리 저장 방식으로도 실행 |
 
-- **남긴 것:** CTE·뷰의 조건 push-down(지금은 전체를 계산), 상호 재귀, 식 인덱스의 covering 사용과 `ON CONFLICT (식)`, 계산만 하는 `VIRTUAL` 생성 컬럼, 테이블 값 함수가 있는 조인의 재배치, 이름 있는 윈도.
+- **남긴 것:** CTE·뷰의 조건 push-down(→ 9단계에서 상수 조건 구현), 상호 재귀, 식 인덱스의 covering 사용과 `ON CONFLICT (식)`, 계산만 하는 `VIRTUAL` 생성 컬럼, 테이블 값 함수가 있는 조인의 재배치, 이름 있는 윈도.
 
 ## 7. 실 프로젝트 적용을 위한 보완 (완료)
 

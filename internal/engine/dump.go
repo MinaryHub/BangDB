@@ -39,6 +39,21 @@ func (x *execCtx) dump(w *bufio.Writer) error {
 	if uv := int32(x.v.Meta(metaUserVersion)); uv != 0 {
 		fmt.Fprintf(w, "PRAGMA user_version = %d;\n", uv)
 	}
+	// Closure tables are rebuilt by CREATE CLOSURE after their source.
+	closureOwned := map[string]bool{}
+	for _, cl := range x.cat.closures {
+		closureOwned[strings.ToLower(cl.DesIndex)] = true
+		if cl.ChildIndex != "" {
+			closureOwned[strings.ToLower(cl.ChildIndex)] = true
+		}
+	}
+	kept := tables[:0:0]
+	for _, t := range tables {
+		if x.cat.closure(t.Name) == nil {
+			kept = append(kept, t)
+		}
+	}
+	tables = kept
 	for _, t := range tables {
 		fmt.Fprintf(w, "%s\n", t.createSQL())
 		prefix := "INSERT INTO " + sql.QuoteIdent(t.Name) + " VALUES("
@@ -76,7 +91,16 @@ func (x *execCtx) dump(w *bufio.Writer) error {
 	}
 	for _, t := range tables {
 		for _, ix := range t.indexes {
-			if !ix.Auto {
+			if !ix.Auto && !closureOwned[strings.ToLower(ix.Name)] {
+				fmt.Fprintf(w, "%s\n", ix.createSQL())
+			}
+		}
+	}
+	for _, name := range x.cat.ClosureNames() {
+		fmt.Fprintf(w, "%s\n", x.cat.DescribeClosure(name))
+		// indexes the user added to the closure table
+		for _, ix := range x.cat.table(name).indexes {
+			if !ix.Auto && !closureOwned[strings.ToLower(ix.Name)] {
 				fmt.Fprintf(w, "%s\n", ix.createSQL())
 			}
 		}

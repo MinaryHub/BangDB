@@ -39,6 +39,9 @@ type execCtx struct {
 
 	triggerDepth int // nesting of trigger bodies
 
+	closureWrite bool                   // closure maintenance: may write closure tables
+	graphs       map[string]*graphEdges // edge sets read by graph_walk/graph_path in this statement
+
 	lastTable *Table // cache of rows()
 	lastRoot  uint32
 	lastRows  store.TableStore
@@ -74,16 +77,19 @@ func (x *execCtx) exec(s sql.Stmt) (Result, error) {
 	if x.tx == nil {
 		return Result{}, errors.New("bangdb: write statement outside of a write transaction")
 	}
+	if err := x.closureGuard(s); err != nil {
+		return Result{}, err
+	}
 	switch st := s.(type) {
 	case *sql.Insert:
 		defer x.pushCTEs(st.With)()
-		return x.execInsert(st)
+		return x.afterDML(x.execInsert(st))
 	case *sql.Update:
 		defer x.pushCTEs(st.With)()
-		return x.execUpdate(st)
+		return x.afterDML(x.execUpdate(st))
 	case *sql.Delete:
 		defer x.pushCTEs(st.With)()
-		return x.execDelete(st)
+		return x.afterDML(x.execDelete(st))
 	case *sql.CreateTable:
 		return Result{}, x.createTable(st)
 	case *sql.DropTable:
@@ -95,9 +101,15 @@ func (x *execCtx) exec(s sql.Stmt) (Result, error) {
 	case *sql.AlterTableAddColumn:
 		return Result{}, x.addColumn(st)
 	case *sql.AlterTableRename:
-		return Result{}, x.renameTable(st)
+		if err := x.renameTable(st); err != nil {
+			return Result{}, err
+		}
+		return Result{}, x.closureRenamed(st)
 	case *sql.AlterTableRenameColumn:
-		return Result{}, x.renameColumn(st)
+		if err := x.renameColumn(st); err != nil {
+			return Result{}, err
+		}
+		return Result{}, x.closureRenamed(st)
 	case *sql.AlterTableDropColumn:
 		return Result{}, x.dropColumn(st)
 	case *sql.CreateView:
@@ -108,12 +120,34 @@ func (x *execCtx) exec(s sql.Stmt) (Result, error) {
 		return Result{}, x.createTrigger(st)
 	case *sql.DropTrigger:
 		return Result{}, x.dropTrigger(st)
+	case *sql.CreateClosure:
+		return Result{}, x.createClosure(st)
+	case *sql.DropClosure:
+		return Result{}, x.dropClosure(st)
 	case *sql.Analyze:
 		return Result{}, x.analyze(st)
 	case *sql.Pragma:
 		return x.pragma(st)
 	}
 	return Result{}, fmt.Errorf("bangdb: unsupported statement %T", s)
+}
+
+// afterDML finishes an INSERT, UPDATE or DELETE: when it is a statement of
+// its own (not a trigger body), the closures over the tables it changed are
+// brought up to date.
+func (x *execCtx) afterDML(res Result, err error) (Result, error) {
+	if x.triggerDepth > 0 || x.closureWrite || x.tx == nil {
+		return res, err
+	}
+	if err != nil {
+		x.tx.closureDirty = nil // the statement is rolled back
+		return res, err
+	}
+	if err := x.flushClosures(); err != nil {
+		x.tx.closureDirty = nil
+		return Result{}, err
+	}
+	return res, nil
 }
 
 func (x *execCtx) table(name string) (*Table, error) {
@@ -462,6 +496,7 @@ func (x *execCtx) insertRow(t *Table, row []any) (int64, error) {
 	if err := rows.Put(rowid, row); err != nil {
 		return 0, err
 	}
+	x.closureChanged(t, row)
 	return rowid, x.v.SpillPoint()
 }
 

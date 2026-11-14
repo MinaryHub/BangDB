@@ -78,6 +78,8 @@ type level struct {
 	// are computed from fnArgs for every row of the levels before it.
 	fn     *tableFunc
 	fnArgs []evalFn
+
+	pushed string // EXPLAIN: conditions pushed into the derived table's body
 }
 
 // levelStats counts what a join level did.
@@ -857,13 +859,17 @@ func (x *execCtx) scanLevel(l *level, e *env, visit func(rowid int64, row []any)
 			args[i] = v
 		}
 		n := int64(0)
-		return l.fn.rows(args, func(row []any) (bool, error) {
+		emit := func(row []any) (bool, error) {
 			if err := x.tick(); err != nil {
 				return false, err
 			}
 			n++
 			return visit(n, row)
-		})
+		}
+		if l.fn.xrows != nil {
+			return l.fn.xrows(x, args, emit)
+		}
+		return l.fn.rows(args, emit)
 	}
 	if l.virtual == nil {
 		return x.scan(l.t, l.acc, e, visit)
@@ -1086,6 +1092,11 @@ func (x *execCtx) buildLevels(from []sql.TableRef, lefts []bool, ons []sql.Expr,
 		var virtual [][]any
 		var rec *cteDef // the recursive WITH table this level reads
 		var fn *tableFunc
+		var pushed []derivedFilter
+		refAlias := ref.Alias
+		if refAlias == "" {
+			refAlias = ref.Name
+		}
 		if ref.Func {
 			var err error
 			if fn, err = lookupTableFunc(ref.Name, len(ref.Args)); err != nil {
@@ -1094,15 +1105,24 @@ func (x *execCtx) buildLevels(from []sql.TableRef, lefts []bool, ons []sql.Expr,
 			t, virtual = fn.table(ref.Name), [][]any{}
 		} else if def := x.cte(ref.Name); def != nil && ref.Sub == nil && !ref.Base {
 			var err error
-			if t, virtual, err = x.cteTable(def, ref.Name); err != nil {
-				return nil, nil, nil, err
+			if !def.done && !def.running {
+				filters := x.derivedFilters(from, i, ons, where, refAlias)
+				if t, virtual, pushed, err = x.filteredCTE(def, ref.Name, filters); err != nil {
+					return nil, nil, nil, err
+				}
+			}
+			if pushed == nil {
+				if t, virtual, err = x.cteTable(def, ref.Name); err != nil {
+					return nil, nil, nil, err
+				}
 			}
 			if def.running {
 				rec = def
 			}
 		} else if ref.Sub != nil {
 			// Derived table: run the subquery once and scan its rows.
-			res, err := x.execSelect(ref.Sub)
+			res, p, err := x.execPushed(ref.Sub, nil, x.derivedFilters(from, i, ons, where, ref.Alias))
+			pushed = p
 			if err != nil {
 				return nil, nil, nil, err
 			}
@@ -1120,7 +1140,7 @@ func (x *execCtx) buildLevels(from []sql.TableRef, lefts []bool, ons []sql.Expr,
 				alias = v.Name
 			}
 			var err error
-			if t, virtual, err = x.viewTable(v, alias); err != nil {
+			if t, virtual, pushed, err = x.viewTable(v, alias, x.derivedFilters(from, i, ons, where, alias)...); err != nil {
 				return nil, nil, nil, err
 			}
 		} else {
@@ -1137,7 +1157,7 @@ func (x *execCtx) buildLevels(from []sql.TableRef, lefts []bool, ons []sql.Expr,
 			return nil, nil, nil, fmt.Errorf("bangdb: ambiguous table name %s (use an alias)", alias)
 		}
 		seen[strings.ToLower(alias)] = true
-		l := &level{t: t, alias: alias, offset: len(sc.cols), left: lefts[i], virtual: virtual, fn: fn}
+		l := &level{t: t, alias: alias, offset: len(sc.cols), left: lefts[i], virtual: virtual, fn: fn, pushed: pushedDesc(pushed)}
 		if rec != nil {
 			rec.levels = append(rec.levels, l)
 		}
@@ -1243,11 +1263,11 @@ func (x *execCtx) buildLevels(from []sql.TableRef, lefts []bool, ons []sql.Expr,
 			continue
 		}
 		if l.virtual != nil {
-			l.acc = &access{kind: accFull, desc: "SCAN SUBQUERY " + l.alias}
+			l.acc = &access{kind: accFull, desc: "SCAN SUBQUERY " + l.alias + l.pushed}
 			if a, err := hashAccess(sc, l, i, accessConds[i], c); err != nil {
 				return nil, nil, nil, err
 			} else if a != nil {
-				a.desc = fmt.Sprintf("SCAN SUBQUERY %s USING HASH%s", l.alias, strings.TrimPrefix(a.desc, "SCAN "+l.t.Name+" USING HASH"))
+				a.desc = fmt.Sprintf("SCAN SUBQUERY %s USING HASH%s", l.alias, strings.TrimPrefix(a.desc, "SCAN "+l.t.Name+" USING HASH")) + l.pushed
 				l.acc = a
 			}
 			continue

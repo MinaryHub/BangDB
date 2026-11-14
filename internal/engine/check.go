@@ -100,6 +100,10 @@ func (x *execCtx) integrityCheck() []string {
 		}
 	}
 
+	for _, name := range x.cat.ClosureNames() {
+		x.checkClosure(x.cat.closure(name), add)
+	}
+
 	// Free list.
 	freeMark := markFor("the free list")
 	pg, hops := x.v.FreeHead(), uint32(0)
