@@ -291,6 +291,28 @@ func (p *parser) parseCreate() (Stmt, error) {
 	if p.acceptKw("TRIGGER") || p.acceptKw("TEMP", "TRIGGER") || p.acceptKw("TEMPORARY", "TRIGGER") {
 		return p.parseTrigger(createPos)
 	}
+	if p.acceptKw("CLOSURE") {
+		cc := &CreateClosure{IfNotExists: p.acceptKw("IF", "NOT", "EXISTS")}
+		var err error
+		if cc.Name, err = p.ident(); err != nil {
+			return nil, err
+		}
+		if !p.acceptKw("ON") {
+			return nil, p.errf("expected ON table (child, parent)")
+		}
+		if cc.Table, err = p.ident(); err != nil {
+			return nil, err
+		}
+		cols, err := p.parseColumnList()
+		if err != nil {
+			return nil, err
+		}
+		if len(cols) != 2 {
+			return nil, p.errf("CREATE CLOSURE needs two columns: (child, parent)")
+		}
+		cc.Child, cc.Parent = cols[0], cols[1]
+		return cc, nil
+	}
 	if p.acceptKw("TABLE") {
 		ct := &CreateTable{}
 		ct.IfNotExists = p.acceptKw("IF", "NOT", "EXISTS")
@@ -618,7 +640,13 @@ func (p *parser) parseDrop() (Stmt, error) {
 		d.Name, err = p.ident()
 		return d, err
 	}
-	return nil, p.errf("expected TABLE, INDEX, VIEW or TRIGGER")
+	if p.acceptKw("CLOSURE") {
+		d := &DropClosure{IfExists: p.acceptKw("IF", "EXISTS")}
+		var err error
+		d.Name, err = p.ident()
+		return d, err
+	}
+	return nil, p.errf("expected TABLE, INDEX, VIEW, TRIGGER or CLOSURE")
 }
 
 // parseParenExpr parses "( expr )".

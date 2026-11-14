@@ -1418,6 +1418,7 @@ func (x *execCtx) updateRow(t *Table, oldID int64, old, newRow []any) (int64, er
 	if err := x.writeRow(t, newID, newRow); err != nil {
 		return 0, err
 	}
+	x.closureUpdated(t, old, newRow)
 	x.noteRowid(t, newID)
 	if err := x.parentUpdated(t, old, newRow); err != nil {
 		return 0, err

@@ -102,11 +102,16 @@ func (x *execCtx) pragma(st *sql.Pragma) (Result, error) {
 		sort.Strings(tables)
 		for _, n := range tables {
 			t := x.cat.table(n)
-			add("table", t.Name, t.Name, t.createSQL())
+			cl := x.cat.closure(n)
+			if cl != nil {
+				add("closure", t.Name, cl.Source, x.cat.DescribeClosure(n))
+			} else {
+				add("table", t.Name, t.Name, t.createSQL())
+			}
 			ixs := append([]*Index(nil), t.indexes...)
 			sort.Slice(ixs, func(i, j int) bool { return ixs[i].Name < ixs[j].Name })
 			for _, ix := range ixs {
-				if !ix.Auto {
+				if !ix.Auto && (cl == nil || !strings.EqualFold(ix.Name, cl.DesIndex)) {
 					add("index", ix.Name, t.Name, ix.createSQL())
 				}
 			}

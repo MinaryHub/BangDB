@@ -326,6 +326,7 @@ func (x *execCtx) removeRow(t *Table, rowid int64, row []any) error {
 	if err := x.deleteRow(t, rowid, row); err != nil {
 		return err
 	}
+	x.closureChanged(t, row)
 	if len(t.referencedBy) == 0 {
 		return nil
 	}

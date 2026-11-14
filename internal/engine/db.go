@@ -483,7 +483,18 @@ type Tx struct {
 	// deferFK skips foreign key checks of new and changed rows (ImportSQL
 	// checks every row at the end).
 	deferFK bool
+	// closureDirty holds, per closure, the child nodes whose edges changed
+	// in the running statement (applied when it finishes).
+	closureDirty map[string]map[string]any
+	// rawClosures lets statements write closure tables (ForceClosureWrite).
+	rawClosures bool
 }
+
+// ForceClosureWrite lets the transaction's statements write closure tables
+// directly and stops maintaining them, for repairs and tests. Changes made
+// this way are not checked: IntegrityCheck reports a closure that no longer
+// matches its source, and DROP CLOSURE + CREATE CLOSURE rebuilds it.
+func (tx *Tx) ForceClosureWrite(on bool) { tx.rawClosures = on }
 
 // Exec runs statements inside the transaction. A failing statement is rolled
 // back on its own; the transaction stays usable.
@@ -545,7 +556,7 @@ func (tx *Tx) execStmt(ctx context.Context, s sql.Stmt, args []any) (Result, err
 	for k, v := range tx.rowids {
 		rowids[k] = v
 	}
-	x := &execCtx{v: tx.v, cat: tx.cat, tx: tx, args: args, ctx: ctx, spill: tx.db.spill}
+	x := &execCtx{v: tx.v, cat: tx.cat, tx: tx, args: args, ctx: ctx, spill: tx.db.spill, closureWrite: tx.rawClosures}
 	res, err := x.exec(s)
 	if err != nil {
 		tx.v.Restore(sp)

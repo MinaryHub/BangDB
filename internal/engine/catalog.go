@@ -230,10 +230,12 @@ type Catalog struct {
 	indexes  map[string]*Index
 	views    map[string]*View
 	triggers map[string]*Trigger
+	closures map[string]*Closure
 }
 
 func newCatalog() *Catalog {
-	return &Catalog{tables: map[string]*Table{}, indexes: map[string]*Index{}, views: map[string]*View{}, triggers: map[string]*Trigger{}}
+	return &Catalog{tables: map[string]*Table{}, indexes: map[string]*Index{}, views: map[string]*View{},
+		triggers: map[string]*Trigger{}, closures: map[string]*Closure{}}
 }
 
 // ForeignKey makes Columns of a table refer to RefColumns (a primary key or
@@ -333,6 +335,9 @@ func (c *Catalog) clone() *Catalog {
 	}
 	for k, tr := range c.triggers {
 		n.triggers[k] = tr // immutable once created
+	}
+	for k, cl := range c.closures {
+		n.closures[k] = cl // replaced, never modified
 	}
 	for k, v := range c.views {
 		nv := *v
@@ -478,6 +483,12 @@ func loadCatalog(v *pager.View) (*Catalog, error) {
 				return nil, err
 			}
 			c.triggers[strings.ToLower(tr.Name)] = tr
+		case 'h':
+			cl := &Closure{}
+			if err := json.Unmarshal(data, cl); err != nil {
+				return nil, fmt.Errorf("bangdb: corrupt catalog entry %q: %w", k, err)
+			}
+			c.closures[strings.ToLower(cl.Name)] = cl
 		}
 	}
 	if err := cur.Err(); err != nil {
