@@ -19,6 +19,8 @@
  │   cursor.go  스트리밍 커서   plancache.go 플랜 캐시                 │
  │   vacuum.go  VACUUM   replication.go 백업·복제   check.go 무결성    │
  │   window.go 윈도 함수  json.go JSON 함수  dump.go 덤프·가져오기·CSV  │
+ │   pushdown.go 뷰·CTE 조건 push-down  closure.go 폐포 테이블          │
+ │   graphfunc.go graph_walk·graph_path                            │
  │   stats.go  통계·슬로우 쿼리                                       │
  ├──────────────────────────────┬────────────────────────────────┤
  │ internal/sql                 │ internal/value                 │
@@ -77,7 +79,7 @@ SQLite의 WAL 모드와 같은 방식의 **다중 버전 페이지 저장소**�
 
 ## 4. 카탈로그 (`internal/engine/catalog.go`)
 
-- 메타 슬롯 0의 B+트리에 `t\0<table>`, `i\0<index>`, `v\0<view>` → JSON 으로 저장. 테이블 항목에 CHECK(SQL 텍스트)와 외래 키가 들어가며, 로드 시 CHECK는 컴파일되고 FK는 부모 테이블의 `referencedBy` 목록으로 연결됩니다.
+- 메타 슬롯 0의 B+트리에 `t\0<table>`, `i\0<index>`, `v\0<view>`, `g\0<trigger>`, `h\0<closure>` → JSON 으로 저장. 테이블 항목에 CHECK(SQL 텍스트)와 외래 키가 들어가며, 로드 시 CHECK는 컴파일되고 FK는 부모 테이블의 `referencedBy` 목록으로 연결됩니다.
 - 커밋된 카탈로그는 불변이고, DDL을 실행하는 트랜잭션은 복제본을 수정합니다. 커밋 시 포인터만 교체되므로 리더는 락 없이 일관된 스키마를 봅니다.
 
 ## 5. SQL 처리
@@ -96,7 +98,9 @@ SQLite의 WAL 모드와 같은 방식의 **다중 버전 페이지 저장소**�
    - **외부 정렬** (`spill.go`): 정렬 버퍼가 `SortMemory`를 넘으면 정렬된 run을 임시 파일에 쓰고 마지막에 k-way 병합합니다(안정 정렬). DISTINCT는 기억한 키가 한도의 절반을 넘으면 나머지 행을 값 순으로 정렬해 인접 중복을 제거하고, GROUP BY는 메모리 그룹이 한도를 넘으면 이후 새 그룹의 행을 그룹 키 순으로 정렬해 한 그룹씩 집계합니다.
 5. **DML**: UPDATE/DELETE는 대상 행을 먼저 모은 뒤 수정합니다 (Halloween 문제 방지). 인덱스는 같은 트랜잭션 안에서 동기적으로 갱신됩니다. UPSERT는 충돌 행을 찾아 `excluded.*`와 함께 UPDATE로 바꿉니다.
 6. **제약 조건** (`fk.go`): CHECK는 행 준비 단계에서 평가(NULL은 통과). FK는 행 단위로 즉시 검사: 자식 삽입·FK 컬럼 변경 시 부모 키(rowid 또는 UNIQUE 인덱스)를 확인하고, 부모 삭제·키 변경 시 자식(선행 컬럼이 FK인 인덱스가 있으면 사용)에 `CASCADE`/`SET NULL`/오류를 적용합니다. 연쇄 동작은 64단계로 제한합니다.
-7. **뷰**: 조회 시 뷰의 SELECT를 실행해 파생 테이블처럼 사용합니다.
+7. **뷰**: 조회 시 뷰의 SELECT를 실행해 파생 테이블처럼 사용합니다. 뷰·CTE·파생 테이블에 대한 바깥의 `열 = 상수`·`열 IN (상수…)` 조건은 본문에 먼저 넣습니다(`pushdown.go`: 일반 본문은 각 SELECT의 WHERE/HAVING, 재귀 CTE는 반복 단계가 그대로 넘기는 열만 시작 SELECT에).
+8. **폐포 테이블** (`closure.go`): `CREATE CLOSURE`의 (anc, des, depth) 테이블. 원본 행 변경은 `insertRow`/`removeRow`/`updateRow`에서 트랜잭션의 "변경된 자식" 집합에 기록되고, 문장(트리거 본문 아닌)이 끝날 때 `afterDML`이 바뀐 노드와 그 아래를 위에서부터(Kahn) 재계산해 다른 행만 고칩니다. 순환이면 문장 실패(세이브포인트 복원). 일반 문장은 폐포 테이블에 쓸 수 없습니다.
+9. **그래프 함수** (`graphfunc.go`): `graph_walk`/`graph_path`는 실행 맥락을 받는 테이블 값 함수로, 간선 테이블을 인덱스로 조회하거나 뷰를 문장마다 한 번 메모리로 읽어 너비 우선 탐색합니다.
 
 ## 6. 동시성 모델
 

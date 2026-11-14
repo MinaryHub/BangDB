@@ -16,6 +16,7 @@ Go로 작성된 **경량 임베디드 관계형 데이터베이스**입니다. �
   - 서브쿼리(스칼라·`EXISTS`·`IN (SELECT)`·`FROM (SELECT)`, 상관 포함), `UNION [ALL]`/`INTERSECT`/`EXCEPT`
   - CTE: `WITH name [(cols)] AS (…)`, 재귀 `WITH RECURSIVE`(트리·그래프 탐색, 수열 생성) — `SELECT`/`INSERT`/`UPDATE`/`DELETE` 앞, 서브쿼리·뷰 안
   - 테이블 값 함수: `json_each`, `json_tree`, `generate_series` — 왼쪽 테이블의 컬럼을 인수로 받음(`FROM posts p, json_each(p.tags) j`)
+  - **온톨로지·그래프**: `CREATE CLOSURE`(계층의 조상·자손을 자동 유지하는 폐포 테이블, 다중 상속 지원), `graph_walk`/`graph_path`(관계를 따라 닿는 노드·최단 경로), 뷰·CTE에 조건 push-down — [docs/ONTOLOGY.md](docs/ONTOLOGY.md)
   - UPSERT(`ON CONFLICT … DO NOTHING / DO UPDATE`), `INSERT OR IGNORE/REPLACE`, `INSERT … SELECT`, `RETURNING`
   - 제약: 복합 `PRIMARY KEY`/`UNIQUE`, `NOT NULL`, `DEFAULT`, `CHECK`, `FOREIGN KEY`(`CASCADE`/`SET NULL`/`RESTRICT`)
   - 생성 컬럼: `total DECIMAL(12,2) GENERATED ALWAYS AS (price * qty) STORED`
@@ -424,6 +425,24 @@ SELECT value FROM generate_series(1, 10, 2);
 - **생성 컬럼**: `[GENERATED ALWAYS] AS (식) [STORED | VIRTUAL]`. 두 종류 모두 행을 쓸 때 계산해 저장합니다(`VIRTUAL`도 저장됨). 식은 같은 행의 일반 컬럼만 참조합니다(다른 생성 컬럼 불가). 값을 직접 넣거나 바꿀 수 없고, 컬럼 목록 없는 `INSERT INTO t VALUES (…)`에는 일반 컬럼 값만 줍니다. `ALTER TABLE ADD COLUMN`으로는 추가할 수 없습니다.
 - **`json_each(json [, path])`**는 배열·객체의 바로 아래 항목마다, **`json_tree`**는 그 아래 전체에 대해 한 행을 냅니다. 컬럼은 SQLite와 같습니다: `key`, `value`, `type`, `atom`, `id`, `parent`, `fullkey`, `path`. **`generate_series(start, stop [, step])`**의 컬럼은 `value`. 인수에는 왼쪽에 있는 테이블의 컬럼을 쓸 수 있고(서브쿼리는 불가), `LEFT JOIN json_each(…) j ON 1`로 항목이 없는 행도 남길 수 있습니다.
 
+## 온톨로지·그래프
+
+```sql
+-- 계층: 조상·자손 관계를 자동 유지 (다중 상속 가능, 순환은 거부)
+CREATE TABLE subclass (child TEXT NOT NULL, parent TEXT, UNIQUE (child, parent));
+CREATE CLOSURE class_tree ON subclass (child, parent);
+SELECT des FROM class_tree WHERE anc = 'ex:Fastener';       -- 하위 개념 전부 (인덱스 조회)
+
+-- 일반 관계: 닿는 노드와 최단 경로
+SELECT node, depth FROM graph_walk('part_of', 'part', 'whole', 'bolt', 3);
+SELECT node FROM graph_path('part_of', 'part', 'whole', 'bolt', 'plant') ORDER BY step;
+```
+
+- `CREATE CLOSURE 이름 ON 원본 (자식열, 부모열)`이 만드는 `이름(anc, des, depth)`는 읽기 전용이며, 원본이 바뀐 문장이 끝날 때 바뀐 노드와 그 아래만 다시 계산합니다. 덤프·VACUUM·복제·무결성 검사에 포함됩니다.
+- `graph_walk(간선, 출발열, 도착열, 시작 [, 최대깊이 [, 'out'|'in'|'both']])`, `graph_path(…, 시작, 목표 …)`. 조건이 있는 관계(트리플의 술어 하나)는 뷰로 만들어 그 이름을 줍니다.
+- 뷰·`WITH`·파생 테이블에 대한 `열 = 상수`·`열 IN (…)` 조건은 안쪽 계산에 먼저 반영됩니다(`EXPLAIN`에 `pushed`). 재귀 CTE는 반복 단계가 그대로 넘기는 열에만 적용됩니다.
+- 자세한 사용법·측정·제약: [docs/ONTOLOGY.md](docs/ONTOLOGY.md)
+
 ## 스키마 예
 
 ```sql
@@ -478,7 +497,7 @@ INSERT INTO emp (dept_id, email, salary) VALUES (1, 'kim@example.com', 100)
 > 보완 항목과 개발 계획은 [docs/ROADMAP.md](docs/ROADMAP.md)를 보세요.
 
 - 이름 있는 윈도(`WINDOW w AS`), `INSTEAD OF` 트리거 미지원. 외래 키 동작(CASCADE 등)으로 바뀐 행은 트리거를 실행하지 않음
-- CTE는 참조될 때 전체를 계산해 메모리에 둠(조건 push-down 없음). 서로를 참조하는 재귀 CTE(상호 재귀)와 바깥 질의에 상관된 CTE는 미지원
+- CTE·뷰는 참조될 때 계산해 메모리에 둠. 바깥 질의의 `열 = 상수`/`열 IN (상수…)` 조건만 안으로 들어가고(재귀 CTE는 그대로 넘겨지는 열만), 다른 테이블 값에 따른 조건은 전체를 계산. 서로를 참조하는 재귀 CTE(상호 재귀)와 바깥 질의에 상관된 CTE는 미지원
 - 타입을 알 수 없는 식의 인덱스는 동등·`IN` 조건에만 쓰임. 식 인덱스는 covering index로 쓰이지 않고, `ON CONFLICT (식)` 대상으로 지정할 수 없음(대상 없는 `ON CONFLICT DO NOTHING`·`INSERT OR REPLACE`는 동작)
 - 생성 컬럼은 항상 저장되며(`VIRTUAL` 포함) 다른 생성 컬럼을 참조할 수 없음
 - 테이블 값 함수가 있는 조인은 쓴 순서대로 실행(재배치 없음)
@@ -497,6 +516,7 @@ INSERT INTO emp (dept_id, email, salary) VALUES (1, 'kim@example.com', 100)
 
 - [보완 검토와 개발 계획 (ROADMAP)](docs/ROADMAP.md)
 - [아키텍처](docs/ARCHITECTURE.md)
+- [온톨로지·지식 그래프로 쓰기](docs/ONTOLOGY.md)
 - [백업과 미러링](docs/REPLICATION.md)
 - [안드로이드 앱에 내장하기](docs/ANDROID.md)
 - [시계열·인메모리 DB 확장 적합성 검토](docs/REVIEW-timeseries-inmemory.md)
