@@ -588,24 +588,24 @@ func (x *execCtx) dropView(st *sql.DropView) error {
 }
 
 // viewTable runs view v and returns it as a virtual table.
-func (x *execCtx) viewTable(v *View, alias string) (*Table, [][]any, error) {
+func (x *execCtx) viewTable(v *View, alias string, filters ...derivedFilter) (*Table, [][]any, []derivedFilter, error) {
 	x.fkDepth++
 	defer func() { x.fkDepth-- }()
 	if x.fkDepth > maxFKDepth {
-		return nil, nil, fmt.Errorf("bangdb: view %s is nested too deeply (or refers to itself)", v.Name)
+		return nil, nil, nil, fmt.Errorf("bangdb: view %s is nested too deeply (or refers to itself)", v.Name)
 	}
 	outer, ctes := x.outer, x.ctes
 	x.outer, x.ctes = nil, nil // a view never sees the enclosing query
-	res, err := x.execSelect(v.sel)
+	res, pushed, err := x.execPushed(v.sel, v.Columns, filters)
 	x.outer, x.ctes = outer, ctes
 	if err != nil {
-		return nil, nil, fmt.Errorf("bangdb: view %s: %w", v.Name, err)
+		return nil, nil, nil, fmt.Errorf("bangdb: view %s: %w", v.Name, err)
 	}
 	t := &Table{Name: alias, RowidCol: -1}
 	names := res.Columns
 	if len(v.Columns) > 0 {
 		if len(v.Columns) != len(names) {
-			return nil, nil, fmt.Errorf("bangdb: view %s has %d column names but the SELECT returns %d columns", v.Name, len(v.Columns), len(names))
+			return nil, nil, nil, fmt.Errorf("bangdb: view %s has %d column names but the SELECT returns %d columns", v.Name, len(v.Columns), len(names))
 		}
 		names = v.Columns
 	}
@@ -616,7 +616,7 @@ func (x *execCtx) viewTable(v *View, alias string) (*Table, [][]any, error) {
 	if rows == nil {
 		rows = [][]any{}
 	}
-	return t, rows, nil
+	return t, rows, pushed, nil
 }
 
 // DescribeView renders a view as SQL, or "" if there is none.

@@ -213,7 +213,7 @@ func tableInfo(t *Table) Result {
 }
 
 func (x *execCtx) viewInfo(name string) (Result, error) {
-	t, _, err := x.viewTable(x.cat.view(name), name)
+	t, _, _, err := x.viewTable(x.cat.view(name), name)
 	if err != nil {
 		return Result{}, err
 	}
