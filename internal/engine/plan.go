@@ -859,13 +859,17 @@ func (x *execCtx) scanLevel(l *level, e *env, visit func(rowid int64, row []any)
 			args[i] = v
 		}
 		n := int64(0)
-		return l.fn.rows(args, func(row []any) (bool, error) {
+		emit := func(row []any) (bool, error) {
 			if err := x.tick(); err != nil {
 				return false, err
 			}
 			n++
 			return visit(n, row)
-		})
+		}
+		if l.fn.xrows != nil {
+			return l.fn.xrows(x, args, emit)
+		}
+		return l.fn.rows(args, emit)
 	}
 	if l.virtual == nil {
 		return x.scan(l.t, l.acc, e, visit)

@@ -39,7 +39,8 @@ type execCtx struct {
 
 	triggerDepth int // nesting of trigger bodies
 
-	closureWrite bool // closure maintenance: may write closure tables
+	closureWrite bool                   // closure maintenance: may write closure tables
+	graphs       map[string]*graphEdges // edge sets read by graph_walk/graph_path in this statement
 
 	lastTable *Table // cache of rows()
 	lastRoot  uint32
